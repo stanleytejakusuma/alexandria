@@ -58,6 +58,12 @@ CORE_REQUIRED = ("type", "title", "generated")
 SOURCE_REQUIRED = ("source", "source_id")
 WIKI_REQUIRED = ("sources",)
 
+# `index.md` and `log.md` are the wiki's structural furniture -- a table of contents
+# and a run chronology. They assert nothing, so there is nothing for them to cite.
+# Exempted BY EXACT PATH rather than by loosening the rule, so "every claim cites"
+# stays hard for every actual page.
+WIKI_STRUCTURAL = frozenset({"wiki/index", "wiki/log"})
+
 # Fields exclusive to one profile -- presence on the other side is a mismatch.
 SOURCE_ONLY = frozenset(
     {"source", "source_id", "source_hash", "hash", "entities", "session", "swept"}
@@ -75,6 +81,11 @@ def profile_for_path(path: str) -> Profile | None:
     if p.startswith("wiki/"):
         return Profile.WIKI
     return None
+
+
+def _doc_id(path: str) -> str:
+    p = str(path).lstrip("./")
+    return p[:-3] if p.endswith(".md") else p
 
 
 def _is_date(v: object) -> bool:
@@ -104,6 +115,8 @@ def validate(fm: dict, path: str) -> list[Issue]:
 
     # --- required fields -------------------------------------------------
     required = CORE_REQUIRED + (SOURCE_REQUIRED if profile is Profile.SOURCE else WIKI_REQUIRED)
+    if profile is Profile.WIKI and _doc_id(path) in WIKI_STRUCTURAL:
+        required = CORE_REQUIRED
     for field in required:
         if fm.get(field) in (None, "", []):
             err("missing_required", field, f"required for the {profile.value} profile")

@@ -180,3 +180,22 @@ def test_wiki_page_with_no_sources_is_an_error():
     fm = wiki()
     del fm["sources"]
     assert "missing_required" in codes(validate(fm, "wiki/x/n.md"))
+
+
+def test_structural_wiki_files_need_no_citations():
+    """index.md and log.md are the wiki's furniture -- a contents list and a run
+    chronology. They assert nothing, so there is nothing to cite."""
+    fm = {"type": "concept", "title": "Index",
+          "generated": {"by": "human:owner", "at": "2026-07-31T00:00:00Z"},
+          "sources": []}
+    assert validate(fm, "wiki/index.md") == []
+    assert validate(fm, "wiki/log.md") == []
+
+
+def test_ordinary_wiki_pages_still_require_citations():
+    """The exemption is by exact path, so the invariant stays hard everywhere else."""
+    fm = {"type": "entity", "title": "Payments",
+          "generated": {"by": "sweep/m", "at": "2026-07-31T00:00:00Z"},
+          "sources": []}
+    assert "missing_required" in codes(validate(fm, "wiki/systems/payments.md"))
+    assert "missing_required" in codes(validate(fm, "wiki/index-of-things.md"))
