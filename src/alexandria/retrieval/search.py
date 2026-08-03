@@ -21,7 +21,9 @@ __all__ = ["SearchConfig", "SearchEngine", "SearchResult"]
 
 @dataclass(frozen=True)
 class SearchConfig:
-    prefetch: int = 20
+    # 8: measured knee on golden-v1 -- 20/12/8 give identical recall and MRR,
+    # p50 1071ms -> 437ms. See config.py.
+    prefetch: int = 8
     top_k: int = 5
     wiki_boost: float = 1.25
     rrf_k: int = 60

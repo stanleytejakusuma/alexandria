@@ -18,7 +18,11 @@ class AppConfig:
     embed_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embed_batch_size: int = 32
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
-    rerank_prefetch: int = 20
+    # 8, not 20. Measured on golden-v1 against the real index: prefetch 20/12/8 all
+    # score IDENTICAL recall@5 (64.3%) and IDENTICAL MRR (0.571), while p50 falls
+    # 1071ms -> 437ms. Quality only degrades at 5 (57.1%, MRR 0.500). 8 is the knee,
+    # and it is what brings p50 inside the spec's <500ms phase-1 gate.
+    rerank_prefetch: int = 8
     rerank_top_k: int = 5
     chunk_tokens: int = 512
     chunk_overlap: float = 0.15
@@ -46,7 +50,7 @@ def load_config(*, corpus_override: str | Path | None = None,
         rerank_model=_env_or_file("ALEXANDRIA_RERANK_MODEL", raw, ("rerank", "model"),
                                   "BAAI/bge-reranker-v2-m3"),
         rerank_prefetch=_as_int(_env_or_file("ALEXANDRIA_RERANK_PREFETCH", raw,
-                                             ("rerank", "prefetch"), 20)),
+                                             ("rerank", "prefetch"), 8)),
         rerank_top_k=_as_int(_env_or_file("ALEXANDRIA_RERANK_TOP_K", raw,
                                           ("rerank", "top_k"), 5)),
         chunk_tokens=_as_int(_env_or_file("ALEXANDRIA_INDEX_CHUNK_TOKENS", raw,

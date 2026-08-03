@@ -34,3 +34,10 @@ def test_unknown_embed_provider_is_rejected(monkeypatch):
     monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "nonsense")
     with pytest.raises(ValueError, match="local, mlx, or hash"):
         load_config()
+
+
+def test_rerank_prefetch_defaults_to_the_measured_knee():
+    """20/12/8 all scored identical recall@5 and MRR on golden-v1; 5 degraded both.
+    8 is the smallest prefetch with no measured quality cost, and the one that
+    brings p50 inside the <500ms gate."""
+    assert load_config().rerank_prefetch == 8
