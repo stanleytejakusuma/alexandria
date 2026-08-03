@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .corpus import Doc
+from .connectors.pi_sessions import PiSessionsConnector
+from .llm import LLMClient
 from .migrate import migrate_kg_sync
 from .schema import Severity, validate
 
@@ -49,8 +53,6 @@ def cmd_lint(args) -> int:
 
 
 def cmd_sync(args) -> int:
-    from .connectors.pi_sessions import PiSessionsConnector
-    from .llm import LLMClient
 
     if args.connector != "pi-sessions":
         print(f"unknown connector: {args.connector}", file=sys.stderr)
@@ -72,17 +74,40 @@ def cmd_sync(args) -> int:
                   f"part {item.meta['part']}/{item.meta['parts']}")
         return 0
 
-    written = 0
-    for item in items:
-        docs = conn.normalize(item)
-        for doc in docs:
-            doc.write(corpus)
-            written += 1
-        if docs:                       # fail-safe: only consume on success
-            conn.commit([item])
-    print(f"wrote {written} note(s)")
+    # Distillation is network-bound, so a small pool turns hours into minutes.
+    # normalize() is pure (call + parse); writes and state stay on the main thread
+    # because StateStore is not thread-safe and correctness beats a few more workers.
+    written = done = failed = 0
+    total = len(items)
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {pool.submit(conn.normalize, item): item for item in items}
+        for future in as_completed(futures):
+            item = futures[future]
+            done += 1
+            try:
+                docs = future.result()
+            except Exception as exc:                     # never lose the batch to one item
+                conn.errors.append(f"{item.source_id}: {type(exc).__name__}: {exc}")
+                docs = []
+            for doc in docs:
+                doc.write(corpus)
+                written += 1
+            if docs:
+                conn.commit([item])     # fail-safe: a failed burst stays unconsumed
+            else:
+                failed += 1
+            if done % 10 == 0 or done == total:
+                rate = done / max(time.time() - t0, 1e-6)
+                eta = (total - done) / rate if rate else 0
+                print(f"  {done}/{total}  notes={written}  empty/failed={failed}  "
+                      f"{rate*60:.1f}/min  eta={eta/60:.1f}m", flush=True)
+
+    print(f"wrote {written} note(s) from {total} burst(s); {failed} produced none")
     for err in conn.errors[:10]:
         print(f"  error: {err}", file=sys.stderr)
+    if len(conn.errors) > 10:
+        print(f"  ... and {len(conn.errors)-10} more", file=sys.stderr)
     return 0
 
 
@@ -103,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--base-url", default="http://127.0.0.1:20128/v1")
     s.add_argument("--model", default="claude-haiku-4-5")
     s.add_argument("--limit", type=int, default=0)
+    s.add_argument("--workers", type=int, default=6)
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_sync)
 

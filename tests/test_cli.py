@@ -30,3 +30,40 @@ def test_lint_fails_on_a_schema_violation(tmp_path, capsys):
 
 def test_unknown_connector_is_rejected(tmp_path):
     assert app(["--corpus", str(tmp_path), "sync", "nope"]) == 2
+
+
+def test_sync_writes_notes_and_is_fail_safe(tmp_path, monkeypatch):
+    """Concurrency must not break the fail-safe: a burst whose distillation fails
+    stays unconsumed, while its siblings still land."""
+    import json
+    from alexandria import cli
+
+    sess = tmp_path / "sessions" / "--home-user-proj--"
+    sess.mkdir(parents=True)
+    for n in range(3):
+        events = [{"type": "session", "id": f"s{n}"}] + [
+            {"type": "message", "timestamp": "2026-07-29T10:0%d:00Z" % i,
+             "message": {"role": "user",
+                         "content": [{"type": "text", "text": "A substantive question. " * 8}]}}
+            for i in range(2)]
+        (sess / f"2026-07-29T10-00-0{n}-000Z_s{n}.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n")
+
+    good = json.dumps({"observations": [{"title": "A finding", "narrative": "n",
+                                         "facts": ["f"], "entities": ["e"], "tags": []}]})
+    from alexandria.llm import ScriptedClient
+
+    class RoundRobin(ScriptedClient):
+        def complete(self, system, user, temperature=0.0):
+            self.calls.append((system, user))
+            return good if len(self.calls) % 2 else "not json"
+
+    monkeypatch.setattr(cli, "LLMClient", lambda **kw: RoundRobin())
+    rc = cli.app(["--corpus", str(tmp_path / "corpus"), "sync", "pi-sessions",
+                  "--sessions-dir", str(tmp_path / "sessions"), "--workers", "2"])
+    assert rc == 0
+    written = list((tmp_path / "corpus" / "sources").rglob("*.md"))
+    assert written, "successful distillations must still land"
+    state = json.loads((tmp_path / "corpus" / ".alexandria" / "state"
+                        / "pi-sessions.json").read_text())
+    assert len(state["bursts"]) == len(written)   # only successes consumed
