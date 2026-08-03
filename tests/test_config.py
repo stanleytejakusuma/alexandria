@@ -1,5 +1,6 @@
 """Retrieval configuration has local defaults and explicit env precedence."""
 
+import pytest
 from pathlib import Path
 
 from alexandria.config import load_config
@@ -21,3 +22,15 @@ def test_config_file_loads_retrieval_defaults_and_environment_wins(tmp_path: Pat
     assert config.embed_provider == "hash"
     assert config.embed_batch_size == 9
     assert config.wiki_boost == 1.5
+
+
+def test_mlx_is_a_valid_embed_provider(monkeypatch):
+    """MLX sidesteps the PyTorch MPS graph-cache leak; it must be selectable."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "mlx")
+    assert load_config().embed_provider == "mlx"
+
+
+def test_unknown_embed_provider_is_rejected(monkeypatch):
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "nonsense")
+    with pytest.raises(ValueError, match="local, mlx, or hash"):
+        load_config()

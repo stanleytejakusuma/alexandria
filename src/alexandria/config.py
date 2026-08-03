@@ -34,8 +34,8 @@ def load_config(*, corpus_override: str | Path | None = None,
     corpus = (corpus_override or os.environ.get("ALEXANDRIA_CORPUS_PATH")
               or _nested(raw, "corpus", "path") or "~/alexandria-corpus")
     provider = _env_or_file("ALEXANDRIA_EMBED_PROVIDER", raw, ("embed", "provider"), "local")
-    if provider not in {"local", "hash"}:
-        raise ValueError("ALEXANDRIA_EMBED_PROVIDER must be local or hash")
+    if provider not in {"local", "hash", "mlx"}:
+        raise ValueError("ALEXANDRIA_EMBED_PROVIDER must be local, mlx, or hash")
     return AppConfig(
         corpus_path=Path(corpus).expanduser(),
         embed_provider=provider,

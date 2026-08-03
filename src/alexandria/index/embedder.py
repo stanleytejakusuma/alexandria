@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol, runtime_checkable
 
-__all__ = ["CachedEmbedder", "Embedder", "HashEmbedder", "LocalEmbedder"]
+__all__ = ["CachedEmbedder", "Embedder", "HashEmbedder", "LocalEmbedder", "MLXEmbedder"]
 
 
 @runtime_checkable
@@ -135,6 +135,69 @@ def _best_device(torch) -> str:
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+class MLXEmbedder:
+    """Apple-native embeddings via MLX, as an alternative to PyTorch/MPS.
+
+    PyTorch's MPS backend compiles and permanently caches a GPU graph per distinct
+    input shape and never releases it (pytorch/pytorch#154329, open). A full index run
+    on this corpus grew system swap by ~10GB as a result. MLX is Apple's own
+    framework with a different memory model and no equivalent cache, so this provider
+    sidesteps the bug rather than mitigating it.
+
+    Uses 8-bit quantized weights by default: less memory and faster, at some cost in
+    numeric fidelity versus fp32. Because the model name is part of the embedding
+    cache key, switching providers correctly invalidates cached vectors rather than
+    silently mixing quantized and full-precision embeddings in one index.
+    """
+
+    def __init__(self, model: str = "mlx-community/Qwen3-Embedding-0.6B-8bit",
+                 batch_size: int = 32, max_length: int = DEFAULT_MAX_LENGTH) -> None:
+        self.model_name = model
+        self.batch_size = batch_size
+        self.max_length = max_length
+        self._model = None
+        self._processor = None
+        self._generate = None
+        self._import_error: Exception | None = None
+
+    @property
+    def name(self) -> str:
+        return self.model_name
+
+    @property
+    def dim(self) -> int:
+        return len(self.embed(["probe"])[0])
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        self._load()
+        vectors: list[list[float]] = []
+        # Batched so a large call cannot materialise one enormous activation tensor.
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start:start + self.batch_size]
+            out = self._generate(self._model, self._processor, batch,
+                                 max_length=self.max_length)
+            vectors.extend([float(value) for value in row]
+                           for row in out.text_embeds.tolist())
+        return vectors
+
+    def _load(self) -> None:
+        if self._import_error is not None:
+            raise RuntimeError(
+                "MLX embeddings require the 'mlx' and 'mlx-embeddings' packages "
+                f"({self._import_error})") from self._import_error
+        if self._model is not None:
+            return
+        try:
+            from mlx_embeddings import generate, load
+        except ImportError as exc:  # pragma: no cover - exercised in installed runtime
+            raise RuntimeError(
+                "MLX embeddings require the 'mlx' and 'mlx-embeddings' packages") from exc
+        self._model, self._processor = load(self.model_name)
+        self._generate = generate
 
 
 class CachedEmbedder:

@@ -20,7 +20,7 @@ from .corpus import Doc
 from .connectors.pi_sessions import PiSessionsConnector
 from .index.bm25 import BM25Index
 from .index.chunker import chunk_document
-from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder
+from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
 from .index.store import VectorStore
 from .llm import LLMClient
 from .migrate import migrate_kg_sync
@@ -252,9 +252,15 @@ def _config_for(args) -> AppConfig:
 
 
 def _cached_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
-    provider = HashEmbedder() if config.embed_provider == "hash" else LocalEmbedder(
-        config.embed_model, config.embed_batch_size
-    )
+    if config.embed_provider == "hash":
+        provider = HashEmbedder()
+    elif config.embed_provider == "mlx":
+        # Measured on this corpus: 3.18x faster than PyTorch/MPS at cosine 0.9995
+        # agreement and identical top-5 ranking, while avoiding the MPS graph-cache
+        # leak (pytorch/pytorch#154329) that grew system swap by ~10GB per full run.
+        provider = MLXEmbedder(batch_size=config.embed_batch_size)
+    else:
+        provider = LocalEmbedder(config.embed_model, config.embed_batch_size)
     return CachedEmbedder(provider, corpus / ".alexandria" / "cache" / "embeddings.sqlite",
                           progress_every=config.index_progress_every)
 
