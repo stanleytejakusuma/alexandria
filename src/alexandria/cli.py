@@ -7,19 +7,25 @@ fewer dependency for a tool whose whole pitch is that your data outlives the eng
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from .config import AppConfig, load_config
 from .corpus import Doc
 from .connectors.pi_sessions import PiSessionsConnector
+from .index.bm25 import BM25Index
+from .index.chunker import chunk_document
+from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder
+from .index.store import VectorStore
 from .llm import LLMClient
 from .migrate import migrate_kg_sync
+from .monitor import QueryLogger
+from .retrieval.rerank import CrossEncoderReranker
+from .retrieval.search import SearchConfig, SearchEngine
 from .schema import Severity, validate
-
-DEFAULT_CORPUS = Path.home() / "alexandria-corpus"
-
 
 def cmd_migrate(args) -> int:
     report = migrate_kg_sync(args.vault, args.corpus, dry_run=args.dry_run)
@@ -31,7 +37,7 @@ def cmd_migrate(args) -> int:
 
 
 def cmd_lint(args) -> int:
-    corpus = Path(args.corpus)
+    corpus = _config_for(args).corpus_path
     errors = checked = 0
     for path in sorted(corpus.rglob("*.md")):
         rel = path.relative_to(corpus)
@@ -58,7 +64,7 @@ def cmd_sync(args) -> int:
         print(f"unknown connector: {args.connector}", file=sys.stderr)
         return 2
 
-    corpus = Path(args.corpus)
+    corpus = _config_for(args).corpus_path
     conn = PiSessionsConnector(
         sessions_dir=args.sessions_dir,
         state_dir=corpus / ".alexandria" / "state",
@@ -111,9 +117,140 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def cmd_index(args) -> int:
+    """Chunk, embed, and persist the corpus in deterministic batches."""
+    config = _config_for(args)
+    corpus = config.corpus_path
+    records, errors = _load_chunk_records(corpus, config, args.limit, args.workers)
+    for error in errors:
+        print(f"skip: {error}", file=sys.stderr)
+    store = VectorStore(corpus / ".alexandria" / "index")
+    lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+    if args.rebuild:
+        store.drop()
+        lexical.drop()
+    embedder = _cached_embedder(config, corpus)
+    started = time.monotonic()
+    indexed = 0
+    cache_hits = cache_misses = 0
+    next_report = config.index_progress_every
+    for start in range(0, len(records), config.embed_batch_size):
+        batch = records[start:start + config.embed_batch_size]
+        vectors = embedder.embed([record["text"] for record in batch])
+        indexed_records = [record | {"vector": vector} for record, vector in zip(batch, vectors, strict=True)]
+        store.upsert(indexed_records)
+        lexical.index(indexed_records)
+        indexed += len(indexed_records)
+        cache_hits += embedder.last_cache_stats["hits"]
+        cache_misses += embedder.last_cache_stats["misses"]
+        if indexed >= next_report or indexed == len(records):
+            rate = indexed / max(time.monotonic() - started, 1e-9)
+            eta = (len(records) - indexed) / rate if rate else 0.0
+            print(f"index: {indexed}/{len(records)} chunks  {rate * 60:.1f}/min  eta={eta / 60:.1f}m",
+                  flush=True)
+            while next_report <= indexed:
+                next_report += config.index_progress_every
+    elapsed = time.monotonic() - started
+    print(f"index: {len(records)} chunks from {len({record['doc_id'] for record in records})} documents "
+          f"in {elapsed:.2f}s (cache {cache_hits} hit/"
+          f"{cache_misses} miss)")
+    return 0
+
+
+def cmd_search(args) -> int:
+    config = _config_for(args)
+    corpus = config.corpus_path
+    embedder = _cached_embedder(config, corpus)
+    engine = SearchEngine(
+        embedder,
+        VectorStore(corpus / ".alexandria" / "index"),
+        BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite"),
+        CrossEncoderReranker(config.rerank_model),
+        SearchConfig(prefetch=config.rerank_prefetch, top_k=config.rerank_top_k,
+                     wiki_boost=config.wiki_boost, rrf_k=config.rrf_k),
+        QueryLogger(corpus / ".alexandria" / "queries.sqlite"),
+    )
+    filters = {field: value for field, value in {
+        "type": args.type, "project": args.project, "layer": args.layer,
+    }.items() if value is not None}
+    results = engine.search(args.query, k=args.k, filters=filters)
+    for result in results:
+        print(f"{result.rank}. {result.chunk_id}  score={result.score:.6f}\n"
+              f"   {result.heading_path}\n   {result.text[:400].replace(chr(10), ' ')}")
+    if args.trace:
+        print(json.dumps(engine.last_trace, indent=2, sort_keys=True))
+    return 0
+
+
+def _config_for(args) -> AppConfig:
+    return load_config(corpus_override=getattr(args, "corpus", None))
+
+
+def _cached_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
+    provider = HashEmbedder() if config.embed_provider == "hash" else LocalEmbedder(
+        config.embed_model, config.embed_batch_size
+    )
+    return CachedEmbedder(provider, corpus / ".alexandria" / "cache" / "embeddings.sqlite",
+                          progress_every=config.index_progress_every)
+
+
+def _load_chunk_records(corpus: Path, config: AppConfig, limit: int, workers: int) -> tuple[list[dict], list[str]]:
+    paths = []
+    for path in sorted(corpus.rglob("*.md")):
+        relative = path.relative_to(corpus)
+        if not relative.parts or relative.parts[0] not in {"sources", "wiki"}:
+            continue
+        if ".alexandria" not in relative.parts and "_unparsed" not in relative.parts:
+            paths.append(path)
+    if limit:
+        paths = paths[:limit]
+    records: list[dict] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for chunk_records, error in pool.map(lambda path: _chunk_path(path, corpus, config), paths):
+            records.extend(chunk_records)
+            if error:
+                errors.append(error)
+    return records, errors
+
+
+def _chunk_path(path: Path, corpus: Path, config: AppConfig) -> tuple[list[dict], str | None]:
+    try:
+        document = Doc.read(path, root=corpus)
+        markdown = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return [], f"{path.relative_to(corpus)}: {exc}"
+    metadata = _chunk_metadata(document.frontmatter, document.doc_id)
+    chunks = chunk_document(document.doc_id, markdown, config.chunk_tokens, config.chunk_overlap)
+    return [{
+        "chunk_id": chunk.chunk_id,
+        "doc_id": chunk.doc_id,
+        "text": chunk.text,
+        "heading_path": chunk.heading_path,
+        **metadata,
+    } for chunk in chunks], None
+
+
+def _chunk_metadata(frontmatter: dict, doc_id: str) -> dict:
+    generated = frontmatter.get("generated")
+    generated_at = frontmatter.get("generated_at")
+    if generated_at is None and isinstance(generated, dict):
+        generated_at = generated.get("at")
+    return {
+        "type": frontmatter.get("type"),
+        "project": frontmatter.get("project"),
+        "status": frontmatter.get("status"),
+        "source": frontmatter.get("source"),
+        "tags": list(frontmatter.get("tags") or []),
+        "entities": list(frontmatter.get("entities") or []),
+        "layer": "wiki" if doc_id.startswith("wiki/") else "sources",
+        "generated_at": generated_at,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="alexandria", description=__doc__)
-    p.add_argument("--corpus", default=str(DEFAULT_CORPUS), help="corpus repo path")
+    p.add_argument("--corpus", default=None, help="corpus repo path (overrides config)")
     sub = p.add_subparsers(dest="command", required=True)
 
     m = sub.add_parser("migrate", help="one-shot transform-copy of a flat vault")
@@ -134,6 +271,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     lint = sub.add_parser("lint", help="validate every document against the schema")
     lint.set_defaults(func=cmd_lint)
+
+    index = sub.add_parser("index", help="chunk, embed, and index the corpus")
+    index.add_argument("--rebuild", action="store_true", help="recreate index tables (retain embedding cache)")
+    index.add_argument("--limit", type=int, default=0, help="maximum documents to index")
+    index.add_argument("--workers", type=int, default=1, help="parallel document chunking workers")
+    index.set_defaults(func=cmd_index)
+
+    search = sub.add_parser("search", help="hybrid retrieval over indexed chunks")
+    search.add_argument("query")
+    search.add_argument("--k", type=int, default=None)
+    search.add_argument("--type")
+    search.add_argument("--project")
+    search.add_argument("--layer", choices=["sources", "wiki"])
+    search.add_argument("--trace", action="store_true")
+    search.set_defaults(func=cmd_search)
 
     d = sub.add_parser("decay", help="propose eviction from a capped memory store")
     d.add_argument("stores", nargs="+")

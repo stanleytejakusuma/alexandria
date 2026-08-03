@@ -1,0 +1,218 @@
+"""Pluggable local embeddings with a content-addressed SQLite cache."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import sqlite3
+import sys
+import time
+from collections.abc import Callable
+from pathlib import Path
+from threading import Lock
+from typing import Protocol, runtime_checkable
+
+__all__ = ["CachedEmbedder", "Embedder", "HashEmbedder", "LocalEmbedder"]
+
+
+@runtime_checkable
+class Embedder(Protocol):
+    """An embedding implementation usable by the retrieval pipeline."""
+
+    @property
+    def dim(self) -> int: ...
+
+    @property
+    def name(self) -> str: ...
+
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class HashEmbedder:
+    """Deterministic, dependency-free embeddings for offline tests and demos."""
+
+    def __init__(self, dim: int = 384) -> None:
+        if dim < 1:
+            raise ValueError("embedding dimension must be positive")
+        self._dim = dim
+
+    @property
+    def name(self) -> str:
+        return f"hash-{self._dim}"
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_one(text) for text in texts]
+
+    def _embed_one(self, text: str) -> list[float]:
+        values: list[float] = []
+        counter = 0
+        seed = hashlib.sha256(text.encode("utf-8")).digest()
+        while len(values) < self._dim:
+            digest = hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+            for start in range(0, len(digest), 4):
+                raw = int.from_bytes(digest[start:start + 4], "big")
+                values.append((raw / 2**31) - 1.0)
+                if len(values) == self._dim:
+                    break
+            counter += 1
+        norm = math.sqrt(sum(value * value for value in values)) or 1.0
+        return [value / norm for value in values]
+
+
+class LocalEmbedder:
+    """Sentence-transformers embedding provider, loaded only when actually used."""
+
+    def __init__(self, model: str = "Qwen/Qwen3-Embedding-0.6B", batch_size: int = 32,
+                 device: str | None = None) -> None:
+        self.model_name = model
+        self.batch_size = batch_size
+        self.device = device
+        self._model = None
+
+    @property
+    def name(self) -> str:
+        return self.model_name
+
+    @property
+    def dim(self) -> int:
+        return int(self._load().get_sentence_embedding_dimension())
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        vectors = self._load().encode(
+            texts,
+            batch_size=self.batch_size,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        return [list(map(float, vector)) for vector in vectors]
+
+    def _load(self):
+        if self._model is not None:
+            return self._model
+        try:
+            import torch
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:  # pragma: no cover - exercised in installed runtime
+            raise RuntimeError("local embeddings require sentence-transformers") from exc
+        device = self.device or _best_device(torch)
+        self._model = SentenceTransformer(self.model_name, device=device)
+        return self._model
+
+
+def _best_device(torch) -> str:
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+class CachedEmbedder:
+    """Cache embeddings by ``sha256(model_name + '\\n' + text)``.
+
+    Cache entries are durable across interrupted index runs. Corrupt values are
+    ignored and overwritten by a fresh provider call instead of breaking search.
+    """
+
+    def __init__(self, provider: Embedder, cache_path: str | Path, *, progress_every: int = 250,
+                 progress_stream=None, on_progress: Callable[[dict], None] | None = None) -> None:
+        self.provider = provider
+        self.cache_path = Path(cache_path)
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(self.cache_path, check_same_thread=False)
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS embeddings (cache_key TEXT PRIMARY KEY, vector TEXT NOT NULL)"
+        )
+        self._connection.commit()
+        self._lock = Lock()
+        self.progress_every = max(1, progress_every)
+        self.progress_stream = progress_stream or sys.stderr
+        self.on_progress = on_progress
+        self.last_cache_stats = {"hits": 0, "misses": 0}
+
+    @property
+    def name(self) -> str:
+        return self.provider.name
+
+    @property
+    def dim(self) -> int:
+        return self.provider.dim
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            self.last_cache_stats = {"hits": 0, "misses": 0}
+            return []
+        started = time.monotonic()
+        keys = [self._key(text) for text in texts]
+        vectors: list[list[float] | None] = [None] * len(texts)
+        pending: dict[str, tuple[str, list[int]]] = {}
+        hits = 0
+        with self._lock:
+            for index, (text, key) in enumerate(zip(texts, keys, strict=True)):
+                cached = self._read(key)
+                if cached is not None:
+                    vectors[index] = cached
+                    hits += 1
+                elif key in pending:
+                    pending[key][1].append(index)
+                else:
+                    pending[key] = (text, [index])
+        missing = list(pending.items())
+        if missing:
+            produced = self.provider.embed([text for _, (text, _) in missing])
+            if len(produced) != len(missing):
+                raise RuntimeError("embedder returned a different number of vectors")
+            with self._lock:
+                for (key, (_, indexes)), vector in zip(missing, produced, strict=True):
+                    clean = [float(value) for value in vector]
+                    self._connection.execute(
+                        "INSERT INTO embeddings(cache_key, vector) VALUES(?, ?) "
+                        "ON CONFLICT(cache_key) DO UPDATE SET vector=excluded.vector",
+                        (key, json.dumps(clean, separators=(",", ":"))),
+                    )
+                    for index in indexes:
+                        vectors[index] = clean
+                self._connection.commit()
+        self.last_cache_stats = {"hits": hits, "misses": len(texts) - hits}
+        self._report_progress(len(texts), started)
+        return [vector for vector in vectors if vector is not None]
+
+    def _key(self, text: str) -> str:
+        return hashlib.sha256(f"{self.name}\\n{text}".encode("utf-8")).hexdigest()
+
+    def _read(self, key: str) -> list[float] | None:
+        row = self._connection.execute(
+            "SELECT vector FROM embeddings WHERE cache_key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            parsed = json.loads(row[0])
+            if not isinstance(parsed, list) or not all(isinstance(value, (int, float)) for value in parsed):
+                raise ValueError("not a numeric vector")
+            return [float(value) for value in parsed]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _report_progress(self, total: int, started: float) -> None:
+        elapsed = max(time.monotonic() - started, 1e-9)
+        rate = total / elapsed
+        event = {
+            "count": total,
+            "rate_per_second": rate,
+            "eta_seconds": 0.0,
+            "cache": dict(self.last_cache_stats),
+        }
+        if self.on_progress is not None:
+            self.on_progress(event)
+        if total >= self.progress_every:
+            print(f"embedding: {total} chunks, {rate * 60:.1f}/min, eta=0.0m "
+                  f"(cache {self.last_cache_stats['hits']} hit/{self.last_cache_stats['misses']} miss)",
+                  file=self.progress_stream, flush=True)
