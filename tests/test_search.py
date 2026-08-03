@@ -92,3 +92,20 @@ def test_search_returns_an_empty_trace_instead_of_crashing_when_records_cannot_b
 
     assert engine.search("sweep page lint") == []
     assert engine.last_trace["stages"]["fusion"]["lookup_errors"]
+
+
+def test_reranker_sees_the_heading_not_just_the_body(tmp_path: Path):
+    """A document whose TITLE matched the query survived fusion and was then dropped
+    by the reranker, because the reranker judged relevance on text stripped of that
+    title. All three stages (bm25, embedder, reranker) must see the same text."""
+    seen = {}
+
+    class CapturingReranker:
+        def rerank(self, query, candidates, k):
+            seen["texts"] = [c.text for c in candidates]
+            return list(candidates[:k])
+
+    build_engine(tmp_path, reranker=CapturingReranker()).search("sweep page lint")
+
+    assert seen.get("texts"), "reranker received no candidates"
+    assert any("Heading" in text for text in seen["texts"]), seen["texts"]

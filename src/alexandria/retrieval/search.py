@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..index.bm25 import BM25Index
+from ..index.bm25 import BM25Index, searchable_text
 from ..index.embedder import Embedder
 from ..index.filtering import normalize_filters
 from ..index.store import VectorStore
@@ -139,7 +139,12 @@ class SearchEngine:
             "timing_ms": _elapsed_ms(fusion_started),
         }
         candidates = [
-            RerankCandidate(chunk_id, records[chunk_id]["text"], boosted_scores[chunk_id])
+            # Heading included: the reranker judges "does this passage answer the
+            # query?", and judging that on text stripped of its own title is how a
+            # document whose TITLE matches the query gets dropped. All three stages
+            # (bm25, embedder, reranker) must see the same text.
+            RerankCandidate(chunk_id, searchable_text(records[chunk_id]),
+                            boosted_scores[chunk_id])
             for chunk_id in after[:self.config.prefetch] if chunk_id in records
         ]
 

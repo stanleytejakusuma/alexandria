@@ -40,9 +40,16 @@ class BM25Index:
         with self.connection:
             for chunk in records:
                 self.connection.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk["chunk_id"],))
+                # Index the heading breadcrumb ALONGSIDE the body. The chunker moves
+                # headings out of `text` and into `heading_path`, so indexing text
+                # alone made every document title and section heading unsearchable --
+                # a systemic recall hole, since a note's title is often its most
+                # information-dense line. Measured: a document titled '...frontmatter
+                # isolation pinning on all agent types' ranked >200 for a query that
+                # was nearly its verbatim title.
                 self.connection.execute(
                     "INSERT INTO chunks_fts(chunk_id, text) VALUES (?, ?)",
-                    (chunk["chunk_id"], chunk["text"]),
+                    (chunk["chunk_id"], searchable_text(chunk)),
                 )
                 doc_id = str(chunk["doc_id"])
                 layer = "wiki" if doc_id.startswith("wiki/") else "sources"
@@ -78,6 +85,18 @@ class BM25Index:
         with self.connection:
             self.connection.execute("DELETE FROM chunks_fts")
             self.connection.execute("DELETE FROM chunk_metadata")
+
+
+def searchable_text(chunk: Mapping[str, Any]) -> str:
+    """Body prefixed with its heading breadcrumb, for lexical and dense indexing alike.
+
+    This is the cheap, deterministic half of "contextual retrieval": a chunk carries
+    the structural context it came from, so 'retry behaviour' under a 'Payments
+    service' heading is findable by either term.
+    """
+    heading = str(chunk.get("heading_path") or "").strip()
+    body = str(chunk.get("text") or "")
+    return f"{heading}\n\n{body}" if heading else body
 
 
 def fts_query(query: str) -> str | None:

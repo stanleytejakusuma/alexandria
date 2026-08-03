@@ -124,3 +124,21 @@ def test_batch_smaller_than_batch_size_still_processes():
     stats = _run_index_pipeline(_records(3), embedder, store, lexical, batch_size=10,
                                 progress_every=1_000_000, progress_stream=None)
     assert stats.indexed == 3
+
+
+def test_embedded_text_includes_the_heading_breadcrumb():
+    """BM25 and the embedder must see the SAME text, or a chunk is findable by one
+    retriever and invisible to the other."""
+    from alexandria.index.bm25 import searchable_text
+
+    chunk = {"chunk_id": "c1", "doc_id": "d",
+             "heading_path": "Payments service > Retry behaviour",
+             "text": "The guard retries three times."}
+    combined = searchable_text(chunk)
+    assert "Payments service" in combined
+    assert "retries three times" in combined
+
+
+def test_searchable_text_handles_a_missing_heading():
+    from alexandria.index.bm25 import searchable_text
+    assert searchable_text({"text": "body only"}) == "body only"

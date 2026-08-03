@@ -89,3 +89,25 @@ def test_more_matching_terms_still_ranks_higher():
     ])
     ranked = [chunk_id for chunk_id, _ in index.search("alpha beta gamma", 5, None)]
     assert ranked[0] == "strong"
+
+
+def test_heading_text_is_searchable(tmp_path: Path):
+    """The chunker moves headings into heading_path, so indexing only `text` made
+    document titles unsearchable -- a systemic recall hole, since the title is often
+    the most information-dense line in a note. A query matching a document's title
+    must find it."""
+    index = BM25Index(tmp_path / "fts.sqlite")
+    index.index([{
+        "chunk_id": "c1", "doc_id": "d1",
+        "heading_path": "Phase 2 action plan: frontmatter isolation pinning on all agent types",
+        "text": "Unrelated body prose that shares no words with the query.",
+    }])
+
+    hits = [cid for cid, _ in index.search("frontmatter isolation pinning agent types", 5)]
+    assert hits == ["c1"]
+
+
+def test_body_still_searchable_when_heading_absent(tmp_path: Path):
+    index = BM25Index(tmp_path / "fts.sqlite")
+    index.index([{"chunk_id": "c1", "doc_id": "d1", "text": "quarantine after repeated lint failures"}])
+    assert [cid for cid, _ in index.search("quarantine lint", 5)] == ["c1"]

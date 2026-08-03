@@ -21,7 +21,7 @@ from .connectors.pi_sessions import PiSessionsConnector
 from .eval.golden import load_golden, verify_targets
 from .eval.history import append_run, compare, load_runs, regressions
 from .eval.runner import EvalReport, run_eval
-from .index.bm25 import BM25Index
+from .index.bm25 import BM25Index, searchable_text
 from .index.chunker import chunk_document
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
 from .index.store import VectorStore
@@ -185,7 +185,10 @@ def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_
         try:
             for start in range(0, len(records), batch_size):
                 batch = records[start:start + batch_size]
-                vectors = embedder.embed([record["text"] for record in batch])
+                # Embed the heading breadcrumb alongside the body, matching what
+                # BM25 indexes. Without it a chunk's structural context ("Payments
+                # service > Retry behaviour") is invisible to BOTH retrievers.
+                vectors = embedder.embed([searchable_text(record) for record in batch])
                 cache_stats = dict(embedder.last_cache_stats)   # snapshot NOW, not later
                 indexed_records = [record | {"vector": vector}
                                    for record, vector in zip(batch, vectors, strict=True)]
