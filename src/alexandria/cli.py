@@ -135,6 +135,13 @@ def build_parser() -> argparse.ArgumentParser:
     lint = sub.add_parser("lint", help="validate every document against the schema")
     lint.set_defaults(func=cmd_lint)
 
+    d = sub.add_parser("decay", help="propose eviction from a capped memory store")
+    d.add_argument("stores", nargs="+")
+    d.add_argument("--apply", action="store_true")
+    d.add_argument("--ingested-ok", action="store_true")
+    d.add_argument("--target", type=float, default=0.80)
+    d.set_defaults(func=lambda a: __import__("alexandria.decay", fromlist=["_run"])._run(a))
+
     return p
 
 
