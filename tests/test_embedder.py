@@ -111,3 +111,39 @@ def test_local_embedder_default_still_normalizes_and_batches():
     call = fake.encode_calls[0]
     assert call["batch_size"] == 7
     assert call["normalize_embeddings"] is True
+
+
+def test_query_embedding_gets_the_instruct_prefix(tmp_path: Path):
+    """Qwen3-Embedding is instruction-aware: it ships a query prompt in its own
+    config_sentence_transformers.json but default_prompt_name is null, so nothing
+    applies it unless asked. The model card quantifies omitting it at a 1-5%
+    retrieval drop -- and paraphrase queries, our measured weak spot, are the
+    trained-for case. Documents are embedded RAW (the card is explicit); only
+    queries carry the prefix."""
+    from alexandria.index.embedder import QUERY_PREFIX
+
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, tmp_path / "cache.sqlite")
+    embedder.embed_queries(["what is the capital gate"])
+
+    sent = provider.calls[0][0]
+    assert sent.startswith("Instruct: ")
+    assert sent.endswith("Query:what is the capital gate")   # no space after Query:
+    assert QUERY_PREFIX.endswith("Query:")
+
+
+def test_document_embedding_stays_raw(tmp_path: Path):
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, tmp_path / "cache.sqlite")
+    embedder.embed(["a document body"])
+    assert provider.calls[0] == ["a document body"]
+
+
+def test_query_and_document_cache_entries_never_collide(tmp_path: Path):
+    """Same text as query and as document must produce distinct cache keys, or a
+    prefixed query vector could be served for a raw document embed."""
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, tmp_path / "cache.sqlite")
+    embedder.embed(["same text"])
+    embedder.embed_queries(["same text"])
+    assert len(provider.calls) == 2          # both computed, no false cache hit

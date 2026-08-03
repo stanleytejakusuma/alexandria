@@ -109,3 +109,70 @@ def test_reranker_sees_the_heading_not_just_the_body(tmp_path: Path):
 
     assert seen.get("texts"), "reranker received no candidates"
     assert any("Heading" in text for text in seen["texts"]), seen["texts"]
+
+
+def test_retrieval_depth_is_decoupled_from_rerank_width(tmp_path: Path):
+    """prefetch conflated two different knobs: how DEEP each retriever's candidate
+    list goes (arithmetic, ~free) and how many candidates the cross-encoder scores
+    (~100ms each). A target measured at dense rank 42 contributes ZERO to fusion at
+    depth 8 -- RRF can only surface mid-ranked candidates from lists deep enough to
+    contain them."""
+    captured = {}
+
+    class CapturingBM25:
+        def search(self, query, k, where=None):
+            captured["bm25_k"] = k
+            return []
+
+    class CapturingStore:
+        def search_vector(self, vec, k, where=None):
+            captured["dense_k"] = k
+            return []
+        def get_many(self, ids):
+            return {}
+
+    class CountingReranker:
+        def rerank(self, query, candidates, k):
+            captured["rerank_in"] = len(candidates)
+            return list(candidates[:k])
+
+    class OneVec:
+        name, dim = "fake", 2
+        def embed(self, texts): return [[1.0, 0.0] for _ in texts]
+
+    engine = SearchEngine(OneVec(), CapturingStore(), CapturingBM25(), CountingReranker(),
+                          SearchConfig(depth=50, prefetch=8, top_k=5))
+    engine.search("anything")
+    assert captured["bm25_k"] == 50
+    assert captured["dense_k"] == 50
+
+
+def test_depth_defaults_to_at_least_prefetch(tmp_path: Path):
+    cfg = SearchConfig(prefetch=8)
+    assert cfg.depth >= cfg.prefetch
+
+
+def test_search_uses_the_query_prefixed_embedding_path(tmp_path: Path):
+    """Queries must go through embed_queries (instruct-prefixed), never the raw
+    document path -- the model was trained on asymmetric query/document encoding."""
+    calls = {}
+
+    class RecordingEmbedder:
+        name, dim = "fake", 2
+        def embed(self, texts):
+            calls["embed"] = list(texts); return [[1.0, 0.0] for _ in texts]
+        def embed_queries(self, texts):
+            calls["embed_queries"] = list(texts); return [[1.0, 0.0] for _ in texts]
+
+    class EmptyStore:
+        def search_vector(self, v, k, where=None): return []
+        def get_many(self, ids): return {}
+
+    class EmptyBM25:
+        def search(self, q, k, where=None): return []
+
+    from alexandria.retrieval.rerank import IdentityReranker
+    SearchEngine(RecordingEmbedder(), EmptyStore(), EmptyBM25(),
+                 IdentityReranker()).search("my question")
+    assert calls.get("embed_queries") == ["my question"]
+    assert "embed" not in calls

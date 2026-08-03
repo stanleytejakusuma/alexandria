@@ -21,9 +21,21 @@ __all__ = ["SearchConfig", "SearchEngine", "SearchResult"]
 
 @dataclass(frozen=True)
 class SearchConfig:
-    # 8: measured knee on golden-v1 -- 20/12/8 give identical recall and MRR,
-    # p50 1071ms -> 437ms. See config.py.
+    # Two DIFFERENT knobs, deliberately decoupled:
+    #   depth    -- how far down each retriever's ranking we collect candidates for
+    #               fusion. Cost: arithmetic + one batched get_many (~free). RRF can
+    #               only surface a candidate mid-ranked in one list if that list is
+    #               deep enough to contain it -- a golden-set target measured at
+    #               dense rank 42 contributed ZERO to fusion at depth 8.
+    #   prefetch -- how many fused candidates the cross-encoder scores. Cost: one
+    #               model pass each (~100ms). 8 is the measured knee on golden-v1
+    #               (20/12/8 identical recall+MRR; p50 1071ms -> 437ms).
+    depth: int = 100
     prefetch: int = 8
+
+    def __post_init__(self):
+        if self.depth < self.prefetch:
+            object.__setattr__(self, "depth", self.prefetch)
     top_k: int = 5
     wiki_boost: float = 1.25
     rrf_k: int = 60
@@ -73,7 +85,12 @@ class SearchEngine:
         embed_started = time.perf_counter()
         query_vector = None
         try:
-            query_vector = self.embedder.embed([query])[0]
+            # embed_queries applies the model's instruct prefix (queries only;
+            # documents are embedded raw). Fall back for bare providers.
+            if hasattr(self.embedder, "embed_queries"):
+                query_vector = self.embedder.embed_queries([query])[0]
+            else:
+                query_vector = self.embedder.embed([query])[0]
             cache_stats = getattr(self.embedder, "last_cache_stats", {"hits": 0, "misses": 1})
             trace["stages"]["embed"] = {
                 "out": 1,
@@ -93,20 +110,20 @@ class SearchEngine:
         lexical_started = time.perf_counter()
         dense_started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=2) as pool:
-            lexical_future = pool.submit(self.bm25.search, query, self.config.prefetch, metadata_filter)
-            dense_future = (pool.submit(self.store.search_vector, query_vector, self.config.prefetch,
+            lexical_future = pool.submit(self.bm25.search, query, self.config.depth, metadata_filter)
+            dense_future = (pool.submit(self.store.search_vector, query_vector, self.config.depth,
                                         metadata_filter) if query_vector is not None else None)
             lexical, lexical_error = _future_value(lexical_future, [])
             dense, dense_error = _future_value(dense_future, []) if dense_future is not None else ([], None)
         trace["stages"]["bm25"] = {
-            "in": self.config.prefetch,
+            "in": self.config.depth,
             "out": len(lexical),
             "scores": dict(lexical),
             "timing_ms": _elapsed_ms(lexical_started),
             "error": lexical_error,
         }
         trace["stages"]["dense"] = {
-            "in": self.config.prefetch,
+            "in": self.config.depth,
             "out": len(dense),
             "scores": {row["chunk_id"]: -float(row.get("_distance", 0.0)) for row in dense},
             "timing_ms": _elapsed_ms(dense_started),

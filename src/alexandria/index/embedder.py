@@ -68,6 +68,19 @@ class HashEmbedder:
 # corpus's chunker ever produced (see tests/test_chunker.py). 640 gives headroom.
 DEFAULT_MAX_LENGTH = 640
 
+# Qwen3-Embedding is instruction-aware. This exact string ships in the model's own
+# config_sentence_transformers.json as the "query" prompt -- but default_prompt_name
+# is null, so nothing applies it unless explicitly requested, and we were not. The
+# model card quantifies the omission: "not using an instruct on the query side can
+# lead to a drop in retrieval performance by approximately 1% to 5%", and paraphrase
+# queries (our measured weak spot) are precisely the trained-for case. Documents are
+# embedded RAW -- the card is explicit: "No need to add instruction for retrieval
+# documents." Note: no space after "Query:" (matches the official template), and the
+# instruction stays in English even for non-English queries (also per the card).
+# Pure text-prepend, so it works identically for the PyTorch and MLX providers.
+QUERY_PREFIX = ("Instruct: Given a web search query, retrieve relevant passages "
+                "that answer the query\nQuery:")
+
 
 class LocalEmbedder:
     """Sentence-transformers embedding provider, loaded only when actually used.
@@ -230,6 +243,15 @@ class CachedEmbedder:
     @property
     def dim(self) -> int:
         return self.provider.dim
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        """Embed QUERIES: instruct-prefixed per the model's own template.
+
+        Lives here (not per-provider) so every provider gets it identically, and the
+        cache stays correct for free -- the prefixed text is the cache key, so query
+        vectors and raw-document vectors of the same string can never collide.
+        """
+        return self.embed([f"{QUERY_PREFIX}{text}" for text in texts])
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
