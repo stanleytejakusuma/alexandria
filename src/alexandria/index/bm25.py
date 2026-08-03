@@ -81,12 +81,26 @@ class BM25Index:
 
 
 def fts_query(query: str) -> str | None:
-    """Return an FTS5 AND expression, never raw user query syntax."""
-    tokens = [token.casefold() for token in WORD_RE.findall(query) if token.casefold() not in STOP_WORDS]
+    """Return a safe FTS5 OR expression, never raw user query syntax.
+
+    OR, not AND. Pure AND makes BM25 a filter rather than a ranker: every incidental
+    word in a natural question becomes mandatory, so one absent term drops an
+    otherwise perfect document to no-match. Measured on golden-v1 -- a document
+    literally titled 'consult-memory-before-building' ranked below 200 for the query
+    'consult memory before building anything new', purely because 'anything' and
+    'new' were required. Three of five golden misses had this shape.
+
+    OR is safe here precisely because FTS5's bm25() ranking already rewards documents
+    matching more terms, and rarer terms more strongly. The failure mode of naive OR
+    (every token optional, so a long question matches almost anything) is a *ranking*
+    concern, and ranking is exactly what bm25() plus the downstream reranker handle.
+    """
+    tokens = [token.casefold() for token in WORD_RE.findall(query)
+              if token.casefold() not in STOP_WORDS]
     if not tokens:
         return None
     # Quoted individual tokens keep FTS operators, quotes, and prefix markers literal.
-    return " AND ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+    return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
 
 
 def json_dumps_list(value: Any) -> str:
