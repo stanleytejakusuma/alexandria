@@ -8,7 +8,11 @@
 
 Alexandria turns the exhaust of your AI coding sessions, notes, chats and documents into a **maintained, cited knowledge base** — then serves it back to any LLM harness through one retrieval API.
 
-It is built on a simple claim: **most "AI memory" systems transcribe, and almost none synthesize.** They write down everything that happened and call it knowledge. What you get is a log wearing a knowledge base's schema — and no amount of better vector search fixes it, because the synthesis was never written in the first place.
+It is built on a specific claim: **synthesis without provenance is not knowledge, it's a nicer-looking guess.**
+
+Plenty of systems compress. The serious agent-memory projects (Mem0, Zep/Graphiti, Letta) already do write-time consolidation, and some do real supersession. What is rare is synthesis into an artifact a *human can audit*: a plain-text, diffable, revertable page where **every individual claim names the source it came from**, and a linter fails the build when one doesn't.
+
+The hobby tier is worse — it logs everything and calls it memory, producing a log wearing a knowledge base's schema. No amount of better vector search fixes that, because the synthesis was never written at all. Alexandria targets both gaps: it synthesizes, and it makes the synthesis checkable.
 
 ```
 raw sources  ──▶  connectors  ──▶  sources/          ──▶  nightly    ──▶  wiki/           ──▶  retrieval API
@@ -129,8 +133,8 @@ No. It uses one (LanceDB) as derived, rebuildable state. The durable artifact is
 **How is this different from a "second brain" / Obsidian / Notion?**
 Those are places for *you* to write. Alexandria is machinery that maintains the knowledge base *for* you from sources you already generate — and its output is a normal Obsidian-readable vault, so you can use both.
 
-**How is this different from agent memory tools (mem0, Zep, MCP memory servers)?**
-Those mostly capture and retrieve. Alexandria's premise is that capture was never the bottleneck — *compression with provenance* is. It also treats an agent's own session transcripts as a first-class source to distill, not just a place to write memories.
+**How is this different from agent memory tools (Mem0, Zep/Graphiti, Letta, MCP memory servers)?**
+Credit where due: those do consolidate at write time, and Zep does genuine temporal invalidation — the "nobody synthesizes" line you'll hear is simply false. Two differences remain. First, **auditability**: their consolidated memory lives in a database as opaque rows, whereas Alexandria's is markdown in git — you can read the whole thing, diff what last night's run changed, and `git revert` a bad synthesis. Second, **enforced per-claim provenance**: a lint ERROR fires on any wiki claim without a resolvable citation, so "why does it believe this?" always has an answer. It also treats an agent's own session transcripts as a first-class source to distill, not merely a place to write memories.
 
 **Does it stop hallucination?**
 No system does. It changes hallucination from invisible and recurring into visible and correctable: a wrong claim becomes a reviewable line in a diffable file with a citation you can check, instead of a fresh unreviewable paragraph on every query.
