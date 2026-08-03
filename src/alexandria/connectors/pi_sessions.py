@@ -193,23 +193,30 @@ def segment_bursts(events: list[dict], gap_hours: float, session_id: str = "",
     return bursts
 
 
-def substance(burst: Burst, min_user_turns: int, min_user_chars: int) -> Verdict:
+def substance(burst: Burst, min_user_turns: int = 0, min_user_chars: int = 180) -> Verdict:
     """Deterministic substance score. A skip predicate under §6.1a: it must be
-    reproducible, must state its reason, and must never be a model's judgment call."""
+    reproducible, must state its reason, and must never be a model's judgment call.
+
+    Turn count and human content are required TOGETHER. Accepting either alone lets a
+    burst of two trivial turns ("ok", "continue") beside a huge tool dump through as
+    'substantive' -- measured: seven such bursts yielded 45 fabricated notes, because
+    a model handed a file listing and asked for observations will invent some.
+    Tool output is not counted: only human-authored turns are evidence of thinking.
+    """
     metrics = {
         "user_turns": burst.user_turns,
         "user_chars": burst.user_chars,
         "messages": len(burst.messages),
     }
-    if burst.user_turns >= min_user_turns:
-        return Verdict(True, "", metrics)
-    # A single dense turn can still be substantive -- turn count alone would
-    # misclassify one real architecture question as an infra smoke test.
+    # Human-authored volume is the whole test. Turn count is kept in the metrics for
+    # the skip log, but it does not gate: once you require real content, counting
+    # turns adds nothing, and gating on turns ALONE was the bug -- it admitted two
+    # trivial turns beside a tool dump.
     if burst.user_chars >= min_user_chars:
         return Verdict(True, "", metrics)
     return Verdict(False,
-                   f"user_turns={burst.user_turns} < {min_user_turns} and "
-                   f"user_chars={burst.user_chars} < {min_user_chars}", metrics)
+                   f"user_chars={burst.user_chars} < {min_user_chars} "
+                   f"(turns={burst.user_turns}, tool output not counted)", metrics)
 
 
 class PiSessionsConnector:

@@ -42,3 +42,23 @@ def test_round_trip_preserves_surviving_entries_exactly(tmp_path):
     entries = decay.parse(store)
     assert len(entries) == 2
     assert decay.render(entries) == original
+
+
+def test_multi_topic_blob_splits_on_numbered_clauses():
+    """The cap made atomic entries impossible, so entries became multi-topic blobs --
+    which is exactly what makes eviction collateral-lossy."""
+    blob = ("Date/time bugs. (1) ps lstart is fixed-width, pad with two spaces. "
+            "(2) Time-bucketed UI has time-shaped states, probe thresholds. "
+            "(3) When a fix does not take, re-derive the root cause. "
+            "(4) npm 11.8 removes bin entries written as ./bin/x.")
+    parts = decay.split_clauses(blob)
+    assert len(parts) == 4
+    assert all(p.startswith("Date/time bugs.") for p in parts)
+    assert "ps lstart" in parts[0] and "npm 11.8" in parts[3]
+
+
+def test_prose_without_clause_structure_is_left_alone():
+    """A bad split mangles a survivor -- worse than no split."""
+    text = "A single coherent rule about publishing that has no numbered clauses."
+    assert decay.split_clauses(text) == [text]
+    assert decay.split_clauses("Only (1) one clause here.") == ["Only (1) one clause here."]

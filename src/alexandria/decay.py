@@ -56,6 +56,32 @@ CAPS = {"USER.md": 5000, "MEMORY.md": 5000, "failures.md": 10000}
 DEFAULT_CAP = 5000
 
 
+CLAUSE_RE = re.compile(r"(?=\((\d)\)\s)")
+
+
+def split_clauses(text: str) -> list[str]:
+    """Split a multi-topic blob on its own numbered clauses.
+
+    Entries became 1500-3000 char multi-topic blobs BECAUSE the cap made atomic ones
+    impossible to add -- so the cap manufactured the shape that now makes deletion
+    collateral-lossy. Splitting restores atomicity, which is what makes eviction
+    surgical instead of a choice between keeping four lessons or losing four.
+
+    Returns [text] unchanged when there is no clear clause structure: a bad split is
+    worse than no split, because it mangles a survivor.
+    """
+    parts = [p.strip() for p in CLAUSE_RE.split(text) if p and p.strip()]
+    # CLAUSE_RE captures the digit, so drop bare-digit fragments
+    parts = [p for p in parts if not p.isdigit()]
+    if len(parts) < 3:
+        return [text]
+    head = parts[0] if not parts[0].startswith("(") else ""
+    body = [p for p in parts if p.startswith("(")]
+    if len(body) < 3:
+        return [text]
+    return [f"{head} {b}".strip() if head else b for b in body]
+
+
 @dataclass
 class Entry:
     text: str
@@ -112,6 +138,8 @@ def _build() -> argparse.ArgumentParser:
                     help="assert contents are already durable elsewhere")
     ap.add_argument("--target", type=float, default=0.80,
                     help="target fill fraction of cap (default 0.80)")
+    ap.add_argument("--propose-splits", action="store_true",
+                    help="show how multi-topic blobs would split into atomic entries")
     return ap
 
 
@@ -139,6 +167,16 @@ def _run(args) -> int:
         print(f"\n{'='*74}\n{path}  ({size}/{cap} chars, {len(entries)} entries)")
         print(f"target {target} chars ({args.target:.0%} of cap)")
         print("-"*74)
+
+        if getattr(args, "propose_splits", False):
+            for e in entries:
+                pieces = split_clauses(e.text)
+                if len(pieces) > 1:
+                    print(f"  SPLIT  {e.chars:>5}ch -> {len(pieces)} atomic entries"
+                          f"  [{e.classify()[0]}] {e.title[:52]}")
+                    for i, piece in enumerate(pieces, 1):
+                        print(f"      {i}. ({len(piece)}ch) {piece[:96]}...")
+            print()
 
         keep, evict = [], []
         # Evict only EPISODIC, largest first, until under target. Pinned and

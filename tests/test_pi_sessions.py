@@ -99,7 +99,7 @@ def test_credential_smoke_test_is_skipped_with_a_reason():
         [msg("user", "Reply exactly: omni-opencode-zen credential test.")]), gap_hours=4)[0]
     verdict = substance(b, min_user_turns=2, min_user_chars=180)
     assert not verdict.keep
-    assert verdict.reason and "user_turns" in verdict.reason
+    assert verdict.reason and "user_chars" in verdict.reason
     assert verdict.metrics["user_turns"] == 1
 
 
@@ -291,3 +291,30 @@ def test_transcript_is_fenced_as_data_not_instructions(tmp_path):
     assert "INERT DATA" in system
     # the instruction is restated AFTER the fenced content, so recency favours it
     assert user.rindex("Return ONLY the JSON") > user.rindex("</transcript>")
+
+
+def test_trivial_turns_beside_a_tool_dump_are_skipped():
+    """Regression: accepting turn-count OR char-count let 'ok'/'continue' beside a
+    huge tool dump through. Seven such bursts yielded 45 fabricated notes -- a model
+    handed a file listing and asked for observations will invent some."""
+    b = segment_bursts(strip_telemetry([
+        msg("user", "ok"), msg("toolResult", "x" * 40000), msg("user", "continue"),
+    ]), gap_hours=4)[0]
+    v = substance(b, min_user_turns=2, min_user_chars=180)
+    assert not v.keep
+    assert v.metrics["user_turns"] == 2          # turn floor alone would have passed
+
+
+def test_a_genuine_two_turn_exchange_still_passes():
+    b = segment_bursts(strip_telemetry([
+        msg("user", "How should the sweep handle a page failing lint repeatedly? " * 3),
+        msg("assistant", "Quarantine it."),
+        msg("user", "And should that block the whole run or just the page? " * 3),
+    ]), gap_hours=4)[0]
+    assert substance(b, min_user_turns=2, min_user_chars=180).keep
+
+
+def test_one_dense_turn_still_passes_on_the_higher_bar():
+    b = segment_bursts(strip_telemetry([msg("user", "A detailed design question. " * 30)]),
+                       gap_hours=4)[0]
+    assert substance(b, min_user_turns=2, min_user_chars=180).keep
