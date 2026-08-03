@@ -114,16 +114,14 @@ class SearchEngine:
         fusion_started = time.perf_counter()
         base_scores = rrf([[chunk_id for chunk_id, _ in lexical],
                            [row["chunk_id"] for row in dense]], self.config.rrf_k)
-        records = {}
-        lookup_errors = {}
-        for chunk_id in base_scores:
-            try:
-                record = self.store.get(chunk_id)
-            except Exception as exc:
-                lookup_errors[chunk_id] = f"{type(exc).__name__}: {exc}"
-                continue
-            if record is not None:
-                records[chunk_id] = record
+        # ONE batched lookup, not one per candidate: the per-candidate version cost
+        # ~494ms of pure overhead per query (up to 40 full table scans).
+        records: dict[str, dict] = {}
+        lookup_errors: dict[str, str] = {}
+        try:
+            records = self.store.get_many(list(base_scores))
+        except Exception as exc:
+            lookup_errors["*"] = f"{type(exc).__name__}: {exc}"
         base_scores = {chunk_id: score for chunk_id, score in base_scores.items() if chunk_id in records}
         layers = {chunk_id: record["layer"] for chunk_id, record in records.items()}
         before = _ordered(base_scores)

@@ -74,6 +74,35 @@ class VectorStore:
         rows = table.search().where(f"chunk_id = {literal}", prefilter=True).limit(1).to_list()
         return _record_from_lance(rows[0]) if rows else None
 
+    def get_many(self, chunk_ids: Iterable[str]) -> dict[str, dict]:
+        """Fetch many records in ONE query.
+
+        Fusion previously called get() per candidate -- up to 40 separate scans of the
+        whole table per query, measured at ~494ms of pure overhead. Batching collapses
+        that into a single predicate. Missing ids are simply absent from the result:
+        callers already handle a candidate vanishing, and inventing a placeholder
+        would put a fabricated record into the retrieval path.
+        """
+        ids = [str(chunk_id) for chunk_id in chunk_ids]
+        if not ids:
+            return {}
+        if self._fallback is not None:
+            found = {}
+            for chunk_id in ids:
+                record = self._fallback.get(chunk_id)
+                if record is not None:
+                    found[chunk_id] = record
+            return found
+        table = self._open_table()  # pragma: no cover - requires optional dependency
+        if table is None:
+            return {}
+        predicate = ", ".join(json.dumps(chunk_id) for chunk_id in ids)
+        rows = (table.search()
+                .where(f"chunk_id IN ({predicate})", prefilter=True)
+                .limit(len(ids))
+                .to_list())
+        return {row["chunk_id"]: _record_from_lance(row) for row in rows}
+
     def count(self) -> int:
         if self._fallback is not None:
             return self._fallback.count()

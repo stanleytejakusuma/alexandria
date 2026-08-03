@@ -55,3 +55,30 @@ def test_store_filters_list_metadata_and_drop(tmp_path: Path):
                                                                where={"tags": "retrieval"})] == ["a"]
     store.drop()
     assert store.count() == 0
+
+
+def test_get_many_returns_all_requested_records(tmp_path: Path):
+    """Fusion looked each candidate up individually -- up to 40 separate scans per
+    query, measured at ~494ms. One batched query replaces them."""
+    store = VectorStore(tmp_path / "index")
+    store.upsert([record(f"c{i}", f"sources/n/{i}", [float(i), 0.0]) for i in range(5)])
+
+    got = store.get_many([f"c{i}" for i in range(5)])
+
+    assert set(got) == {f"c{i}" for i in range(5)}
+    assert got["c3"]["chunk_id"] == "c3"
+
+
+def test_get_many_handles_missing_and_empty(tmp_path: Path):
+    store = VectorStore(tmp_path / "index")
+    store.upsert([record("real", "sources/n/a", [1.0, 0.0])])
+
+    assert store.get_many([]) == {}
+    got = store.get_many(["real", "does-not-exist"])
+    assert set(got) == {"real"}          # missing ids are absent, never invented
+
+
+def test_get_many_agrees_with_get(tmp_path: Path):
+    store = VectorStore(tmp_path / "index")
+    store.upsert([record("a", "sources/n/a", [1.0, 0.0])])
+    assert store.get_many(["a"])["a"] == store.get("a")
