@@ -64,8 +64,7 @@ def test_doc_id_is_path_minus_extension():
     assert doc_id("./sources/pi/x.md") == "sources/pi/x"
 
 
-def test_body_hash_ignores_trailing_whitespace_only():
-    assert body_hash("hello\n") == body_hash("hello\n\n\n")
+def test_body_hash_distinguishes_leading_whitespace():
     assert body_hash("  hello") != body_hash("hello")
 
 
@@ -114,3 +113,25 @@ def test_doc_read_rejects_missing_frontmatter(tmp_path):
     p.write_text("no frontmatter here\n")
     with pytest.raises(ValueError, match="frontmatter"):
         Doc.read(p, root=tmp_path)
+
+
+# ---- regression: Codex adversarial review findings ----
+
+def test_closing_fence_must_be_exact():
+    """`--- trailing prose` is not a valid closing fence; the doc is malformed."""
+    fm, _ = split_frontmatter("---\ntype: observation\n--- prose\nbody\n")
+    assert fm is None
+
+
+def test_body_containing_bare_fence_lines_survives():
+    """184 real notes have `---` inside the body. Only the FIRST closing fence splits."""
+    text = "---\ntype: observation\ntitle: x\n---\nintro\n\n---\n\nafter rule\n"
+    fm, body = split_frontmatter(text)
+    assert fm["type"] == "observation"
+    assert body == "intro\n\n---\n\nafter rule\n"
+
+
+def test_body_hash_is_byte_exact():
+    """Immutability guard must NOT forgive trailing-whitespace edits."""
+    assert body_hash("hello\n") != body_hash("hello\n\n\n")
+    assert body_hash("hello ") != body_hash("hello")

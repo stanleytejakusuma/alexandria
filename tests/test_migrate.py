@@ -195,3 +195,178 @@ def test_every_output_validates(tmp_path):
     rep = migrate_kg_sync(vault, corpus, dry_run=False)
     assert rep.schema_errors == [], rep.schema_errors
     assert rep.written == 5
+
+
+# ---- regression: Codex adversarial review findings ----
+
+FENCED = """---
+source: notes-app
+source_id: 'f1'
+type: observation
+title: Note about the schema
+status: active
+date: '2026-07-04T15:54:00'
+---
+
+Real content before.
+
+```markdown
+## Related (semantic)
+- [[an example]] (0.81)
+```
+
+Real content after the fence.
+
+## A Later Section
+
+Must survive.
+"""
+
+
+def test_fenced_literal_heading_is_not_treated_as_a_section(tmp_path):
+    """A note *about* the vault schema quotes the heading inside a code fence.
+    A fence-unaware matcher deletes from there to EOF -- catastrophic silent loss."""
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    write(vault, "fenced.md", FENCED)
+    migrate_kg_sync(vault, corpus, dry_run=False)
+
+    body = next((corpus / "sources").rglob("*.md")).read_text()
+    assert "Real content after the fence." in body
+    assert "## A Later Section" in body
+    assert "Must survive." in body
+    assert "## Related (semantic)" in body      # inside the fence: preserved
+
+
+def test_h3_related_heading_is_not_dropped(tmp_path):
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    write(vault, "h3.md", LEGACY.replace("## Related (semantic)", "### Related (semantic)"))
+    migrate_kg_sync(vault, corpus, dry_run=False)
+    body = next((corpus / "sources").rglob("*.md")).read_text()
+    assert "### Related (semantic)" in body     # only H2 is machine-generated
+
+
+def test_section_at_end_of_body_and_annotations_after(tmp_path):
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    write(vault, "a.md", LEGACY)
+    migrate_kg_sync(vault, corpus, dry_run=False)
+    body = next((corpus / "sources").rglob("*.md")).read_text()
+    assert "Something Else" not in body         # the H2 section did get dropped
+    assert "Hand-written note that must survive." in body
+
+
+def test_invalid_utf8_is_quarantined_not_corrupted(tmp_path):
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    (vault / "bad.md").write_bytes(b"---\ntype: observation\n---\n\xff\xfe not utf8\n")
+    write(vault, "good.md", LEGACY)
+
+    rep = migrate_kg_sync(vault, corpus, dry_run=False)
+    assert rep.quarantined == 1
+    assert "invalid utf-8" in rep.quarantine_reasons
+    # quarantined byte-for-byte, never replaced with U+FFFD or emptied
+    assert (corpus / "sources" / "_unparsed" / "bad.md").read_bytes().endswith(b"\xff\xfe not utf8\n")
+    assert rep.total_in == rep.written + rep.quarantined + rep.collapsed
+
+
+def test_output_path_collisions_are_detected_and_disambiguated(tmp_path):
+    """Distinct source_ids that normalize to one filename must not overwrite."""
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    write(vault, "a.md", LEGACY.replace("source_id: '10'", "source_id: 'a/b'"))
+    write(vault, "b.md", LEGACY.replace("source_id: '10'", "source_id: 'a:b'")
+                               .replace("failed open", "failed closed"))
+
+    rep = migrate_kg_sync(vault, corpus, dry_run=False)
+    assert rep.written == 2
+    on_disk = list((corpus / "sources").rglob("*.md"))
+    assert len(on_disk) == 2, "second document silently overwrote the first"
+    assert len(rep.collisions) == 1
+
+
+def test_unknown_legacy_keys_are_counted_not_silently_dropped(tmp_path):
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    write(vault, "a.md", LEGACY.replace("kind: insight", "kind: insight\nmystery_field: value"))
+    rep = migrate_kg_sync(vault, corpus, dry_run=False)
+    assert rep.dropped_keys["mystery_field"] == 1
+
+
+def test_body_trailing_whitespace_is_preserved(tmp_path):
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    write(vault, "a.md", "---\nsource: notes-app\nsource_id: 'w1'\ntype: observation\n"
+                         "title: T\nstatus: active\ndate: '2026-07-04'\n---\nbody line\n\n\n")
+    migrate_kg_sync(vault, corpus, dry_run=False)
+    from alexandria.corpus import Doc
+    d = Doc.read(next((corpus / "sources").rglob("*.md")), root=corpus)
+    assert d.body == "body line\n\n\n"
+
+
+# ---- regression: Red round 2 -- derived rollups are not ground truth ----
+
+ROLLUP = """---
+source: derived
+source_id: daily-2026-07-29
+type: daily
+project: none
+kind: session
+status: active
+date: '2026-07-29T00:00:00'
+tags: []
+---
+
+# 2026-07-29
+
+Daily rollup. Lists all atomic nodes from this date. Auto-regenerated.
+
+- [[some-note]] - insight - none
+"""
+
+
+def test_derived_rollups_are_excluded_not_migrated(tmp_path):
+    """Rollups are regenerated wholesale upstream and are themselves N:1 syntheses.
+    In an immutable layer with an exact body hash they would mint a superseding note
+    on every regeneration -- unbounded churn, zero new information."""
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    write(vault, "daily-2026-07-29.md", ROLLUP)
+    write(vault, "atomic.md", LEGACY)
+
+    rep = migrate_kg_sync(vault, corpus, dry_run=False)
+    assert rep.excluded_derived == 1
+    assert rep.written == 1                      # only the atomic note
+    assert rep.reconciles
+    assert not (corpus / "sources" / "derived").exists()
+
+
+def test_reconciliation_includes_exclusions(tmp_path):
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    for i in range(3):
+        write(vault, f"r{i}.md", ROLLUP.replace("daily-2026-07-29", f"daily-r{i}"))
+    write(vault, "a.md", LEGACY)
+    write(vault, "bad.md", "no frontmatter\n")
+
+    rep = migrate_kg_sync(vault, corpus, dry_run=False)
+    assert rep.total_in == 5
+    assert (rep.written, rep.quarantined, rep.excluded_derived) == (1, 1, 3)
+    assert rep.total_in == rep.accounted
+
+
+def test_unbalanced_fences_do_not_disable_the_drop(tmp_path):
+    """Notebook-derived notes contain malformed openers (``output closed by ```),
+    leaving an odd fence count. Naive fence tracking then sticks 'inside a fence'
+    forever and silently skips every drop -- 26 real notes hit this."""
+    vault, corpus = tmp_path / "v", tmp_path / "c"
+    vault.mkdir()
+    write(vault, "nb.md", LEGACY.replace(
+        "The retry guard failed open under load.",
+        "``output\nBoth conditions are True\n```\n\nprose after"))
+    migrate_kg_sync(vault, corpus, dry_run=False)
+    body = next((corpus / "sources").rglob("*.md")).read_text()
+    assert "## Related (semantic)" not in body
+    assert "Both conditions are True" in body     # fenced content still preserved
+    assert "Hand-written note that must survive." in body

@@ -28,23 +28,25 @@ MAX_SLUG = 60
 
 
 def split_frontmatter(text: str) -> tuple[dict | None, str]:
-    """Return (frontmatter, body). frontmatter is None when absent or malformed."""
-    if not text.startswith(FENCE):
+    """Return (frontmatter, body). frontmatter is None when absent or malformed.
+
+    Both delimiters must be lines consisting of exactly `---`. A document whose YAML
+    ends with `--- trailing prose` is malformed and is reported as such rather than
+    being silently accepted with three characters shaved off.
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != FENCE:
         return None, text
-    parts = text.split("\n" + FENCE, 1)
-    if len(parts) != 2:
-        return None, text
-    raw = parts[0][len(FENCE):]
-    body = parts[1]
-    if body.startswith("\n"):
-        body = body[1:]
-    try:
-        fm = yaml.safe_load(raw)
-    except yaml.YAMLError:
-        return None, text
-    if not isinstance(fm, dict):
-        return None, text
-    return fm, body
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\r\n") == FENCE:
+            raw = "".join(lines[1:i])
+            body = "".join(lines[i + 1:])
+            try:
+                fm = yaml.safe_load(raw)
+            except yaml.YAMLError:
+                return None, text
+            return (fm, body) if isinstance(fm, dict) else (None, text)
+    return None, text          # never closed
 
 
 def render(fm: dict, body: str) -> str:
@@ -59,8 +61,12 @@ def doc_id(path: str | Path) -> str:
 
 
 def body_hash(body: str) -> str:
-    """Content hash of a note body. Trailing whitespace is not content."""
-    return hashlib.sha256(body.rstrip().encode("utf-8")).hexdigest()
+    """Exact content hash of a note body.
+
+    Deliberately byte-exact, including trailing whitespace: this is the immutability
+    tripwire, and a guard that forgives whitespace edits is a guard with a hole in it.
+    """
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def slugify(text: str, max_len: int = MAX_SLUG) -> str:
