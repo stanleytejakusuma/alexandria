@@ -7,7 +7,65 @@ from alexandria.cli import app, build_parser
 
 def test_parser_exposes_the_documented_verbs():
     verbs = build_parser()._subparsers._group_actions[0].choices
-    assert {"migrate", "sync", "lint", "index", "search"} <= set(verbs)
+    assert {"migrate", "sync", "lint", "index", "search", "eval"} <= set(verbs)
+
+
+def test_eval_release_gate_fails_when_a_previous_hit_becomes_a_miss(tmp_path, monkeypatch, capsys):
+    import json
+    from types import SimpleNamespace
+
+    from alexandria import cli
+
+    corpus = tmp_path / "corpus"
+    golden = corpus / ".alexandria" / "golden" / "golden-v1.jsonl"
+    target = corpus / "sources" / "wanted.md"
+    golden.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    target.write_text("target", encoding="utf-8")
+    golden.write_text(json.dumps({
+        "id": "release-gate", "query": "find it", "must_retrieve": ["sources/wanted"], "k": 5,
+    }) + "\n", encoding="utf-8")
+
+    class FakeResult:
+        def __init__(self, doc_id):
+            self.doc_id = doc_id
+
+    class FakeEngine:
+        embedder = SimpleNamespace(name="hash-24")
+        reranker = SimpleNamespace(model_name="fake", half_precision=True)
+        config = SimpleNamespace(prefetch=20, top_k=5, rrf_k=60, wiki_boost=1.25)
+        store = SimpleNamespace(count=lambda: 1)
+
+        def __init__(self, ids):
+            self.ids = ids
+
+        def search(self, query, *, k=None):
+            return [FakeResult(doc_id) for doc_id in self.ids]
+
+    engines = iter([FakeEngine(["sources/wanted"]), FakeEngine([])])
+    monkeypatch.setattr(cli, "_build_search_engine", lambda config, path: next(engines), raising=False)
+
+    assert app(["--corpus", str(corpus), "eval"]) == 0
+    assert app(["--corpus", str(corpus), "eval", "--fail-on-regression"]) == 1
+    assert "HIT->MISS: release-gate" in capsys.readouterr().out
+
+
+def test_eval_reports_missing_targets_as_unusable_json_without_running_retrieval(tmp_path, monkeypatch, capsys):
+    import json
+
+    from alexandria import cli
+
+    corpus = tmp_path / "corpus"
+    golden = corpus / ".alexandria" / "golden" / "golden-v1.jsonl"
+    golden.parent.mkdir(parents=True)
+    golden.write_text(json.dumps({
+        "id": "missing", "query": "q", "must_retrieve": ["sources/deleted"], "k": 5,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "_build_search_engine", lambda config, path: pytest.fail("must not run"),
+                        raising=False)
+
+    assert app(["--corpus", str(corpus), "eval", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out) == {"target_errors": ["missing"]}
 
 
 def test_index_and_search_use_offline_provider_and_show_trace(tmp_path, monkeypatch, capsys):

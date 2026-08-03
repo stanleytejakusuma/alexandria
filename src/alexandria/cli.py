@@ -18,6 +18,9 @@ from pathlib import Path
 from .config import AppConfig, load_config
 from .corpus import Doc
 from .connectors.pi_sessions import PiSessionsConnector
+from .eval.golden import load_golden, verify_targets
+from .eval.history import append_run, compare, load_runs, regressions
+from .eval.runner import EvalReport, run_eval
 from .index.bm25 import BM25Index
 from .index.chunker import chunk_document
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
@@ -225,16 +228,7 @@ def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_
 def cmd_search(args) -> int:
     config = _config_for(args)
     corpus = config.corpus_path
-    embedder = _cached_embedder(config, corpus)
-    engine = SearchEngine(
-        embedder,
-        VectorStore(corpus / ".alexandria" / "index"),
-        BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite"),
-        CrossEncoderReranker(config.rerank_model),
-        SearchConfig(prefetch=config.rerank_prefetch, top_k=config.rerank_top_k,
-                     wiki_boost=config.wiki_boost, rrf_k=config.rrf_k),
-        QueryLogger(corpus / ".alexandria" / "queries.sqlite"),
-    )
+    engine = _build_search_engine(config, corpus)
     filters = {field: value for field, value in {
         "type": args.type, "project": args.project, "layer": args.layer,
     }.items() if value is not None}
@@ -247,8 +241,62 @@ def cmd_search(args) -> int:
     return 0
 
 
+def cmd_eval(args) -> int:
+    """Measure current retrieval against the private golden set without changing it."""
+    if args.k is not None and args.k < 0:
+        print("eval: --k must be non-negative", file=sys.stderr)
+        return 2
+    config = _config_for(args)
+    corpus = config.corpus_path
+    golden_path = (Path(args.golden).expanduser() if args.golden else
+                   corpus / ".alexandria" / "golden" / "golden-v1.jsonl")
+    try:
+        entries = load_golden(golden_path)
+    except ValueError as exc:
+        _print_eval_error(str(exc), as_json=args.json)
+        return 2
+    target_errors = verify_targets(entries, corpus)
+    if target_errors:
+        if args.json:
+            print(json.dumps({"target_errors": target_errors}, ensure_ascii=False))
+        else:
+            print("UNUSABLE golden set: missing target document(s): "
+                  + ", ".join(target_errors), file=sys.stderr)
+        return 2
+
+    report = run_eval(_build_search_engine(config, corpus), entries, k_override=args.k)
+    history_path = corpus / ".alexandria" / "eval_runs.jsonl"
+    previous = load_runs(history_path)
+    delta = compare(previous[-1], report) if previous and (args.compare_last or args.fail_on_regression) else None
+    append_run(history_path, report)
+
+    if args.json:
+        payload = report.to_dict()
+        if delta is not None:
+            payload["comparison"] = delta.to_dict()
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        _print_eval_report(report, delta)
+
+    if report.summary.errors:
+        return 1
+    return 1 if args.fail_on_regression and delta is not None and regressions(delta) else 0
+
+
 def _config_for(args) -> AppConfig:
     return load_config(corpus_override=getattr(args, "corpus", None))
+
+
+def _build_search_engine(config: AppConfig, corpus: Path) -> SearchEngine:
+    return SearchEngine(
+        _cached_embedder(config, corpus),
+        VectorStore(corpus / ".alexandria" / "index"),
+        BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite"),
+        CrossEncoderReranker(config.rerank_model),
+        SearchConfig(prefetch=config.rerank_prefetch, top_k=config.rerank_top_k,
+                     wiki_boost=config.wiki_boost, rrf_k=config.rrf_k),
+        QueryLogger(corpus / ".alexandria" / "queries.sqlite"),
+    )
 
 
 def _cached_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
@@ -319,6 +367,38 @@ def _chunk_metadata(frontmatter: dict, doc_id: str) -> dict:
     }
 
 
+def _print_eval_error(message: str, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"error": message}, ensure_ascii=False))
+    else:
+        print(f"UNUSABLE golden set: {message}", file=sys.stderr)
+
+
+def _print_eval_report(report: EvalReport, delta) -> None:
+    print(f"{'id':<36} result  rank  latency")
+    for result in report.results:
+        status = "ERROR" if result.error else "HIT" if result.hit else "MISS"
+        print(f"{result.id:<36} {status:<6} {result.rank:>4}  {result.latency_ms:>8.3f}ms")
+        if result.error:
+            print(f"  error: {result.error}")
+    summary = report.summary
+    scored = summary.n - len(summary.target_errors)
+    print(f"\nrecall@k: {summary.recall_at_k:.1%} ({summary.hits}/{scored})  "
+          f"MRR: {summary.mrr:.3f}  errors: {summary.errors}")
+    if summary.misses:
+        print("misses: " + ", ".join(summary.misses))
+    if summary.target_errors:
+        print("target errors: " + ", ".join(summary.target_errors))
+    if summary.error_ids:
+        print("query errors: " + ", ".join(summary.error_ids))
+    if delta is not None:
+        print(f"\nvs previous: recall {delta.recall_at_k:+.1%}, MRR {delta.mrr:+.3f}")
+        if delta.hit_to_miss:
+            print("HIT->MISS: " + ", ".join(delta.hit_to_miss))
+        if delta.miss_to_hit:
+            print("MISS->HIT: " + ", ".join(delta.miss_to_hit))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="alexandria", description=__doc__)
     p.add_argument("--corpus", default=None, help="corpus repo path (overrides config)")
@@ -357,6 +437,15 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--layer", choices=["sources", "wiki"])
     search.add_argument("--trace", action="store_true")
     search.set_defaults(func=cmd_search)
+
+    evaluate = sub.add_parser("eval", help="score retrieval against the private golden set")
+    evaluate.add_argument("--golden", help="path to the private golden JSONL file")
+    evaluate.add_argument("--k", type=int, help="override every entry's retrieval depth")
+    evaluate.add_argument("--json", action="store_true", help="emit a machine-readable report")
+    evaluate.add_argument("--compare-last", action="store_true", help="show transitions from the prior run")
+    evaluate.add_argument("--fail-on-regression", action="store_true",
+                          help="exit 1 when a prior hit becomes a miss")
+    evaluate.set_defaults(func=cmd_eval)
 
     d = sub.add_parser("decay", help="propose eviction from a capped memory store")
     d.add_argument("stores", nargs="+")
