@@ -32,7 +32,11 @@ PATTERNS: list[tuple[str, str]] = [
     ("slack token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
     ("EVM address", r"\b0x[a-fA-F0-9]{40}\b"),
     ("base58 wallet address", r"\b[1-9A-HJ-NP-Za-km-z]{43,44}\b"),
-    ("tailscale/private host", r"\b\d{1,3}(?:\.\d{1,3}){3}\b(?<!127\.0\.0\.1)"),
+    # Real host addresses. RFC 5737 documentation ranges (192.0.2.x, 198.51.100.x,
+    # 203.0.113.x) and loopback are excluded: they are reserved for examples and
+    # can never route to a real machine, so flagging them only trains people to
+    # ignore the scanner.
+    ("host address", r"\b(?!127\.0\.0\.1)(?!192\.0\.2\.)(?!198\.51\.100\.)(?!203\.0\.113\.)\d{1,3}(?:\.\d{1,3}){3}\b"),
 ]
 
 # Files the scanner never flags (it would flag its own pattern list).

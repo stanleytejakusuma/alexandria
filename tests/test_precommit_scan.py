@@ -53,3 +53,16 @@ def test_readme_is_clean():
     readme = Path(__file__).resolve().parent.parent / "README.md"
     found = precommit_scan.scan_text(readme.read_text(encoding="utf-8"), P)
     assert found == [], f"README would leak: {found}"
+
+
+def test_documentation_ip_ranges_are_not_flagged():
+    """RFC 5737 addresses are reserved for examples and cannot route anywhere.
+    Flagging them only trains people to ignore the scanner."""
+    assert hits("connect to 192.0.2.99") == []
+    assert hits("see 198.51.100.7 and 203.0.113.4") == []
+    assert hits("api binds 127.0.0.1") == []
+
+
+def test_real_private_addresses_are_still_flagged():
+    assert hits("the box is at 192.168.44.99")
+    assert hits("tailnet host 100.104.107.107")
