@@ -7,7 +7,23 @@ from alexandria.cli import app, build_parser
 
 def test_parser_exposes_the_documented_verbs():
     verbs = build_parser()._subparsers._group_actions[0].choices
-    assert {"migrate", "sync", "lint"} <= set(verbs)
+    assert {"migrate", "sync", "lint", "index", "search"} <= set(verbs)
+
+
+def test_index_and_search_use_offline_provider_and_show_trace(tmp_path, monkeypatch, capsys):
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "pi" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        "---\ntype: observation\ntitle: Retry\nproject: core\nsource: pi\ntags: [retrieval]\n"
+        "entities: [sweep]\ngenerated:\n  at: '2026-08-01T00:00:00Z'\n---\n"
+        "# Retry\n\nThe sweep retries a page that fails lint.\n"
+    )
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+
+    assert app(["--corpus", str(corpus), "index", "--limit", "1"]) == 0
+    assert app(["--corpus", str(corpus), "search", "sweep page lint", "--trace"]) == 0
+    assert "metadata_filter" in capsys.readouterr().out
 
 
 def test_lint_passes_on_a_clean_corpus(tmp_path, capsys):
