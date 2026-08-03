@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AppConfig, load_config
@@ -131,30 +133,93 @@ def cmd_index(args) -> int:
         lexical.drop()
     embedder = _cached_embedder(config, corpus)
     started = time.monotonic()
-    indexed = 0
-    cache_hits = cache_misses = 0
-    next_report = config.index_progress_every
-    for start in range(0, len(records), config.embed_batch_size):
-        batch = records[start:start + config.embed_batch_size]
-        vectors = embedder.embed([record["text"] for record in batch])
-        indexed_records = [record | {"vector": vector} for record, vector in zip(batch, vectors, strict=True)]
-        store.upsert(indexed_records)
+    stats = _run_index_pipeline(records, embedder, store, lexical,
+                                batch_size=config.embed_batch_size,
+                                progress_every=config.index_progress_every,
+                                progress_stream=sys.stdout)
+    elapsed = time.monotonic() - started
+    print(f"index: {len(records)} chunks from {len({record['doc_id'] for record in records})} documents "
+          f"in {elapsed:.2f}s (cache {stats.cache_hits} hit/"
+          f"{stats.cache_misses} miss)")
+    return 0
+
+
+@dataclass(frozen=True)
+class IndexStats:
+    indexed: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+
+
+def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_size: int,
+                        progress_every: int, progress_stream) -> IndexStats:
+    """Overlap embedding (GPU-bound) with store writes (I/O-bound).
+
+    The naive loop -- embed batch, write batch, embed next batch -- leaves the GPU
+    idle for the full duration of every LanceDB upsert and FTS5 index write. Measured
+    on the real corpus this was the dominant cost, not the model itself. Two threads:
+    one calls the embedder (the only thing touching the shared MPS device, so there is
+    never GPU contention), the other persists finished batches. A bounded queue
+    (maxsize=2) caps how far the embedder can run ahead, so this does not trade I/O
+    wait for unbounded memory growth -- the exact failure mode a memory-constrained
+    machine cannot afford.
+
+    `last_cache_stats` is a mutable attribute on the embedder that the NEXT embed()
+    call overwrites. It is snapshotted immediately after each call, on the producer
+    side, and carried through the queue -- reading it later on the writer thread would
+    silently attribute one batch's cache stats to another under real overlap.
+    """
+    if not records:
+        return IndexStats()
+
+    import queue as _queue
+
+    work: _queue.Queue = _queue.Queue(maxsize=2)
+    SENTINEL = object()
+    failure: list[BaseException] = []
+
+    def produce() -> None:
+        try:
+            for start in range(0, len(records), batch_size):
+                batch = records[start:start + batch_size]
+                vectors = embedder.embed([record["text"] for record in batch])
+                cache_stats = dict(embedder.last_cache_stats)   # snapshot NOW, not later
+                indexed_records = [record | {"vector": vector}
+                                   for record, vector in zip(batch, vectors, strict=True)]
+                work.put((indexed_records, cache_stats))
+        except BaseException as exc:  # noqa: BLE001 -- must reach the main thread
+            failure.append(exc)
+        finally:
+            work.put(SENTINEL)
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+
+    indexed = cache_hits = cache_misses = 0
+    next_report = progress_every
+    started = time.monotonic()
+    while True:
+        item = work.get()
+        if item is SENTINEL:
+            break
+        indexed_records, cache_stats = item
+        store.upsert(indexed_records)          # I/O overlaps the NEXT batch's embed()
         lexical.index(indexed_records)
         indexed += len(indexed_records)
-        cache_hits += embedder.last_cache_stats["hits"]
-        cache_misses += embedder.last_cache_stats["misses"]
-        if indexed >= next_report or indexed == len(records):
+        cache_hits += cache_stats["hits"]
+        cache_misses += cache_stats["misses"]
+        if progress_stream is not None and (indexed >= next_report or indexed == len(records)):
             rate = indexed / max(time.monotonic() - started, 1e-9)
             eta = (len(records) - indexed) / rate if rate else 0.0
             print(f"index: {indexed}/{len(records)} chunks  {rate * 60:.1f}/min  eta={eta / 60:.1f}m",
-                  flush=True)
+                  file=progress_stream, flush=True)
             while next_report <= indexed:
-                next_report += config.index_progress_every
-    elapsed = time.monotonic() - started
-    print(f"index: {len(records)} chunks from {len({record['doc_id'] for record in records})} documents "
-          f"in {elapsed:.2f}s (cache {cache_hits} hit/"
-          f"{cache_misses} miss)")
-    return 0
+                next_report += progress_every
+
+    producer.join()
+    if failure:
+        raise failure[0]
+    return IndexStats(indexed=indexed, cache_hits=cache_hits, cache_misses=cache_misses)
 
 
 def cmd_search(args) -> int:

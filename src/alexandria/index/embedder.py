@@ -64,14 +64,34 @@ class HashEmbedder:
         return [value / norm for value in values]
 
 
+# Grounded in measurement, not a guess: 603 tokens was the largest chunk this
+# corpus's chunker ever produced (see tests/test_chunker.py). 640 gives headroom.
+DEFAULT_MAX_LENGTH = 640
+
+
 class LocalEmbedder:
-    """Sentence-transformers embedding provider, loaded only when actually used."""
+    """Sentence-transformers embedding provider, loaded only when actually used.
+
+    Pads every batch to a FIXED length rather than PyTorch/HF's default per-batch
+    dynamic padding. This is a direct fix for a confirmed, currently-open PyTorch MPS
+    bug (pytorch/pytorch#154329): the MPS backend compiles and permanently caches a
+    GPU execution graph per distinct input shape, and torch.mps.empty_cache() does
+    not touch that cache. Our chunks vary in length, so dynamic padding means nearly
+    every batch is a new shape -- this was the measured cause of unbounded swap
+    growth (21GB -> 30GB+) during a single indexing run. Fixed-length padding keeps
+    the shape constant, so PyTorch only ever compiles one graph.
+
+    Padding tokens are excluded from attention, so this does not change the
+    resulting embedding values for real tokens -- only removes the shape variance
+    that was triggering new graph compilation.
+    """
 
     def __init__(self, model: str = "Qwen/Qwen3-Embedding-0.6B", batch_size: int = 32,
-                 device: str | None = None) -> None:
+                 device: str | None = None, max_length: int = DEFAULT_MAX_LENGTH) -> None:
         self.model_name = model
         self.batch_size = batch_size
         self.device = device
+        self.max_length = max_length
         self._model = None
 
     @property
@@ -90,6 +110,9 @@ class LocalEmbedder:
             batch_size=self.batch_size,
             show_progress_bar=False,
             normalize_embeddings=True,
+            processing_kwargs={"text": {"padding": "max_length",
+                                        "max_length": self.max_length,
+                                        "truncation": True}},
         )
         return [list(map(float, vector)) for vector in vectors]
 

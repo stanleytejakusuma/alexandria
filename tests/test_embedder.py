@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from alexandria.index.embedder import CachedEmbedder, HashEmbedder
+from alexandria.index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder
 
 
 class CountingEmbedder:
@@ -59,3 +59,55 @@ def test_corrupt_cache_value_is_recomputed(tmp_path: Path):
     embedder.embed(["same"])
 
     assert provider.calls == [["same"], ["same"]]
+
+
+class FakeSentenceTransformer:
+    """Records exactly what LocalEmbedder asks it to do -- no real model needed."""
+
+    def __init__(self):
+        self.encode_calls: list[dict] = []
+
+    def encode(self, texts, **kwargs):
+        self.encode_calls.append({"texts": list(texts), **kwargs})
+        return [[0.0, 1.0] for _ in texts]
+
+    def get_sentence_embedding_dimension(self):
+        return 2
+
+
+def test_local_embedder_pads_to_a_fixed_length():
+    """PyTorch's MPS backend compiles and permanently caches a new GPU execution
+    graph per distinct input shape (pytorch/pytorch#154329, confirmed open). Variable
+    per-batch padding means nearly every batch is a new shape; this was the measured
+    cause of tonight's swap growth. Fixed-length padding keeps the shape constant so
+    only one graph is ever compiled, no matter how batch content varies."""
+    fake = FakeSentenceTransformer()
+    embedder = LocalEmbedder(max_length=640)
+    embedder._model = fake
+
+    embedder.embed(["short", "a much longer piece of text than the other one"])
+
+    assert len(fake.encode_calls) == 1
+    kwargs = fake.encode_calls[0]["processing_kwargs"]["text"]
+    assert kwargs["padding"] == "max_length"
+    assert kwargs["max_length"] == 640
+    assert kwargs["truncation"] is True
+
+
+def test_local_embedder_max_length_covers_the_real_corpus_max():
+    """Grounded in measurement, not a guess: 603 tokens is the largest chunk this
+    corpus's chunker ever produced. The fixed length must exceed it or content
+    silently truncates at embed time -- a worse bug than the one being fixed."""
+    assert LocalEmbedder().max_length >= 603
+
+
+def test_local_embedder_default_still_normalizes_and_batches():
+    fake = FakeSentenceTransformer()
+    embedder = LocalEmbedder(batch_size=7)
+    embedder._model = fake
+
+    embedder.embed(["x"])
+
+    call = fake.encode_calls[0]
+    assert call["batch_size"] == 7
+    assert call["normalize_embeddings"] is True
