@@ -20,6 +20,7 @@ from .corpus import Doc
 from .connectors.pi_sessions import PiSessionsConnector
 from .eval.golden import load_golden, verify_targets
 from .eval.history import append_run, compare, load_runs, regressions
+from .eval.metrics import by_overlap_band
 from .eval.runner import EvalReport, run_eval
 from .index.bm25 import BM25Index, searchable_text
 from .index.chunker import chunk_document
@@ -394,6 +395,13 @@ def _print_eval_report(report: EvalReport, delta) -> None:
         print("target errors: " + ", ".join(summary.target_errors))
     if summary.error_ids:
         print("query errors: " + ", ".join(summary.error_ids))
+    bands = by_overlap_band(report.results)
+    if bands:
+        print(f"\n{'overlap band':<12} {'n':>4} {'recall@k':>10} {'MRR':>7}")
+        for band in ("literal", "partial", "zero"):
+            if band in bands:
+                b = bands[band]
+                print(f"{band:<12} {b.n:>4} {b.recall_at_k:>9.1%} {b.mrr:>7.3f}")
     if delta is not None:
         print(f"\nvs previous: recall {delta.recall_at_k:+.1%}, MRR {delta.mrr:+.3f}")
         if delta.hit_to_miss:

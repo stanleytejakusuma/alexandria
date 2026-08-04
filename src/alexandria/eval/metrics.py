@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 
-__all__ = ["EvalResult", "EvalSummary", "mrr", "recall_at_k", "reciprocal_rank", "summarize"]
+__all__ = ["EvalResult", "EvalSummary", "by_overlap_band", "mrr", "recall_at_k",
+          "reciprocal_rank", "summarize"]
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class EvalResult:
     latency_ms: float
     error: str | None = None
     target_error: bool = False
+    overlap_band: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -33,6 +35,7 @@ class EvalResult:
             latency_ms=float(raw["latency_ms"]),
             error=raw.get("error"),
             target_error=bool(raw.get("target_error", False)),
+            overlap_band=raw.get("overlap_band"),
         )
 
 
@@ -87,6 +90,20 @@ def mrr(per_query_rr: Iterable[float]) -> float:
     """Mean reciprocal rank, defined as zero for an empty input."""
     values = list(per_query_rr)
     return sum(values) / len(values) if values else 0.0
+
+
+def by_overlap_band(results: Sequence[EvalResult]) -> dict[str, EvalSummary]:
+    """Slice results by NoLiMa-style lexical-overlap band and summarize each slice.
+
+    Turns one aggregate recall number into a diagnostic one: "zero-overlap recall
+    dropped" localizes a regression; "recall dropped" does not. Untagged entries
+    (every pre-tagging golden entry) are excluded, not folded into a fake band.
+    """
+    bands: dict[str, list[EvalResult]] = {}
+    for result in results:
+        if result.overlap_band:
+            bands.setdefault(result.overlap_band, []).append(result)
+    return {band: summarize(rows) for band, rows in bands.items()}
 
 
 def summarize(results: Sequence[EvalResult]) -> EvalSummary:

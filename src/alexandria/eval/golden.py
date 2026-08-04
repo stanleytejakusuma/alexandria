@@ -9,6 +9,16 @@ from pathlib import Path
 __all__ = ["GoldenEntry", "load_golden", "verify_targets"]
 
 
+# NoLiMa-style diagnostic stratification: tagging each query by how much it lexically
+# overlaps its target turns one aggregate recall number into a slice that can actually
+# localize a regression ("zero-overlap recall dropped" is far more actionable than
+# "recall dropped"). provenance separates hand-written entries from LLM-assisted ones,
+# so a future audit of the golden set itself can tell which entries carry a human's
+# direct judgment versus a retriever-assisted acceptance.
+OVERLAP_BANDS = frozenset({"literal", "partial", "zero"})
+PROVENANCE_VALUES = frozenset({"hand", "assisted"})
+
+
 @dataclass(frozen=True)
 class GoldenEntry:
     """One query and its valid (ANY-OF) target document ids."""
@@ -18,10 +28,12 @@ class GoldenEntry:
     must_retrieve: tuple[str, ...]
     k: int
     note: str | None = None
+    overlap_band: str | None = None
+    provenance: str | None = None
 
 
-_FIELDS = {"id", "query", "must_retrieve", "k", "note"}
-_REQUIRED_FIELDS = _FIELDS - {"note"}
+_FIELDS = {"id", "query", "must_retrieve", "k", "note", "overlap_band", "provenance"}
+_REQUIRED_FIELDS = {"id", "query", "must_retrieve", "k"}
 
 
 def load_golden(path: str | Path) -> list[GoldenEntry]:
@@ -78,6 +90,8 @@ def _parse_entry(raw: object, line_number: int) -> GoldenEntry:
     targets = raw["must_retrieve"]
     k = raw["k"]
     note = raw.get("note")
+    overlap_band = raw.get("overlap_band")
+    provenance = raw.get("provenance")
     if not isinstance(entry_id, str) or not entry_id:
         raise ValueError(f"golden line {line_number}: id must be a non-empty string")
     if not isinstance(query, str) or not query:
@@ -89,4 +103,10 @@ def _parse_entry(raw: object, line_number: int) -> GoldenEntry:
         raise ValueError(f"golden line {line_number}: k must be a non-negative integer")
     if note is not None and not isinstance(note, str):
         raise ValueError(f"golden line {line_number}: note must be a string when present")
-    return GoldenEntry(entry_id, query, tuple(targets), k, note)
+    if overlap_band is not None and overlap_band not in OVERLAP_BANDS:
+        raise ValueError(f"golden line {line_number}: overlap_band must be one of "
+                         f"{sorted(OVERLAP_BANDS)}, got {overlap_band!r}")
+    if provenance is not None and provenance not in PROVENANCE_VALUES:
+        raise ValueError(f"golden line {line_number}: provenance must be one of "
+                         f"{sorted(PROVENANCE_VALUES)}, got {provenance!r}")
+    return GoldenEntry(entry_id, query, tuple(targets), k, note, overlap_band, provenance)

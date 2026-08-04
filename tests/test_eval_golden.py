@@ -65,3 +65,46 @@ def test_verify_targets_returns_entry_ids_with_missing_target_documents(tmp_path
     ]
 
     assert verify_targets(entries, corpus) == ["missing"]
+
+
+# ---- overlap_band + provenance: NoLiMa-style diagnostic stratification, and
+# provenance so a hand-written entry is distinguishable from an LLM-assisted one ----
+
+
+def test_overlap_band_and_provenance_are_optional_and_accepted(tmp_path):
+    p = tmp_path / "g.jsonl"
+    p.write_text(json.dumps({
+        "id": "a", "query": "q", "must_retrieve": ["d"], "k": 5,
+        "overlap_band": "zero", "provenance": "assisted",
+    }) + "\n")
+    entries = load_golden(p)
+    assert entries[0].overlap_band == "zero"
+    assert entries[0].provenance == "assisted"
+
+
+def test_entry_without_the_new_fields_still_loads(tmp_path):
+    """Every one of the 15 existing entries predates these fields -- they must keep
+    loading as-is, with the new fields simply absent (None), not required."""
+    p = tmp_path / "g.jsonl"
+    p.write_text(json.dumps({"id": "a", "query": "q", "must_retrieve": ["d"], "k": 5}) + "\n")
+    entries = load_golden(p)
+    assert entries[0].overlap_band is None
+    assert entries[0].provenance is None
+
+
+def test_invalid_overlap_band_is_rejected(tmp_path):
+    p = tmp_path / "g.jsonl"
+    p.write_text(json.dumps({
+        "id": "a", "query": "q", "must_retrieve": ["d"], "k": 5, "overlap_band": "medium",
+    }) + "\n")
+    with pytest.raises(ValueError, match="overlap_band"):
+        load_golden(p)
+
+
+def test_invalid_provenance_is_rejected(tmp_path):
+    p = tmp_path / "g.jsonl"
+    p.write_text(json.dumps({
+        "id": "a", "query": "q", "must_retrieve": ["d"], "k": 5, "provenance": "robot",
+    }) + "\n")
+    with pytest.raises(ValueError, match="provenance"):
+        load_golden(p)

@@ -1,4 +1,4 @@
-from alexandria.eval.metrics import EvalResult, mrr, recall_at_k, reciprocal_rank, summarize
+from alexandria.eval.metrics import by_overlap_band, EvalResult, mrr, recall_at_k, reciprocal_rank, summarize
 
 
 def test_recall_at_k_is_any_of_and_handles_boundaries_and_duplicates():
@@ -33,3 +33,29 @@ def test_summarize_keeps_target_errors_distinct_from_retrieval_misses_and_errors
     assert summary.error_ids == ["error"]
     assert summary.recall_at_k == 1 / 3
     assert summary.mrr == 1 / 6
+
+
+def test_eval_result_carries_overlap_band():
+    r = EvalResult("id1", "q", True, 1, ["d1"], 10.0, overlap_band="zero")
+    assert r.overlap_band == "zero"
+    assert EvalResult.from_dict(r.to_dict()).overlap_band == "zero"
+
+
+def test_by_overlap_band_groups_and_summarizes_each_band():
+    results = [
+        EvalResult("a", "q", True, 1, ["x"], 1.0, overlap_band="literal"),
+        EvalResult("b", "q", True, 2, ["x"], 1.0, overlap_band="literal"),
+        EvalResult("c", "q", False, 0, [], 1.0, overlap_band="zero"),
+        EvalResult("d", "q", True, 1, ["x"], 1.0, overlap_band="zero"),
+        EvalResult("e", "q", True, 1, ["x"], 1.0, overlap_band=None),
+    ]
+    bands = by_overlap_band(results)
+    assert bands["literal"].recall_at_k == 1.0
+    assert bands["zero"].recall_at_k == 0.5
+    assert bands["literal"].n == 2 and bands["zero"].n == 2
+    assert "None" not in bands and None not in bands   # untagged entries excluded, not miscounted
+
+
+def test_by_overlap_band_empty_when_nothing_tagged():
+    results = [EvalResult("a", "q", True, 1, ["x"], 1.0)]
+    assert by_overlap_band(results) == {}

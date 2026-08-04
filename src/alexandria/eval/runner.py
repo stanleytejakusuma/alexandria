@@ -69,7 +69,8 @@ def run_eval(engine, entries: list[GoldenEntry], *, k_override: int | None = Non
             rank = 0
             error = f"{type(exc).__name__}: {exc}"
         latency_ms = round((time.perf_counter() - started) * 1000, 3)
-        results.append(EvalResult(entry.id, entry.query, hit, rank, retrieved_ids, latency_ms, error))
+        results.append(EvalResult(entry.id, entry.query, hit, rank, retrieved_ids, latency_ms, error,
+                                  overlap_band=entry.overlap_band))
 
     return EvalReport(
         results=results,
