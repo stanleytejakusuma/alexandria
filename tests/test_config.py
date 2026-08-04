@@ -41,3 +41,10 @@ def test_rerank_prefetch_defaults_to_the_measured_knee():
     8 is the smallest prefetch with no measured quality cost, and the one that
     brings p50 inside the <500ms gate."""
     assert load_config().rerank_prefetch == 8
+
+
+def test_mlx_is_the_default_embed_provider():
+    """The live corpus index was built with MLX (3.18x faster, cosine 0.9994
+    agreement on real golden-set docs, avoids a confirmed PyTorch MPS memory leak).
+    'local' remains selectable but is no longer the default."""
+    assert load_config().embed_provider == "mlx"

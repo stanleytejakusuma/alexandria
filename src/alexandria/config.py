@@ -37,7 +37,12 @@ def load_config(*, corpus_override: str | Path | None = None,
     raw = _read_toml(config_path)
     corpus = (corpus_override or os.environ.get("ALEXANDRIA_CORPUS_PATH")
               or _nested(raw, "corpus", "path") or "~/alexandria-corpus")
-    provider = _env_or_file("ALEXANDRIA_EMBED_PROVIDER", raw, ("embed", "provider"), "local")
+    # mlx: measured 3.18x faster than pytorch/mps with cosine 0.9994 agreement on the
+    # real golden-set documents, and avoids a confirmed PyTorch MPS memory leak
+    # (pytorch/pytorch#154329) that grew system swap ~10GB per full index run.
+    # The live corpus index was built with this provider; changing it back to
+    # 'local' requires a full re-embed (different cache key = different model name).
+    provider = _env_or_file("ALEXANDRIA_EMBED_PROVIDER", raw, ("embed", "provider"), "mlx")
     if provider not in {"local", "hash", "mlx"}:
         raise ValueError("ALEXANDRIA_EMBED_PROVIDER must be local, mlx, or hash")
     return AppConfig(
