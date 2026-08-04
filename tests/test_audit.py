@@ -113,3 +113,23 @@ def test_grade_note_tolerates_a_response_missing_the_new_field():
     llm = ScriptedClient([json.dumps({"verdict": "supported", "reason": "stated directly"})])
     v = grade_note(llm, "t", "T", "b", "n1")
     assert v.verdict == "supported"
+
+
+# ---- v3 (compositional support) was TRIED AND REVERTED -- record, do not re-try
+# blindly. Theory: permit multi-span "compositional" support so true-but-distributed
+# claims stop failing the single-quote bar (the clean false-positive cost of v2).
+# Measured on the same 295-item RAGTruth sample, seed=0:
+#     v1 baseline: Subtle Conflict 60.0%, clean FP 20.0%
+#     v2 (strict quote, SHIPPED): Subtle Conflict 73.3%, clean FP 32.5%
+#     v3 (compositional): Subtle Conflict 66.7%, clean FP 30.0%
+# v3 recovered only 2.5pp of clean cost while giving back half the subtle gain --
+# the escape hatch leaked leniency without meaningfully helping clean material.
+# v2 kept: highest subtle-conflict catch rate, nearly identical clean cost, simpler
+# prompt. Its false-positive cost is absorbed by the phase-2 review branch (a good
+# claim waiting one extra review cycle is cheap; a wrong claim shipping cited is not).
+
+
+def test_v2_strict_quote_prompt_is_the_shipped_version():
+    lowered = GRADER_SYSTEM.lower()
+    assert "quote" in lowered and "relationship" in lowered
+    assert "compositional" not in lowered      # v3's vocabulary, reverted
