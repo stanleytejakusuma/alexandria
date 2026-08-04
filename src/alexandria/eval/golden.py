@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
+
+from .jsonl_records import load_jsonl_records
 
 __all__ = ["GoldenEntry", "load_golden", "verify_targets"]
 
@@ -38,25 +39,7 @@ _REQUIRED_FIELDS = {"id", "query", "must_retrieve", "k"}
 
 def load_golden(path: str | Path) -> list[GoldenEntry]:
     """Load a golden JSONL file, rejecting every malformed row with its line number."""
-    source = Path(path)
-    entries: list[GoldenEntry] = []
-    ids: set[str] = set()
-    try:
-        lines = source.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise ValueError(f"unable to read golden set {source}: {exc}") from exc
-
-    for line_number, line in enumerate(lines, start=1):
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"golden line {line_number}: malformed JSON ({exc.msg})") from exc
-        entry = _parse_entry(raw, line_number)
-        if entry.id in ids:
-            raise ValueError(f"golden line {line_number}: duplicate id {entry.id!r}")
-        ids.add(entry.id)
-        entries.append(entry)
-    return entries
+    return load_jsonl_records(path, _parse_entry, lambda e: e.id)
 
 
 def verify_targets(entries: list[GoldenEntry], corpus_path: str | Path) -> list[str]:
