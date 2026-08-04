@@ -28,7 +28,8 @@ GROUND-TRUTH MAPPING (a real judgment call, made explicit and tested):
                                           either verdict counts as correctly caught,
                                           only "supported" is a miss)
 
-STRATIFIED, not uniform random: Subtle Conflict is 16 of 2,675 test-split items
+STRATIFIED, not uniform random: Subtle Conflict is 15 of 2,675 test-split, quality=good
+items
 (0.6%). A uniform sample of a few hundred would likely draw zero, and Subtle-vs-Evident
 accuracy is the single most diagnostic split this calibration can report -- exactly the
 gap where LLM judges are known to fail silently. Take every rare item that exists.
