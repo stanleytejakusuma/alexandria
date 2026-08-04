@@ -1,0 +1,36 @@
+loaded 2675 test-split, quality=good responses
+stratified sample: 295 items -- Counter({'clean': 120, 'Evident Conflict': 60, 'Evident Baseless Info': 60, 'Subtle Baseless Info': 40, 'Subtle Conflict': 15})
+  20/295
+  40/295
+  60/295
+  80/295
+  100/295
+  120/295
+  140/295
+  160/295
+  180/295
+  200/295
+  220/295
+  240/295
+  260/295
+  280/295
+  295/295
+
+==================================================================
+audit.py calibration against RAGTruth (real ground truth)
+==================================================================
+  graded: 295   errors: 0
+
+  category                     n   accuracy
+  ------------------------------------------
+  clean                      120      67.5%
+  Evident Conflict            60      98.3%
+  Subtle Conflict             15      73.3%
+  Evident Baseless Info       60      86.7%
+  Subtle Baseless Info        40      92.5%
+
+  Evident Conflict vs Subtle Conflict accuracy gap: +25.0pp  <-- grader weaker on the SUBTLE case
+
+  Evident Baseless Info vs Subtle Baseless Info accuracy gap: -5.8pp
+
+  false-positive rate on genuinely clean material: 32.5%
