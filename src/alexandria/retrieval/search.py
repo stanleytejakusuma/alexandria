@@ -21,16 +21,21 @@ __all__ = ["SearchConfig", "SearchEngine", "SearchResult"]
 
 @dataclass(frozen=True)
 class SearchConfig:
-    # Two DIFFERENT knobs, deliberately decoupled:
-    #   depth    -- how far down each retriever's ranking we collect candidates for
-    #               fusion. Cost: arithmetic + one batched get_many (~free). RRF can
-    #               only surface a candidate mid-ranked in one list if that list is
-    #               deep enough to contain it -- a golden-set target measured at
-    #               dense rank 42 contributed ZERO to fusion at depth 8.
-    #   prefetch -- how many fused candidates the cross-encoder scores. Cost: one
-    #               model pass each (~100ms). 8 is the measured knee on golden-v1
-    #               (20/12/8 identical recall+MRR; p50 1071ms -> 437ms).
-    depth: int = 100
+    # depth and prefetch are kept as separate knobs (see docstrings below) even
+    # though depth is currently EQUAL to prefetch -- that equality is a measured
+    # conclusion, not a coincidence of the code shape.
+    #
+    # depth=100 was tried and REVERTED. The theory was sound (a golden target at
+    # dense-rank-42 contributes zero to fusion at depth=8) but measurement disagreed:
+    # on the MLX+heading-fix index with the query instruct-prefix also enabled,
+    # depth=100 crowded the rerank pool with more plausible distractors that beat
+    # the true answer for the scarce prefetch=8 slots -- recall@5 78.6%->64.3%,
+    # MRR 0.607 vs 0.714 at depth=8. Each change was safe ALONE; combined they hurt.
+    # depth=8 matches or beats every other tested combination. If you re-attempt
+    # deeper candidate pools, re-run golden-v1 with prefix on AND off before trusting it.
+    depth: int = 8
+    # 8: measured knee on golden-v1 -- 20/12/8 give identical recall and MRR,
+    # p50 1071ms -> 437ms. See config.py.
     prefetch: int = 8
 
     def __post_init__(self):

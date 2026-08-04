@@ -152,6 +152,14 @@ def test_depth_defaults_to_at_least_prefetch(tmp_path: Path):
     assert cfg.depth >= cfg.prefetch
 
 
+def test_depth_default_is_the_measured_safe_value():
+    """depth=100 was tried and reverted: sound in isolation, but combined with the
+    query instruct-prefix it crowded the rerank pool with distractors and dropped
+    recall@5 78.6%->64.3% on golden-v1 (MRR 0.714->0.607). depth=8 matched or beat
+    every tested combination."""
+    assert SearchConfig().depth == 8
+
+
 def test_search_uses_the_query_prefixed_embedding_path(tmp_path: Path):
     """Queries must go through embed_queries (instruct-prefixed), never the raw
     document path -- the model was trained on asymmetric query/document encoding."""
