@@ -3,7 +3,7 @@
 import json
 import pytest
 
-from alexandria.audit import AuditResult, Verdict, grade_note, sample
+from alexandria.audit import GRADER_SYSTEM, AuditResult, Verdict, grade_note, sample
 from alexandria.llm import LLMError, ScriptedClient
 
 
@@ -69,3 +69,47 @@ def test_grader_refuses_to_judge_on_truncated_evidence():
     llm = ScriptedClient([json.dumps({"verdict": "supported", "reason": "ok"})])
     with pytest.raises(LLMError, match="truncated evidence"):
         grade_note(llm, "x" * 5000, "T", "b", "n1", max_transcript=1000)
+
+
+# ---- subtle-conflict hardening (measured on RAGTruth: Evident 93.3% vs Subtle
+# Conflict 60.0%, a 33.3pp gap -- specific to CAUSAL/RELATIONAL misattribution, not
+# unsupported-addition subtlety, per calibration in scripts/calibrate-audit.py) ----
+
+
+def test_grader_prompt_requires_a_quoted_relationship_span():
+    """Cheapest, best-targeted fix per research: force the grader to quote the exact
+    source text establishing the SPECIFIC relationship/causal link claimed, not just
+    confirm the individual facts are real. 'B alone caused it' has real spans for B
+    and for the outcome -- but no span states B-alone-sufficiency. Forcing that quote
+    surfaces the gap that holistic judging papers over. Zero extra LLM calls: one
+    added required field in the same response."""
+    assert "relationship" in GRADER_SYSTEM.lower() or "causal" in GRADER_SYSTEM.lower()
+    assert "quote" in GRADER_SYSTEM.lower() or "span" in GRADER_SYSTEM.lower()
+
+
+def test_grader_prompt_separates_facts_real_from_relationship_established():
+    """The exact distinction the measured gap turns on: individual facts being real
+    is necessary but not sufficient -- the SPECIFIC connection claimed between them
+    must also be found in the source, not assumed from surface plausibility."""
+    lowered = GRADER_SYSTEM.lower()
+    assert "individually" in lowered or "each fact" in lowered or "on its own" in lowered
+
+
+def test_grade_note_still_works_with_the_new_required_field():
+    """External contract must not break: verdict/reason still parse even though the
+    model is now asked for a supporting quote first."""
+    llm = ScriptedClient([json.dumps({
+        "supporting_quote": "the exact source text",
+        "verdict": "fabricated",
+        "reason": "quote does not establish the specific link claimed",
+    })])
+    v = grade_note(llm, "transcript text", "T", "body claiming a link", "n1")
+    assert v.verdict == "fabricated"
+
+
+def test_grade_note_tolerates_a_response_missing_the_new_field():
+    """A model that ignores the new instruction and returns only verdict/reason must
+    not crash the pipeline -- the field is a reasoning scaffold, not a hard contract."""
+    llm = ScriptedClient([json.dumps({"verdict": "supported", "reason": "stated directly"})])
+    v = grade_note(llm, "t", "T", "b", "n1")
+    assert v.verdict == "supported"
