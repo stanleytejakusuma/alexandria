@@ -57,3 +57,28 @@ fourth, valid run against claude-fable-5 vs deepseek-v4-pro (a model outside
 the affected class, used before the gateway fix was confirmed) also showed
 the correct directional signal (28.6% vs 9.4%), corroborating this result
 independently before the gateway-side root cause was even found.
+
+## Judge 3: gather-completeness for CONTRA-SCAN, first real measurement (2026-08-05)
+
+`gather-completeness-judge3-v1.log` -- the real result against
+`contradiction-pairs-v1.jsonl` (6 pairs, post ANY-OF fix) and the real
+corpus, k=8 (matching `rerank_prefetch`, the actual gather-stage depth, not
+the final top-5 a user sees). **16.7% pair recall (1/6), far below the 90%
+gate.** Do not read the exact percentage as precise -- n=6 gives a Wilson
+95% CI of roughly [3%, 56%] -- but the direction is real: single-shot
+retrieval at k=8 cannot reliably surface both sides of a contradiction in
+one query. This is not a labeling artifact: every miss's actual retrieved
+candidates were checked against real content before this number was
+trusted (see the contradiction-pairs-v1 commit in the corpus repo), and 4
+of 6 pairs' near-misses turned out to be genuine, different documents, not
+duplicates that should have counted.
+
+This result is direct empirical support for a design decision already made
+independently (`DECISIONS-graph-vs-vector.md`): the bounded phase-2 gather
+loop (seed retrieve -> detect referenced-but-missing -> one follow-up
+retrieve) exists specifically to close gaps like this one, where a single
+retrieval pass finds one side of a contradiction but not the other. Next
+step per SPEC-phase2-eval.md's own order of work: this seeded-contradiction
+set is far too small (n=6) to trust as a real gate; needs the same
+expansion treatment the retrieval golden set and coverage-calibration sets
+already got.
