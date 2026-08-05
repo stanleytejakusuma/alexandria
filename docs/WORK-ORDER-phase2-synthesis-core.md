@@ -21,14 +21,16 @@ purpose — judge before player.
 one topic's sources, synthesize one page, judge it, repair it if needed.**
 It deliberately does **not** cover *exhaustive full-corpus sweep
 orchestration* (how every topic across the whole corpus gets enumerated and
-scheduled). That orchestration was previously specified as "§6.1a execution-
-model invariants" in an earlier design conversation, referenced from
-`SPEC-phase2-eval.md` and `RUBRIC-skip-log-audit.md` — but the actual
-document defining it could not be located in this repo, in session history,
-or in memory when this work order was written. Rather than reconstruct it
-from a secondhand paraphrase and risk you building against a fabricated
-spec, full-sweep orchestration is explicitly **out of scope** here (§8) and
-will be its own work order once that gap is resolved. This split mirrors
+scheduled). That orchestration's spec ("§6.1a", referenced from
+`SPEC-phase2-eval.md`) was genuinely missing when this work order was first
+written — not locatable in this repo, session history, or memory — and has
+since been reconstructed and fully resolved via direct confirmation, not
+guessed: see `docs/DECISIONS-phase2-execution-model.md`. That resolution
+does not change this work order's scope, though. Full-sweep orchestration
+is still explicitly **out of scope** here (§8) and is still its own,
+separate work order (not yet written) — the split was always a deliberate
+mirror of how phase 1 itself was split, independent of whether the spec was
+available.
 how phase 1 itself was split into a retrieval-library order and a separate
 eval-harness order — prove the core mechanism on one page before scaling to
 "sweep everything."
@@ -200,10 +202,10 @@ new grading logic** — it is orchestration only.
 
 ### 4.4 `src/alexandria/synthesis/repair.py`
 
-**Bounded repair loop with the anti-gutting guard** — this is the one
-piece of "§6.1a" language this work order can implement with confidence,
-because it's independently, fully specified in `SPEC-phase2-eval.md`'s own
-text (quoted): *"The repair loop may not fix a coverage failure by
+**Bounded repair loop with the anti-gutting guard** — this piece was
+already independently, fully specified in `SPEC-phase2-eval.md`'s own
+text (quoted), before the rest of the execution model was reconstructed in
+`DECISIONS-phase2-execution-model.md`: *"The repair loop may not fix a coverage failure by
 fabricating support (Judge 1 re-runs on every repair iteration — the two
 judges are each other's anti-gaming guard)"* and *"the anti-gutting guard
 prevents the repair loop from satisfying the entailment gate by deleting
@@ -311,7 +313,9 @@ standard the phase-1 eval-harness work order set for itself.
 ## 8. Out of scope — do not build
 
 **Full-corpus sweep orchestration / exhaustive topic enumeration** — the
-missing "§6.1a" spec (see §0). Do not guess at this; a later work order
+full-sweep orchestration spec (see §0; now resolved in
+`DECISIONS-phase2-execution-model.md`, but still deliberately out of this
+work order's scope). Do not guess at this; a later work order
 will cover it once the spec gap is resolved. This work order's
 `pipeline.py` takes one topic/target as input and is invoked once; do not
 build a scheduler, a queue, or a "run this over the whole corpus" driver.
@@ -352,6 +356,7 @@ individual judges' isolated calibration runs didn't exercise).
   standalone judge baselines in §2.
 - Any spec deviation, and why.
 - Anything in §6/§7 that bit you anyway.
-- Whether, having built this, you still believe the §6.1a gap in §0 is
-  real (i.e., you could not find the missing spec either) — a second,
-  independent "I looked and it's not there" is useful signal on its own.
+- (This item is now resolved — `docs/DECISIONS-phase2-execution-model.md`
+  exists and covers the full-sweep execution model. No action needed; kept
+  here only so the history of the gap and its resolution stays visible in
+  this document, not silently edited away.)

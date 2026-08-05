@@ -3,9 +3,11 @@
 Date: 2026-08-04. Status: accepted, written BEFORE phase-2 code by design.
 Constrains: the phase-2 work order and all synthesis-sweep implementation.
 Inputs: README phase table (phase-2 gate), `DECISIONS-multi-actor-posture.md`
-(adopted seams + dedup action space), §6.1a execution-model invariants
+(adopted seams + dedup action space), `DECISIONS-phase2-execution-model.md`
 (exhaustive enumeration, deterministic/logged skip predicates, side-effect-free
-nodes with serial fold, bounded repair loop with anti-gutting guard).
+nodes with serial fold, bounded repair loop with anti-gutting guard —
+reconstructed and fully resolved 2026-08-05 after the original reference
+turned out to point nowhere; see that document for why).
 
 ## Doctrine
 
@@ -43,7 +45,8 @@ The citation lint only punishes fabrication. It creates zero pressure against
 silently dropping true facts to avoid citation risk — omission leaves no
 artifact to lint. Judge 2 creates the artifact.
 
-**Mechanism (leans on §6.1a, deterministic first, LLM second):**
+**Mechanism (leans on `DECISIONS-phase2-execution-model.md`, deterministic
+first, LLM second):**
 
 - Exhaustive enumeration means every gathered chunk for a page is enumerated
   before writing. The sweep must account for 100% of enumerated chunks: each is
