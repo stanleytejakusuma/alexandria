@@ -1,0 +1,42 @@
+======================================================================
+Judge 3: gather-completeness for CONTRA-SCAN -- v2, expanded set
+======================================================================
+k=8 (matches real rerank_prefetch config, the gather-stage depth)
+git_sha: e43635e7713f32e16656f5821650d34661841f28
+
+pair recall: 30.8% (4/13)
+gate (>=90%% per SPEC-phase2-eval.md): FAIL
+
+result pair id                                            claim_a  claim_b 
+OK     pi-capital-gate-active-vs-retired                  True     True    
+MISS   opencode-full-migration-decided-then-reversed      False    True    
+MISS   github-account-gregoriustanleyy-vs-canonical       False    True    
+MISS   REDACTED-aggregate-cap-015-vs-035                   False    False   
+MISS   git-push-gated-vs-free-until-release               True     False   
+MISS   gpt-5-6-terra-context-window-500k-vs-272k          False    True    
+MISS   opencode-1m-context-vs-extra-usage-cap             False    True    
+OK     us-stock-signal-short-vs-buy-biased                True     True    
+OK     wallet-js-live-ahead-vs-mirror-ahead               True     True    
+OK     playwright-cli-real-vs-mislabeled                  True     True    
+MISS   morpho-blue-arbitrum-singleton-address             False    True    
+MISS   REDACTED-protection-guard-alert-before-vs-after-retry False    True    
+MISS   REDACTED-deploy-amount-3-vs-1-5-sol                False    False   
+
+Wilson 95%% CI at 4/13: [12.7%%, 57.6%%] -- still wide, still a small-n result.
+v1 (n=6, 1 pair): 16.7%% [3.0%%, 56.4%%]. Point estimate moved to 30.8%%; CI barely
+tightened because the point estimate itself shifted, not purely an n effect.
+Both readings agree on the direction: well below the 90%% gate.
+
+Directional pattern worth flagging, verified precisely (not eyeballed) via a
+separate breakdown pass: of the 9 misses, 6 found claim_b (the later/
+corrected side) but not claim_a (the original, now-superseded side); 1 found
+the reverse (claim_a but not claim_b); 2 found neither. The 6-vs-1 skew is a
+real, if modest at this n, directional signal that the superseding claim is
+easier to find than the superseded one -- makes sense (newer/current facts
+get referenced and consolidated more; the old claim stops being reinforced
+once corrected) and is directly actionable: a future gather-loop follow-up
+round specifically needs to search for EARLIER assertions on a topic, not
+just more recent content about it, since "more of the same" biases toward
+finding the side that's already easy to find. This asymmetry claim itself
+has an even smaller n (9 misses) than the headline number -- treat it as a
+hypothesis worth testing at scale, not a confirmed law.

@@ -82,3 +82,27 @@ step per SPEC-phase2-eval.md's own order of work: this seeded-contradiction
 set is far too small (n=6) to trust as a real gate; needs the same
 expansion treatment the retrieval golden set and coverage-calibration sets
 already got.
+
+## Judge 3, expanded set (2026-08-05): 6 -> 13 pairs, 16.7% -> 30.8%
+
+`gather-completeness-judge3-v2.log`. Contradiction-pairs-v1 grew 6 -> 13
+(within the SPEC's original 10-15 target, not overshot) via one Explore
+agent sweep into fresh domains, same rigor as every prior ground-truth
+round: exact quoted evidence required, every doc_id independently
+re-verified against real content before accepting, ANY-OF near-duplicates
+checked proactively this round rather than found reactively after a bad
+measurement (the lesson from v1). One pair (protection-guard alert timing)
+reused a doc already flagged ambiguous in an earlier round for a DIFFERENT
+pairing -- independently re-verified clean before accepting, since it's a
+genuinely different (and better-separated, 16 days apart) pair than what
+was screened out before.
+
+Result: 30.8% (4/13), still FAIL against the 90% gate, Wilson 95% CI
+[12.7%, 57.6%] -- barely tighter than v1's despite the larger n, because the
+point estimate itself moved up, not just the sample size. A real, smaller-n
+(9 misses) but interesting secondary pattern: 6 of 9 misses found the later/
+corrected claim but not the original superseded one; only 1 miss went the
+other direction. Flagged as a hypothesis, not a confirmed law, but
+directly actionable if it holds: a gather-loop follow-up round needs to
+specifically search for earlier assertions, not just more content on a
+topic.
