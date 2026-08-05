@@ -110,14 +110,64 @@ already schema-agnostic).
 This is explicitly **not** "no, forever." It is "not yet, with a specific,
 scheduled point of re-examination" — see below.
 
-## Re-entry triggers (either reopens the question)
 
-1. A real second corpus or consumer whose relationship-shaped queries
-   *measurably* fail flat retrieval plus the 2-round gather loop — failure
-   demonstrated in eval, not speculated.
-2. A query-economics inversion: a high-query-volume consumer arrives over a
-   now-stable (not still-growing) corpus, flipping the amortization math
-   that currently favors avoiding a standing index.
+
+## Re-entry triggers, quantified (added 2026-08-05)
+
+The two original triggers below were deliberately qualitative when this
+document was first written; sharpened here into falsifiable numbers so the
+phase 3 → 4 checkpoint has something concrete to check against instead of
+re-litigating from scratch. Metrics 1-4 and 6 are **proposed operational
+thresholds, not yet-measured facts** — no real phase-3 usage data exists
+yet to calibrate them against. Metric 5 is a hard implementation gate, not
+a trigger for starting work.
+
+1. **Real (not simulated) gather-loop recall on relationship-shaped
+   queries drops below ~75%.** Judge 3 already gates the *simulated*
+   calibration set at ≥90% contradiction-pair recall (`SPEC-phase2-eval.md`).
+   The real trigger is sustained recall below ~75% on actual phase-3
+   shadow-run data, measured across at least 30 real synthesis pages (below
+   that, small-n red-flag territory per the same Wilson-interval discipline
+   used throughout this project's eval work). One bad run is not a trigger;
+   a sustained pattern across multiple measurement rounds is.
+2. **The gather loop's follow-up round fires on more than ~40-50% of all
+   synthesis pages.** The loop assumes multi-hop need is the *exception* --
+   most pages should resolve in one retrieval pass. If the second round is
+   needed on most pages instead, the corpus is more relationship-dense than
+   assumed, and a standing structure may genuinely amortize better than a
+   disposable pass repeated constantly.
+3. **Corpus growth stabilizes below ~5%/month chunk growth, AND
+   relationship-shaped query volume sustains above roughly 50-100/day.**
+   Both conditions must hold together -- high query volume over a
+   still-growing corpus does not flip the math, because extraction cost
+   keeps getting re-paid regardless.
+4. **A real second corpus shows meaningfully higher relationship density
+   than this one** -- e.g. 3x+ the cluster-shaped fact-chain density per
+   chunk that `synthesis-clusters-v1.jsonl` found here (8 usable clusters
+   out of ~33k chunks, and that took real, effortful, targeted search),
+   measured under the same search effort.
+5. **Hard gate on any real extraction pipeline, before it ships (not a
+   trigger to start work):** ≥90% precision and ≥85% recall on a
+   calibration set built the same way as `coverage-calibration-v1.jsonl`
+   -- real ground truth, double-labeled, adjudicated -- specifically to
+   prove it doesn't repeat Anthropic's own disclosed 45%-fact-loss failure
+   mode before any output from it is trusted.
+6. **Ongoing maintenance stays under a real time budget -- proposed ceiling
+   ~30-60 min/week of manual review/correction, sustained.** If early
+   experimentation shows upkeep costing meaningfully more than that on an
+   ongoing basis, disqualifying regardless of how good metrics 1-4 look --
+   there is no team to absorb it on a one-person project.
+
+**Primary concern if this is ever built, named explicitly so it can't be
+quietly forgotten under future time pressure:** not the engineering --
+the risk that the eval-first discipline used to build `coverage-
+calibration-v1.jsonl` and its rubric gets skipped the second time, exactly
+when the temptation to skip it is highest (near a product deadline, at the
+phase 3→4 boundary). A wrongly-extracted relationship does not just fail
+to help -- it actively misleads a synthesis page, with nothing currently
+watching for it. This project's own origin story is a vault that died from
+exactly this shape of deferred judgment. Metric 5 exists specifically to
+force the same discipline to happen again, not be assumed.
 
 ## Scheduled checkpoint, not just an ambient trigger
 
@@ -129,6 +179,6 @@ usage, real relationship-shaped queries in the wild, not projected ones.
 — after real consumer usage data exists, before phase 4 finalizes the
 answer endpoint and ships the product surface. This is a deliberate gate,
 not a passive "revisit if something comes up": the phase 3 → 4 transition
-does not proceed without an explicit yes/no re-check against both triggers
-above, recorded as an update to this document either way (including "no
-change, still REJECT" — a checked box, not silence).
+does not proceed without an explicit yes/no re-check against all six
+quantified metrics above, recorded as an update to this document either way
+(including "no change, still REJECT" — a checked box, not silence).
