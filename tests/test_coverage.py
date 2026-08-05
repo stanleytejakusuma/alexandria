@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from alexandria.coverage import GRADER_SYSTEM, SkipVerdict, grade_skip
+from alexandria.coverage import GRADER_SYSTEM, SkipVerdict, grade_skip, grade_skip_twice
 from alexandria.eval.calibration_cases import LABEL_CODES
 from alexandria.llm import LLMError, ScriptedClient
 
@@ -86,3 +86,62 @@ def test_all_appendix_a_codes_are_valid_grader_output():
         llm = ScriptedClient([_resp("LB" if code.startswith("LB") else "SS", code)])
         v = grade_skip(llm, "claims", "chunk", f"case-{code}")
         assert v.label_code == code
+
+
+# ---- borderline detection via disagreement across two independent graders,
+# not single-shot self-report -- the calibration run found the grader almost
+# never says "borderline" itself even when explicitly licensed to; disagreement
+# between two independent runs is the mechanism that's actually proven to work
+# (the same method already validated on the rubric itself, Fable vs Sol) ----
+
+
+def test_agreement_when_both_graders_say_lb():
+    llm_a = ScriptedClient([_resp("LB", "LB:contradiction:direct")])
+    llm_b = ScriptedClient([_resp("LB", "LB:contradiction:mutual_exclusive")])
+    r = grade_skip_twice(llm_a, llm_b, "claims", "chunk", "case-1")
+    assert r.agree is True
+    assert r.consensus_label == "LB"
+
+
+def test_agreement_when_both_graders_say_ss():
+    llm_a = ScriptedClient([_resp("SS", "SS:tangential")])
+    llm_b = ScriptedClient([_resp("SS", "SS:near_duplicate")])
+    r = grade_skip_twice(llm_a, llm_b, "claims", "chunk", "case-2")
+    assert r.agree is True
+    assert r.consensus_label == "SS"
+
+
+def test_disagreement_between_lb_and_ss_becomes_borderline():
+    llm_a = ScriptedClient([_resp("LB", "LB:qualification:temporal")])
+    llm_b = ScriptedClient([_resp("SS", "SS:tangential")])
+    r = grade_skip_twice(llm_a, llm_b, "claims", "chunk", "case-3")
+    assert r.agree is False
+    assert r.consensus_label == "borderline"
+
+
+def test_either_grader_saying_borderline_forces_borderline_consensus():
+    """A hedge from either side should never get overridden by the other's confidence --
+    that would defeat the whole point of using disagreement to catch genuine ambiguity."""
+    llm_a = ScriptedClient([_resp("borderline", "LB:qualification:severity")])
+    llm_b = ScriptedClient([_resp("LB", "LB:qualification:severity")])
+    r = grade_skip_twice(llm_a, llm_b, "claims", "chunk", "case-4")
+    assert r.agree is False
+    assert r.consensus_label == "borderline"
+
+
+def test_agreement_result_preserves_both_individual_verdicts():
+    """The individual verdicts must survive the merge -- losing them would make a
+    disagreement un-auditable, the same failure mode as any grader whose reasoning
+    can't be checked after the fact."""
+    llm_a = ScriptedClient([_resp("LB", "LB:contradiction:direct", claim="c1", fact="f1")])
+    llm_b = ScriptedClient([_resp("SS", "SS:trivial", claim="c2", fact="f2")])
+    r = grade_skip_twice(llm_a, llm_b, "claims", "chunk", "case-5")
+    assert r.verdict_a.claim == "c1"
+    assert r.verdict_b.claim == "c2"
+
+
+def test_a_failure_in_either_grader_propagates_and_is_never_a_silent_pass():
+    llm_a = ScriptedClient(["not json"])
+    llm_b = ScriptedClient([_resp("SS", "SS:tangential")])
+    with pytest.raises(LLMError, match="case-6"):
+        grade_skip_twice(llm_a, llm_b, "claims", "chunk", "case-6")

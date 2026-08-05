@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from alexandria.coverage import grade_skip  # noqa: E402
+from alexandria.coverage import grade_skip, grade_skip_twice  # noqa: E402
 from alexandria.eval.calibration_cases import STRATA, load_calibration_cases  # noqa: E402
 from alexandria.llm import LLMClient  # noqa: E402
 
@@ -67,6 +67,9 @@ def run(args) -> int:
     cases = load_calibration_cases(args.path)
     print(f"loaded {len(cases)} calibration cases from {args.path}", file=sys.stderr)
 
+    if args.second_model:
+        return run_dual(args, cases)
+
     grader = LLMClient(model=args.model, timeout=120, max_retries=4, base_delay=2.0, min_interval=0.5)
 
     results: list[tuple[object, object | None, str | None]] = []  # (case, verdict, error)
@@ -89,6 +92,79 @@ def run(args) -> int:
 
     report(results)
     return 0
+
+
+def run_dual(args, cases) -> int:
+    """Borderline-via-disagreement mode: grade every case with two independent
+    clients (default: cross-vendor) and report where they disagree, not just
+    single-grader accuracy. The real question this answers: does disagreement
+    concentrate on stratum 4 (built to be genuinely contested) and stay low
+    everywhere else, or is it just noise?
+    """
+    llm_a = LLMClient(model=args.model, timeout=120, max_retries=4, base_delay=2.0, min_interval=0.5)
+    llm_b = LLMClient(model=args.second_model, timeout=120, max_retries=4, base_delay=2.0, min_interval=0.5)
+    print(f"dual-grader mode: {args.model} vs {args.second_model}", file=sys.stderr)
+
+    results: list[tuple[object, object | None, str | None]] = []  # (case, AgreementResult, error)
+
+    def grade(case):
+        try:
+            r = grade_skip_twice(llm_a, llm_b, case.page_claims, case.skipped_chunk, case.id)
+            return case, r, None
+        except Exception as exc:
+            return case, None, f"{type(exc).__name__}: {str(exc)[:180]}"
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(grade, case): case for case in cases}
+        for fut in as_completed(futures):
+            results.append(fut.result())
+            done += 1
+            if done % 10 == 0 or done == len(cases):
+                print(f"  {done}/{len(cases)}", file=sys.stderr, flush=True)
+
+    report_dual(results)
+    return 0
+
+
+def report_dual(results) -> None:
+    errors = [r for r in results if r[2] is not None]
+    graded = [(case, r) for case, r, err in results if err is None]
+
+    print("\n" + "=" * 70)
+    print("coverage.py borderline-via-disagreement (two independent graders)")
+    print("=" * 70)
+    print(f"  graded: {len(graded)}   errors: {len(errors)}")
+
+    border = [r for case, r in graded if case.stratum in BORDERLINE_STRATA]
+    confident = [r for case, r in graded if case.stratum not in BORDERLINE_STRATA]
+
+    if border:
+        disagree_rate = sum(1 for r in border if not r.agree) / len(border)
+        lo, hi = wilson_interval(sum(1 for r in border if not r.agree), len(border))
+        print(f"\n  Disagreement rate on stratum 4 (built to be genuinely contested):")
+        print(f"    {disagree_rate*100:.1f}%  n={len(border)}  95% CI [{lo*100:.1f}%,{hi*100:.1f}%]")
+        print("    (want this HIGH -- disagreement should concentrate here)")
+
+    if confident:
+        disagree_rate = sum(1 for r in confident if not r.agree) / len(confident)
+        lo, hi = wilson_interval(sum(1 for r in confident if not r.agree), len(confident))
+        print(f"\n  Disagreement rate on the other 9 (confident) strata:")
+        print(f"    {disagree_rate*100:.1f}%  n={len(confident)}  95% CI [{lo*100:.1f}%,{hi*100:.1f}%]")
+        print("    (want this LOW -- a high rate here means the two graders are just")
+        print("     noisy, not specifically sensitive to genuine ambiguity)")
+
+    disagreements = [(case, r) for case, r in graded if not r.agree]
+    if disagreements:
+        print(f"\n  All {len(disagreements)} disagreement(s), by stratum:")
+        for case, r in disagreements:
+            print(f"    stratum {case.stratum:>2}  {case.id:<55} "
+                  f"{r.verdict_a.label:<10} vs {r.verdict_b.label:<10}")
+
+    if errors:
+        print(f"\n  {len(errors)} grader error(s), first 5:")
+        for case, _, err in errors[:5]:
+            print(f"    {case.id}: {err}")
 
 
 def report(results) -> None:
@@ -150,6 +226,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--path", type=Path, default=DEFAULT_PATH)
     p.add_argument("--model", default="claude-sonnet-5")
+    p.add_argument("--second-model", default=None,
+                   help="if set, run borderline-via-disagreement mode: grade every "
+                        "case with both --model and --second-model, report where "
+                        "they disagree instead of single-grader accuracy")
     p.add_argument("--workers", type=int, default=4)
     return p
 

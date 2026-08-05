@@ -58,3 +58,36 @@ def test_min_interval_throttles(monkeypatch):
     c = LLMClient(min_interval=0.5)
     c.complete("s", "u"); c.complete("s", "u")
     assert any(s > 0 for s in slept)
+
+
+# ---- known-bad model+temperature combo, found live 2026-08-05: gpt-5.6-sol at
+# temperature=0 returns cross-contaminated responses from unrelated earlier requests
+# (confirmed via raw curl, bypassing this client entirely -- ruled out concurrency,
+# ruled out blanket gateway-level caching, ruled out a generic prompt-attractor; narrowed
+# to this exact model+temp combo specifically, likely OpenAI's own flex/priority
+# service_tier routing for this connection). Guard against it at the client level so a
+# future caller can't silently trust a corrupted response. ----
+
+
+def test_gpt_5_6_sol_at_temperature_zero_is_refused():
+    with pytest.raises(LLMError, match="gpt-5.6-sol.*temperature|temperature.*gpt-5.6-sol"):
+        LLMClient(model="gpt-5.6-sol").complete("s", "u", temperature=0.0)
+
+
+def test_gpt_5_6_sol_with_prefix_is_also_refused():
+    """The bad alias is reachable through provider-prefixed forms too (cu/gpt-5.6-sol,
+    cc/gpt-5.6-sol, openrouter/anthropic/... style routing) -- match on suffix, not
+    exact string, so a routing prefix doesn't quietly bypass the guard."""
+    with pytest.raises(LLMError, match="gpt-5.6-sol"):
+        LLMClient(model="cu/gpt-5.6-sol").complete("s", "u", temperature=0.0)
+
+
+def test_gpt_5_6_sol_at_nonzero_temperature_is_allowed(monkeypatch):
+    monkeypatch.setattr(LLMClient, "_once", lambda self, s, u, temperature=0.0: "ok")
+    assert LLMClient(model="gpt-5.6-sol").complete("s", "u", temperature=0.3) == "ok"
+
+
+def test_other_models_at_temperature_zero_are_unaffected(monkeypatch):
+    monkeypatch.setattr(LLMClient, "_once", lambda self, s, u, temperature=0.0: "ok")
+    assert LLMClient(model="gpt-5.6-terra").complete("s", "u", temperature=0.0) == "ok"
+    assert LLMClient(model="claude-sonnet-5").complete("s", "u", temperature=0.0) == "ok"

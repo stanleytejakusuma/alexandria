@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from .eval.calibration_cases import LABEL_CODES
 from .llm import LLMError
 
-__all__ = ["SkipVerdict", "grade_skip", "GRADER_SYSTEM"]
+__all__ = ["SkipVerdict", "AgreementResult", "grade_skip", "grade_skip_twice", "GRADER_SYSTEM"]
 
 LABELS = frozenset({"LB", "SS", "borderline"})
 
@@ -139,3 +139,38 @@ def grade_skip(llm, page_claims: str, skipped_chunk: str, case_id: str) -> SkipV
         return SkipVerdict(case_id, label, label_code, claim, fact, relation)
     except (LLMError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise LLMError(f"grader failed on {case_id}: {type(exc).__name__}: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class AgreementResult:
+    """Two independent verdicts on the same pair, merged into a consensus.
+
+    Calibration found the grader almost never self-reports "borderline" in a single
+    call, even when the prompt explicitly licenses it -- an LLM asked to pick a label
+    tends to pick one. Disagreement across two independent runs is the mechanism
+    that's actually proven to work, the same one already validated on the rubric
+    itself (a blind claude-fable-5 draft vs. a blind gpt-5.6-sol draft converged
+    strongly on every non-obvious call and diverged exactly where things were
+    genuinely unresolved). Applied here: if two independently-run graders land on the
+    same LB/SS/borderline side, trust that side. If they don't, the disagreement
+    itself IS the borderline signal, regardless of how confident either individual
+    verdict sounds.
+    """
+
+    case_id: str
+    verdict_a: SkipVerdict
+    verdict_b: SkipVerdict
+    agree: bool
+    consensus_label: str
+
+
+def grade_skip_twice(llm_a, llm_b, page_claims: str, skipped_chunk: str, case_id: str) -> AgreementResult:
+    """Grade the same pair with two independent clients (ideally different model
+    families) and merge into a consensus. A failure in either grader propagates --
+    a silent fallback to one grader's opinion would defeat the point of asking two.
+    """
+    verdict_a = grade_skip(llm_a, page_claims, skipped_chunk, case_id)
+    verdict_b = grade_skip(llm_b, page_claims, skipped_chunk, case_id)
+    agree = verdict_a.label == verdict_b.label
+    consensus_label = verdict_a.label if agree else "borderline"
+    return AgreementResult(case_id, verdict_a, verdict_b, agree, consensus_label)

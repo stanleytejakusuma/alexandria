@@ -36,7 +36,24 @@ class LLMClient:
     # hammering it wastes somebody's quota to no purpose.
     RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 
+    # Known-bad model+temperature combo, found live 2026-08-05: gpt-5.6-sol at
+    # temperature=0 returns cross-contaminated responses copied from unrelated
+    # earlier requests -- confirmed via raw curl bypassing this client entirely,
+    # concurrency and blanket caching both ruled out by direct test, narrowed to
+    # this exact combo (gpt-5.6-terra and gpt-5.6-sol at temperature>0 are both
+    # unaffected). Likely OpenAI's own flex/priority service_tier routing on this
+    # connection; unconfirmed since that's a live gateway runtime setting, not
+    # something visible from source. Refuse outright rather than trust an answer
+    # nothing here can tell is corrupted.
+    _BAD_MODEL_AT_ZERO_TEMP = "gpt-5.6-sol"
+
     def complete(self, system: str, user: str, temperature: float = 0.0) -> str:
+        if temperature == 0.0 and self.model.endswith(self._BAD_MODEL_AT_ZERO_TEMP):
+            raise LLMError(
+                f"refusing to call {self.model!r} at temperature=0: gpt-5.6-sol at "
+                f"temperature=0 is confirmed to return cross-contaminated responses "
+                f"from unrelated earlier requests (see llm.py comment). Use a nonzero "
+                f"temperature or a different model.")
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
             if self.min_interval:
