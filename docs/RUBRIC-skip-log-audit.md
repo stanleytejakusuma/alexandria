@@ -108,6 +108,29 @@ misread as contradiction (a named false-positive mechanism, §3) — resolve
 temporal/scope overlap *before* judging contradiction, don't infer it from
 surface negation words alone.
 
+**Mirror case, added after real disagreement in double-labeling (see
+Appendix D): C states an earlier problem/blocked/active-defect state, F
+reports a LATER resolution.** This is the temporal mirror of the
+not-contradiction bullet above, and it does not get the same pass. Rule:
+
+- If C is phrased as an **unanchored, ongoing claim** ("is blocked,"
+  "undermines," no date given) and F reports that this was later resolved,
+  the omission is **LB `qualification:temporal`** — a reader has no signal
+  that C is stale, and F was already gathered.
+- If C is **explicitly anchored to a named historical event** ("the 6/24
+  audit found X," "as of the bring-up attempt") rather than phrased as the
+  current state, whether a later resolution must still surface is
+  **UNRESOLVED** — double-labeling produced genuine, defensible disagreement
+  on this exact distinction with no rubric text to arbitrate it. Treat as
+  `borderline` until adjudicated case-by-case; do not default to either
+  label mechanically.
+
+The distinguishing test: read C in isolation, with no other context. Would
+a reader reasonably take it as describing the *current* state, or as a
+report of what was true *at a stated past moment*? The former is
+unanchored; the latter is anchored. This wording-level distinction is doing
+real labeling work and was not previously named in this rubric.
+
 ### Step 3 — Material-qualification test (per remaining Fᵢ × Cⱼ)
 
 A fact **materially qualifies** a claim iff it is:
@@ -555,3 +578,57 @@ content-only credibility rule; the exact 80% agreement threshold). The two
 gaps Fable alone caught (Flaw 2, Flaw 3) are additive fixes, not
 disagreements — nothing in this record required adjudicating a genuine
 conflict between the two drafts.
+
+---
+
+## Appendix D: double-labeling adjudication record (v1 calibration set)
+
+Per §5's requirement, the hard strata (2, 3, 4, 8 — 22 cases) were
+double-labeled: the original construction (`claude-fable-5`, applying the
+rubric to its own constructed pairs) versus a fully blind independent pass
+by `gpt-5.6-sol` (given only `page_claims` + `skipped_chunk`, no labels, no
+visibility into the original reasoning). Raw agreement: **10/22 (45%)** —
+well below the ~80% threshold §2e sets as the signal the rubric itself, not
+the labelers, may be the defect. Every disagreement was individually
+re-checked against the real source corpus before any resolution — the same
+discipline applied throughout this project's ground-truth work. The low raw
+agreement number is not a failure signal on its own; what it produced on
+inspection is the real result.
+
+Case descriptions below are anonymized (this document is public; the real
+case ids with full content live only in the private calibration-set commit).
+
+| Case | Original | Sol (blind) | Adjudication | Resolution |
+|---|---|---|---|---|
+| An infra-component status claim, phrased as ongoing ("is operational"), later reported permanently retired | LB | SS | Unanchored present tense later contradicted by a permanent-status change — Sol's "no forward permanence claim" reasoning doesn't apply to unanchored claims | **Kept LB** |
+| A blocked-service-bringup claim, later reported successfully started | LB | SS | Same pattern: unanchored "is blocked" later resolved | **Kept LB** |
+| An active-defect claim ("undermines..."), later reported fixed and verified | LB | SS | Same pattern: unanchored active-problem claim later resolved | **Kept LB** |
+| A secret-key-exposure audit finding, phrased as a dated historical event ("the audit found X on [date]") | LB | SS | Claim is explicitly anchored to a named historical event, not phrased as current state — genuinely unresolved by the rubric as it stood | **Moved to borderline (stratum 4)**; motivated the new Step 2 mirror-case rule |
+| An infra-isolation rationale vs. a later, broader migration decision | LB | SS | Sol correct: the two facts are complementary, not qualifying — a real construction flaw (sequential cluster facts assumed to qualify without checking) | **Relabeled SS:tangential**, moved to stratum 6 |
+| A distribution-mechanism description vs. the legal rationale for one of its properties | LB | SS | Sol correct: mechanism description and its legal rationale don't stand in a qualifying relationship | **Relabeled SS:tangential**, moved to stratum 6 |
+| An accepted-risk verdict vs. its stated future re-escalation triggers | LB | SS | Sol correct, and confirmed by re-checking the real source cluster: the original relation claimed a specific trigger was implicated, but the real fact directly contradicts that premise. A genuine factual error in construction, not an interpretive disagreement | **Relabeled SS:tangential**, moved to stratum 6 |
+| A "sole distribution path" claim vs. preserved-but-inactive peer copies | LB | SS | Redundant with an already-existing borderline twin built for the same real fact pair; Sol's SS lean adds weight against a confident label | **Dropped** (kept only the borderline twin) |
+| A same-day reversed harness-migration decision, two conflicting "final posture" records | LB | SS | "Chose not to migrate" is genuinely ambiguous between full rejection and rejecting only exclusive migration — both readings defensible | **Moved to borderline (stratum 4)** |
+| A drawdown-breaker restart-reset limitation vs. a narrower bug fix | borderline | SS | Already reclassified to borderline pre-double-labeling (fix-scope ambiguity found by re-reading the source code excerpt); Sol's independent SS lean is consistent with genuine uncertainty, not a new problem | No change — borderline is working as intended |
+| "Sole distribution path" twin (hand-built borderline case) | borderline | SS | Sol's SS lean is exactly the kind of independent second opinion this stratum exists to collect | No change — this *is* the adjudication data point |
+| Accepted-risk / re-escalation-triggers twin (hand-built borderline case) | borderline | SS | Same as above | No change |
+
+**Net read.** Of 12 disagreements: 3 were the original construction correctly
+resisting an over-broad reading Sol applied uniformly across temporal cases
+(unanchored present tense really does need updating); 4 were real
+construction errors Sol correctly caught (including one confirmed factual
+error, not just an interpretive call); 5 were genuine, defensible ambiguity
+correctly routed to the borderline stratum rather than forced either way.
+**No disagreement was resolved by authority — every one was checked against
+either the real source corpus or a re-derived reading of the rubric's own
+logic.** The double-labeling process did exactly what §5 designed it to do:
+it surfaced errors in both directions and one real rubric gap (the
+anchored-vs-unanchored temporal distinction, now Step 2's mirror-case rule),
+rather than rubber-stamping either labeler.
+
+Post-adjudication set: 71/104 cases (see `coverage-calibration-v1.jsonl`
+commit history for the full count-by-stratum). Strata 2, 3, and 8 shrank as
+weak constructions were removed; stratum 4 grew as genuine ambiguity was
+correctly identified rather than suppressed. This is the intended dynamic —
+a stratification plan's job is to find true ambiguity, not to hit a target
+count.
