@@ -100,3 +100,46 @@ def test_models_outside_the_fast_tier_list_are_unaffected(monkeypatch):
     monkeypatch.setattr(LLMClient, "_once", lambda self, s, u, temperature=0.0: "ok")
     assert LLMClient(model="claude-sonnet-5").complete("s", "u", temperature=0.0) == "ok"
     assert LLMClient(model="claude-fable-5").complete("s", "u", temperature=0.0) == "ok"
+
+
+# ---- cache-busting nonce, found live 2026-08-05: the gateway's semantic
+# (similarity-based) response cache serves a DIFFERENT earlier request's answer
+# for a genuinely different prompt when the two are similar enough -- confirmed
+# via the gateway's own cache_metrics table showing claude-sonnet-5 (not just the
+# Codex-family models already refused above) with 1073 semantic-cache entries and
+# 142 real cache hits. A gateway-side fix is being handled in a separate session;
+# this is the client-side mitigation that doesn't wait on it: make every outgoing
+# request unique enough that a similarity cache can't false-match it against an
+# unrelated earlier call. ----
+
+
+def test_two_calls_with_identical_system_and_user_send_different_payloads(monkeypatch):
+    """The whole point: two logically-different calls (or even the same call run
+    twice) must never be similar enough to collide in a similarity cache."""
+    seen_systems = []
+
+    def capture(self, system, user, temperature=0.0):
+        seen_systems.append(system)
+        return "ok"
+
+    monkeypatch.setattr(LLMClient, "_once", capture)
+    client = LLMClient()
+    client.complete("same system prompt", "same user prompt")
+    client.complete("same system prompt", "same user prompt")
+    assert seen_systems[0] != seen_systems[1]
+
+
+def test_the_nonce_does_not_corrupt_the_original_system_content():
+    """Whatever gets appended must not lose or mangle the caller's actual
+    instructions -- a cache-busting marker is worthless if it breaks grading."""
+    client = LLMClient()
+    busted = client._with_cache_buster("You are a careful grader.")
+    assert busted.startswith("You are a careful grader.")
+    assert busted != "You are a careful grader."
+
+
+def test_the_nonce_is_actually_unique_per_call():
+    client = LLMClient()
+    a = client._with_cache_buster("system text")
+    b = client._with_cache_buster("system text")
+    assert a != b

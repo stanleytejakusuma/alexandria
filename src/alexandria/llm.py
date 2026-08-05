@@ -12,6 +12,7 @@ import random
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 
 __all__ = ["LLMClient", "ScriptedClient", "LLMError"]
@@ -62,6 +63,7 @@ class LLMClient:
                 f"(luna, gpt-5.5) to return cross-contaminated responses from "
                 f"unrelated earlier requests at temperature=0 (see llm.py comment). "
                 f"Use a nonzero temperature or a different model.")
+        system = self._with_cache_buster(system)
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
             if self.min_interval:
@@ -82,6 +84,19 @@ class LLMClient:
                 delay = self.base_delay * (2 ** attempt)
                 time.sleep(random.uniform(0, delay))
         raise last if last else LLMError("unreachable")
+
+    # Found live 2026-08-05: the gateway's own semantic (similarity-based) response
+    # cache serves an unrelated earlier request's answer when two prompts are similar
+    # enough -- confirmed via the gateway's own cache_metrics table (claude-sonnet-5
+    # alone: 1073 semantic-cache entries, 142 real cache hits served; not limited to
+    # the Codex-family models refused above). A gateway-side fix is being handled
+    # separately; this doesn't wait on it. Appending a unique marker to every outgoing
+    # system prompt means no two real requests -- even two literally identical ones --
+    # are ever similar enough to false-match in a similarity cache. The cost (losing a
+    # legitimate exact-duplicate cache hit, if any ever existed) is nothing next to the
+    # benefit (a wrong answer can never silently look like a right one).
+    def _with_cache_buster(self, system: str) -> str:
+        return f"{system}\n\n[internal request id, not part of the task: {uuid.uuid4()}]"
 
     def _once(self, system: str, user: str, temperature: float = 0.0) -> str:
         payload = json.dumps({
