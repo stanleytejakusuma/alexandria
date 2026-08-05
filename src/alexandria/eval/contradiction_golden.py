@@ -27,12 +27,20 @@ PROVENANCE_VALUES = frozenset({"hand", "assisted"})
 
 @dataclass(frozen=True)
 class ContradictionPairEntry:
-    """A query that should surface both members of a genuinely-contradicting pair."""
+    """A query that should surface both members of a genuinely-contradicting pair.
+
+    claim_a/claim_b are each ANY-OF tuples, not single doc ids -- the same reason
+    GoldenEntry.must_retrieve is ANY-OF: this corpus restates the same real fact
+    across multiple near-duplicate documents, and any one of them surfacing during
+    gather should count. Found by measurement (a k=8 gather-completeness run scored
+    0/6 pairs until near-duplicates already present on disk were verified and added
+    here), not assumed up front.
+    """
 
     id: str
     query: str
-    claim_a: str
-    claim_b: str
+    claim_a: tuple[str, ...]
+    claim_b: tuple[str, ...]
     relationship: str
     note: str | None
     provenance: str
@@ -48,14 +56,20 @@ def load_contradiction_golden(path: str | Path) -> list[ContradictionPairEntry]:
 
 
 def verify_contradiction_targets(entries: list[ContradictionPairEntry], corpus_path: str | Path) -> list[str]:
-    """Return pair ids where claim_a or claim_b is missing from the corpus."""
+    """Return pair ids where any claim_a or claim_b candidate is missing from the
+    corpus -- every listed ANY-OF candidate is a claim this is a real document, so
+    even one missing is a data error, not an acceptable partial state (same
+    discipline as the retrieval golden set's verify_targets).
+    """
     corpus = Path(corpus_path)
     existing = {
         path.relative_to(corpus).with_suffix("").as_posix()
         for path in corpus.rglob("*.md")
         if path.is_file()
     } if corpus.exists() else set()
-    return [entry.id for entry in entries if entry.claim_a not in existing or entry.claim_b not in existing]
+    return [entry.id for entry in entries
+            if any(c not in existing for c in entry.claim_a)
+            or any(c not in existing for c in entry.claim_b)]
 
 
 def _parse_entry(raw: object, line_number: int) -> ContradictionPairEntry:
@@ -70,8 +84,8 @@ def _parse_entry(raw: object, line_number: int) -> ContradictionPairEntry:
 
     entry_id = raw["id"]
     query = raw["query"]
-    claim_a = raw["claim_a"]
-    claim_b = raw["claim_b"]
+    raw_claim_a = raw["claim_a"]
+    raw_claim_b = raw["claim_b"]
     relationship = raw["relationship"]
     note = raw.get("note")
     provenance = raw["provenance"]
@@ -80,12 +94,10 @@ def _parse_entry(raw: object, line_number: int) -> ContradictionPairEntry:
         raise ValueError(f"line {line_number}: id must be a non-empty string")
     if not isinstance(query, str) or not query:
         raise ValueError(f"line {line_number}: query must be a non-empty string")
-    if not isinstance(claim_a, str) or not claim_a:
-        raise ValueError(f"line {line_number}: claim_a must be a non-empty string")
-    if not isinstance(claim_b, str) or not claim_b:
-        raise ValueError(f"line {line_number}: claim_b must be a non-empty string")
-    if claim_a == claim_b:
-        raise ValueError(f"line {line_number}: claim_a and claim_b must be distinct documents")
+    claim_a = _parse_any_of(raw_claim_a, line_number, "claim_a")
+    claim_b = _parse_any_of(raw_claim_b, line_number, "claim_b")
+    if set(claim_a) & set(claim_b):
+        raise ValueError(f"line {line_number}: claim_a and claim_b must not share a document")
     if relationship not in RELATIONSHIP_VALUES:
         raise ValueError(f"line {line_number}: relationship must be one of "
                          f"{sorted(RELATIONSHIP_VALUES)}, got {relationship!r}")
@@ -96,3 +108,10 @@ def _parse_entry(raw: object, line_number: int) -> ContradictionPairEntry:
                          f"{sorted(PROVENANCE_VALUES)}, got {provenance!r}")
 
     return ContradictionPairEntry(entry_id, query, claim_a, claim_b, relationship, note, provenance)
+
+
+def _parse_any_of(value: object, line_number: int, field_name: str) -> tuple[str, ...]:
+    if (not isinstance(value, list) or not value
+            or not all(isinstance(v, str) and v for v in value)):
+        raise ValueError(f"line {line_number}: {field_name} must be a non-empty list of strings")
+    return tuple(value)

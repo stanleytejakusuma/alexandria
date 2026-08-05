@@ -76,8 +76,8 @@ def run_gather_completeness(engine, entries: list[ContradictionPairEntry], *,
         try:
             raw_results = engine.search(entry.query, k=k)
             retrieved_ids = [_document_id(r) for r in raw_results][:k]
-            claim_a_found = entry.claim_a in retrieved_ids
-            claim_b_found = entry.claim_b in retrieved_ids
+            claim_a_found = any(c in retrieved_ids for c in entry.claim_a)
+            claim_b_found = any(c in retrieved_ids for c in entry.claim_b)
             both_found = claim_a_found and claim_b_found
             error = None
         except Exception as exc:  # a gather-stage miss must never be a silent pass

@@ -40,10 +40,20 @@ class FakeEngine:
 
 
 def _pair(**overrides):
-    base = dict(id="p1", query="q", claim_a="sources/a", claim_b="sources/b",
+    base = dict(id="p1", query="q", claim_a=("sources/a",), claim_b=("sources/b",),
                relationship="contradicts", note=None, provenance="hand")
     base.update(overrides)
     return ContradictionPairEntry(**base)
+
+
+def test_any_of_a_multi_candidate_claim_a_counts_as_found():
+    """The whole reason for ANY-OF: any one of several near-duplicate documents
+    surfacing should count, not just one hand-picked canonical doc id."""
+    engine = FakeEngine({"q": ["sources/a-duplicate", "sources/b"]})
+    pair = _pair(claim_a=("sources/a-original", "sources/a-duplicate"))
+    report = run_gather_completeness(engine, [pair], k_override=5)
+    assert report.results[0].claim_a_found is True
+    assert report.results[0].both_found is True
 
 
 def test_both_members_found_counts_as_covered():
@@ -81,8 +91,8 @@ def test_pair_recall_averages_across_multiple_pairs():
         "q1": ["sources/a1", "sources/b1"],
         "q2": ["sources/a2"],
     })
-    entries = [_pair(id="p1", query="q1", claim_a="sources/a1", claim_b="sources/b1"),
-              _pair(id="p2", query="q2", claim_a="sources/a2", claim_b="sources/b2")]
+    entries = [_pair(id="p1", query="q1", claim_a=("sources/a1",), claim_b=("sources/b1",)),
+              _pair(id="p2", query="q2", claim_a=("sources/a2",), claim_b=("sources/b2",))]
     report = run_gather_completeness(engine, entries, k_override=5)
     assert report.summary.pair_recall == 0.5
     assert report.summary.n == 2
