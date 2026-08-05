@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .jsonl_records import load_jsonl_records
 
-__all__ = ["STRATA", "CalibrationCase", "load_calibration_cases", "stratum_counts"]
+__all__ = ["STRATA", "LABEL_CODES", "CalibrationCase", "load_calibration_cases", "stratum_counts"]
 
 # Mirrors docs/RUBRIC-skip-log-audit.md section 5 exactly.
 STRATA: dict[int, dict] = {

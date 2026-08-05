@@ -1,0 +1,27 @@
+
+======================================================================
+coverage.py calibration against coverage-calibration-v1 (real ground truth)
+======================================================================
+  graded: 71   errors: 0
+
+    # stratum                                                 n  correct      wilson 95% CI
+  ------------------------------------------------------------------------------------------
+    1 Direct contradiction                                    4    4/4   [ 51.0%,100.0%]
+    2 Qualification -- temporal / subsequent development      6    6/6   [ 61.0%,100.0%]
+    3 Qualification -- scope/condition/exception              4    4/4   [ 51.0%,100.0%]
+    4 Borderline qualification (weakened, tagged borderline)    7    0/7   [  0.0%, 35.4%]  <-- red flag
+    5 Near-duplicate (incl. drifted paraphrase)              12   12/12  [ 75.7%,100.0%]
+    6 Tangential, same corpus, adjacent cluster              15   11/15  [ 48.0%, 89.1%]
+    7 Stale/superseded -- WITH documented correction          8    8/8   [ 67.6%,100.0%]
+    8 Stale/conflicting -- WITHOUT documented correction      1    1/1   [ 20.7%,100.0%]
+    9 Trivial caveat                                          8    8/8   [ 67.6%,100.0%]
+   10 No-target-claim (contradicts an unstated claim)         6    3/6   [ 18.8%, 81.2%]  <-- red flag
+
+  POOLED (gate on these, not per-stratum numbers):
+    LB recall (strata 1,2,3,8):  100.0%  n=15  95% CI [79.6%,100.0%]
+    SS false-positive rate (strata 5,6,7,9,10): 14.3%  n=49  95% CI [7.1%,26.7%]
+    Stratum 4 (borderline) grader-agrees-with-construction rate: 0.0%  n=7 -- NOT an accuracy claim, borderline cases have no single right answer
+
+  Reminder: this set is small (n=71) and single-labeled beyond the double-
+  labeling already recorded in RUBRIC-skip-log-audit.md Appendix D -- treat
+  per-stratum numbers as red-flag detectors, not precision estimates.
