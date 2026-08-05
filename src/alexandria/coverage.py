@@ -113,14 +113,19 @@ class SkipVerdict:
     relation: str
 
 
-def grade_skip(llm, page_claims: str, skipped_chunk: str, case_id: str) -> SkipVerdict:
+def grade_skip(llm, page_claims: str, skipped_chunk: str, case_id: str,
+               temperature: float = 0.0) -> SkipVerdict:
     """Grade one (page_claims, skipped_chunk) pair. A grader failure is recorded, never
     silently counted as a pass -- same discipline as audit.py's grade_note: an eval
     that cannot fail correctly is worse than no eval.
+
+    temperature defaults to 0 for reproducibility, but is forwardable -- some models
+    (the Codex-fast-tier class LLMClient refuses outright at temperature=0, see
+    llm.py) can only be graded with it explicitly nonzero.
     """
     prompt = USER_TEMPLATE.format(page_claims=page_claims, skipped_chunk=skipped_chunk)
     try:
-        raw = llm.complete(GRADER_SYSTEM, prompt)
+        raw = llm.complete(GRADER_SYSTEM, prompt, temperature=temperature)
         data = json.loads(_unfence(raw))
         label = str(data["label"]).strip()
         label_code = str(data["label_code"]).strip()
@@ -164,13 +169,16 @@ class AgreementResult:
     consensus_label: str
 
 
-def grade_skip_twice(llm_a, llm_b, page_claims: str, skipped_chunk: str, case_id: str) -> AgreementResult:
+def grade_skip_twice(llm_a, llm_b, page_claims: str, skipped_chunk: str, case_id: str,
+                     temperature_a: float = 0.0, temperature_b: float = 0.0) -> AgreementResult:
     """Grade the same pair with two independent clients (ideally different model
     families) and merge into a consensus. A failure in either grader propagates --
     a silent fallback to one grader's opinion would defeat the point of asking two.
+    Each side's temperature is independently forwardable for the same reason
+    grade_skip's is.
     """
-    verdict_a = grade_skip(llm_a, page_claims, skipped_chunk, case_id)
-    verdict_b = grade_skip(llm_b, page_claims, skipped_chunk, case_id)
+    verdict_a = grade_skip(llm_a, page_claims, skipped_chunk, case_id, temperature=temperature_a)
+    verdict_b = grade_skip(llm_b, page_claims, skipped_chunk, case_id, temperature=temperature_b)
     agree = verdict_a.label == verdict_b.label
     consensus_label = verdict_a.label if agree else "borderline"
     return AgreementResult(case_id, verdict_a, verdict_b, agree, consensus_label)

@@ -103,13 +103,15 @@ def run_dual(args, cases) -> int:
     """
     llm_a = LLMClient(model=args.model, timeout=120, max_retries=4, base_delay=2.0, min_interval=0.5)
     llm_b = LLMClient(model=args.second_model, timeout=120, max_retries=4, base_delay=2.0, min_interval=0.5)
-    print(f"dual-grader mode: {args.model} vs {args.second_model}", file=sys.stderr)
+    print(f"dual-grader mode: {args.model} (temp={args.temperature}) vs "
+          f"{args.second_model} (temp={args.second_temperature})", file=sys.stderr)
 
     results: list[tuple[object, object | None, str | None]] = []  # (case, AgreementResult, error)
 
     def grade(case):
         try:
-            r = grade_skip_twice(llm_a, llm_b, case.page_claims, case.skipped_chunk, case.id)
+            r = grade_skip_twice(llm_a, llm_b, case.page_claims, case.skipped_chunk, case.id,
+                                 temperature_a=args.temperature, temperature_b=args.second_temperature)
             return case, r, None
         except Exception as exc:
             return case, None, f"{type(exc).__name__}: {str(exc)[:180]}"
@@ -230,6 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="if set, run borderline-via-disagreement mode: grade every "
                         "case with both --model and --second-model, report where "
                         "they disagree instead of single-grader accuracy")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="temperature for --model; some models (the Codex-fast-tier "
+                        "class) are refused outright at 0 by LLMClient, see llm.py")
+    p.add_argument("--second-temperature", type=float, default=0.0,
+                   help="temperature for --second-model, independent of --temperature")
     p.add_argument("--workers", type=int, default=4)
     return p
 

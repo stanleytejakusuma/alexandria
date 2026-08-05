@@ -12,6 +12,31 @@ def _resp(label, label_code, claim="the claim", fact="the fact", relation="direc
                        "claim": claim, "fact": fact, "relation": relation})
 
 
+def test_grade_skip_defaults_to_temperature_zero():
+    calls = []
+    class RecordingClient(ScriptedClient):
+        def complete(self, system, user, temperature=0.0):
+            calls.append(temperature)
+            return super().complete(system, user, temperature)
+    llm = RecordingClient([_resp("LB", "LB:contradiction:direct")])
+    grade_skip(llm, "claims", "chunk", "case-temp-default")
+    assert calls == [0.0]
+
+
+def test_grade_skip_forwards_an_explicit_temperature():
+    """Escape hatch for models known to need it -- e.g. the Codex-fast-tier class
+    LLMClient refuses outright at temperature=0 (see llm.py); grading them at all
+    requires passing a nonzero temperature through explicitly, not silently defaulting."""
+    calls = []
+    class RecordingClient(ScriptedClient):
+        def complete(self, system, user, temperature=0.0):
+            calls.append(temperature)
+            return super().complete(system, user, temperature)
+    llm = RecordingClient([_resp("LB", "LB:contradiction:direct")])
+    grade_skip(llm, "claims", "chunk", "case-temp-explicit", temperature=0.2)
+    assert calls == [0.2]
+
+
 def test_grade_skip_parses_a_load_bearing_verdict():
     llm = ScriptedClient([_resp("LB", "LB:contradiction:direct")])
     v = grade_skip(llm, "The fix was verified working.", "The fix failed verification.", "case-1")
@@ -93,6 +118,21 @@ def test_all_appendix_a_codes_are_valid_grader_output():
 # never says "borderline" itself even when explicitly licensed to; disagreement
 # between two independent runs is the mechanism that's actually proven to work
 # (the same method already validated on the rubric itself, Fable vs Sol) ----
+
+
+def test_grade_skip_twice_forwards_independent_temperatures():
+    calls_a, calls_b = [], []
+    class RecA(ScriptedClient):
+        def complete(self, system, user, temperature=0.0):
+            calls_a.append(temperature); return super().complete(system, user, temperature)
+    class RecB(ScriptedClient):
+        def complete(self, system, user, temperature=0.0):
+            calls_b.append(temperature); return super().complete(system, user, temperature)
+    llm_a = RecA([_resp("LB", "LB:contradiction:direct")])
+    llm_b = RecB([_resp("SS", "SS:tangential")])
+    grade_skip_twice(llm_a, llm_b, "claims", "chunk", "case-t", temperature_a=0.0, temperature_b=0.2)
+    assert calls_a == [0.0]
+    assert calls_b == [0.2]
 
 
 def test_agreement_when_both_graders_say_lb():
