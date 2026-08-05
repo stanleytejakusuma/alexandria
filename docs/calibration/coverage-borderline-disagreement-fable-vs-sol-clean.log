@@ -1,0 +1,20 @@
+
+======================================================================
+coverage.py borderline-via-disagreement (two independent graders)
+======================================================================
+  graded: 71   errors: 0
+
+  Disagreement rate on stratum 4 (built to be genuinely contested):
+    28.6%  n=7  95% CI [8.2%,64.1%]
+    (want this HIGH -- disagreement should concentrate here)
+
+  Disagreement rate on the other 9 (confident) strata:
+    3.1%  n=64  95% CI [0.9%,10.7%]
+    (want this LOW -- a high rate here means the two graders are just
+     noisy, not specifically sensitive to genuine ambiguity)
+
+  All 4 disagreement(s), by stratum:
+    stratum  4  s8-opencode-overflow-lane-vs-no-migrate                 LB         vs SS        
+    stratum  4  s4-REDACTED-sole-path-vs-preserved-peer-copies           LB         vs SS        
+    stratum 10  ss10-REDACTED-page-gate-vulns-chunk                       LB         vs SS        
+    stratum 10  ss10-breaker-history-page-failopen-chunk                LB         vs SS        

@@ -37,3 +37,23 @@ All three runs used the identical 295-item stratified sample (seed=0) from
   mechanism for borderline detection; disagreement across two independent
   grader runs (the same method already proven on the rubric itself, Fable
   vs Sol) is the more consistent path, still to be built.
+
+## Borderline-via-disagreement, clean final run (2026-08-05)
+
+`coverage-borderline-disagreement-fable-vs-sol-clean.log` -- claude-fable-5
+vs gpt-5.6-sol (temperature=0.1 on the sol side; LLMClient refuses it
+outright at temperature=0, permanently, even though the underlying gateway
+dedup bug is now fixed -- see llm.py comment and the gateway work order
+(kept outside this repo, private infrastructure) for why that guard stays
+regardless of upstream state). This run is the one to trust:
+0 errors, 71/71 graded, disagreement concentrated 28.6% (n=7) on stratum 4
+vs 3.1% (n=64) on the other nine strata -- a ~9x ratio, the sharpest signal
+of every attempt at this experiment. Three earlier attempts the same day
+(sol at temperature=0, then terra at temperature=0, then this same
+fable-vs-sol pairing before the gateway fix) were all silently corrupted by
+a gateway-side request-deduplication bug unrelated to Alexandria's own code
+or model reasoning quality -- see the work order for the full trace. A
+fourth, valid run against claude-fable-5 vs deepseek-v4-pro (a model outside
+the affected class, used before the gateway fix was confirmed) also showed
+the correct directional signal (28.6% vs 9.4%), corroborating this result
+independently before the gateway-side root cause was even found.
