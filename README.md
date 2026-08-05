@@ -120,6 +120,11 @@ Everything is markdown with YAML frontmatter — readable in Obsidian, greppable
 
 Every gate is a measurement, not an opinion. Phases don't advance because they feel done.
 
+The phase 3 → 4 boundary also carries a standing checkpoint: whether
+Alexandria adopts graph-structured retrieval, formally re-examined against
+named re-entry triggers rather than left ambient — see
+[`docs/DECISIONS-graph-vs-vector.md`](docs/DECISIONS-graph-vs-vector.md).
+
 ---
 
 ## FAQ
