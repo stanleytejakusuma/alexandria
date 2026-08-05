@@ -18,6 +18,11 @@ build/
 *.lancedb/
 *.sqlite
 
+# Corpus content may be mounted here during local runs; the engine repository never
+# owns either raw sources or generated synthesis pages.
+/sources/
+/wiki/
+
 # OS / editor
 .DS_Store
 .idea/
