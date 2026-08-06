@@ -120,6 +120,15 @@ Everything is markdown with YAML frontmatter — readable in Obsidian, greppable
 
 Every gate is a measurement, not an opinion. Phases don't advance because they feel done.
 
+**Phase-2 status (2026-08-05):** the single-page synthesis core
+(gather → write → judge → repair → emit) is merged as a verified *component* —
+its native checks pass (deterministic chunk accounting, entailment audit,
+sampled skip-log coverage, anti-gutting repair). Phase 2 itself is **not**
+certified: the golden-synthesis load-bearing-fact recall gate
+(`SPEC-phase2-eval.md` ≥ 90%) measured only 3/5 and 4/5 on the first live
+cluster via two independent graders. The dual-grader fact-recall evaluator
+and the full 8-cluster measurement are the pending gate evidence.
+
 The phase 3 → 4 boundary also carries a standing checkpoint: whether
 Alexandria adopts graph-structured retrieval, formally re-examined against
 named re-entry triggers rather than left ambient — see
