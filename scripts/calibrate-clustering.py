@@ -166,14 +166,14 @@ def sweep_topic(embedder, corpus: Path, chunks) -> None:
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     norms[norms < 1e-8] = 1.0
     vectors = vectors / norms
-    all_pairs = list(_pairs_above(vectors, 0.35))
+    all_pairs = list(_pairs_above(vectors, 0.45))
     print(f"topic sweep: {len(chunks)} chunks, {len(all_pairs)} pairs >= 0.35")
 
     print(f"\ntopic overlap sweep over {len(chunks)} probe chunks (one per doc), "
           f"{len(synth)} known-good clusters")
     print(f"{'t':>6} {'meanJ':>6} {'recalled':>10}")
     best = (0.0, None)
-    for t in [0.75, 0.70, 0.65, 0.60, 0.55, 0.50, 0.45, 0.40, 0.35]:
+    for t in [0.95, 0.92, 0.90, 0.88, 0.85, 0.82, 0.80, 0.78, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50]:
         uf = _UnionFind(len(chunks))
         for i, j in all_pairs:
             if vectors[i] @ vectors[j] >= t:
@@ -215,11 +215,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     embedder = CachedEmbedder(
-        MLXEmbedder(), corpus / ".alexandria" / "cache" / "embeddings.sqlite")
+        MLXEmbedder(model="Qwen/Qwen3-Embedding-0.6B"),
+        corpus / ".alexandria" / "cache" / "embeddings.sqlite")
     sweep_dedup(embedder, corpus, pairs, labels)
 
-    # probe chunks: golden source docs (must be visible to the overlap sweep)
-    # plus a seeded sample of the rest of the corpus for cluster noise.
+    # probe: ALL chunks of the golden source docs + a seeded sample of the
+    # rest of the corpus. First-chunk-only probes collapsed at scale (meanJ
+    # 0.03 vs 0.53 on a 600-doc probe) -- the real sweep clusters every
+    # chunk, so the calibration must too.
     synth = load_synthesis_golden(corpus / ".alexandria" / "golden" / "synthesis-clusters-v1.jsonl")
     golden_doc_ids = {d for e in synth for d in e.source_docs}
     paths = sorted(corpus.rglob("*.md"))
@@ -233,11 +236,9 @@ def main(argv: list[str] | None = None) -> int:
     for path in probe_paths:
         rel = str(path.relative_to(corpus))[:-3]
         doc = path.read_text(encoding="utf-8", errors="replace")
-        cs = chunk_document(rel, doc)
-        if cs:
-            chunks.append(cs[0])
-    print(f"\ncorpus probe: {len(chunks)} docs (golden sources included; "
-          f"{len(paths)} files total on disk)")
+        chunks.extend(chunk_document(rel, doc))
+    print(f"\ncorpus probe: {len(chunks)} chunks from {len(probe_paths)} docs "
+          f"(golden sources included; {len(paths)} files total on disk)")
     sweep_topic(embedder, corpus, chunks)
     return 0
 
