@@ -881,3 +881,16 @@ def test_replay_aggregate_fallback_without_agreement(tmp_path):
     assert replayed["clusters"][0]["consensus_covered"] == ["f1", "f3", "f4"]
     assert replayed["clusters"][0]["contested_ids"] == []
     assert replayed["verdict"] == "PROVISIONAL_FAIL"  # still contested elsewhere
+
+
+def test_driver_rejects_ambiguous_flag_abbreviations():
+    """allow_abbrev=False (found 2026-08-07): argparse silently accepted
+    `--gather <path>` as an abbreviation of `--gather-model`, swallowing a
+    flag the user thought existed. Flags that look right but mean something
+    else must fail loudly."""
+    cli = _load_script("synthesize_golden_pages")
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        cli.build_parser().parse_args([
+            "--golden", "g.jsonl", "--out", "/tmp/o", "--gather", "/tmp/gather",
+        ])

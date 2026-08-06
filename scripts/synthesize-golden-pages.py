@@ -192,7 +192,11 @@ def _client(model: str, base_url: str, api_key_env: str) -> LLMClient:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__)
+    # allow_abbrev=False: argparse otherwise accepts --gather as a silent
+    # abbreviation of --gather-model (found 2026-08-07 -- it swallowed a real
+    # flag in a production run; flags that look right but mean something else
+    # must fail loudly).
+    p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN)
     p.add_argument("--out", type=Path, required=True, help="output dir (created if missing)")
     p.add_argument("--limit", type=int, default=None, help="cap the number of clusters (smoke runs)")
