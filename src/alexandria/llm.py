@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,6 +17,30 @@ import uuid
 from dataclasses import dataclass, field
 
 __all__ = ["LLMClient", "ScriptedClient", "LLMError"]
+
+
+def _read_with_deadline(r, timeout: int) -> bytes:
+    """Read the full response body under a hard deadline.
+
+    urllib's socket timeout does not bound a stalled STREAM: a proxy that
+    keeps the connection alive while sending nothing (observed live
+    2026-08-07: an unattended synthesis run sat silent ~40min on an idle
+    ESTABLISHED pair) lets r.read() block past any timeout. Run the read
+    on a daemon thread and abandon it at the deadline."""
+    result: list[bytes] = []
+
+    def _read() -> None:
+        try:
+            result.append(r.read())
+        except Exception:
+            pass  # the deadline path abandons us anyway
+
+    worker = threading.Thread(target=_read, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout)
+    if not result:
+        raise TimeoutError(f"response body read exceeded {timeout}s deadline")
+    return result[0]
 
 
 class LLMError(RuntimeError):
@@ -116,7 +141,7 @@ class LLMClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                body = json.loads(r.read())
+                body = json.loads(_read_with_deadline(r, self.timeout))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
             err = LLMError(f"HTTP {exc.code}: {detail}")
