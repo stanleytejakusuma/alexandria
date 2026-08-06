@@ -43,20 +43,26 @@ scoped as a separate work order.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from ..corpus import split_frontmatter
 from ..llm import LLMError
+from ..synthesis.repair import REPAIR_SYSTEM
+from ..synthesis.write import WRITER_SYSTEM
 from .synthesis_golden import LoadBearingFact, SynthesisClusterEntry
 
 __all__ = [
     "BAND_LOW",
     "GATE_THRESHOLD",
+    "MANIFEST_VERSION",
+    "build_manifest",
+    "verify_manifest",
     "GRADER_SYSTEM",
     "STATUS_GRADED",
     "STATUS_MEASUREMENT_INVALID",
@@ -93,6 +99,10 @@ VERDICT_PASS = "PASS"
 VERDICT_PROVISIONAL_FAIL = "PROVISIONAL_FAIL"
 VERDICT_FINAL_FAIL = "FINAL_FAIL"
 VERDICT_INVALID = "INVALID"
+
+# Aggregation semantics version: bump when scoring/verdict rules change so
+# reports from different aggregation versions are never silently compared.
+MANIFEST_VERSION = "fact-recall-v1"
 
 GRADER_SYSTEM = """You are grading whether a generated knowledge page covers a fixed set of
 hand-curated facts. Grade only what a reader sees in the page text: the prose
@@ -364,6 +374,70 @@ class FactRecallReport:
     timestamp: str
     git_sha: str
     config: dict[str, object]
+    manifest: dict[str, object] = field(default_factory=dict)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        return _sha256_bytes(path.read_bytes())
+    except OSError:
+        return None
+
+
+def build_manifest(*, golden_path: str | Path, page_dir: str | Path,
+                   gather_dir: str | Path, model_a: str, model_b: str) -> dict[str, object]:
+    """Bind every artifact that produced a report: golden set bytes, the writer/
+    repair/grader prompts, model config, each graded page and gather sidecar,
+    git sha, and the aggregation version. Re-verifying against the same manifest
+    proves the artifacts were not edited after the fact (Red round-2 requirement
+    for authoritative gate use)."""
+    golden = Path(golden_path)
+    pages, gathers = Path(page_dir), Path(gather_dir)
+    return {
+        "aggregation_version": MANIFEST_VERSION,
+        "git_sha": _git_sha(),
+        "golden_sha256": _sha256_file(golden),
+        "prompt_sha256": {
+            "writer": _sha256_bytes(WRITER_SYSTEM.encode("utf-8")),
+            "repair": _sha256_bytes(REPAIR_SYSTEM.encode("utf-8")),
+            "grader": _sha256_bytes(GRADER_SYSTEM.encode("utf-8")),
+        },
+        "models": {"model_a": model_a, "model_b": model_b},
+        "pages": {p.stem: _sha256_file(p) for p in sorted(pages.glob("*.md"))},
+        "gather_sidecars": {
+            (p.stem[:-len(".gather")] if p.stem.endswith(".gather") else p.stem): _sha256_file(p)
+            for p in sorted(gathers.glob("*.gather.json"))
+        },
+    }
+
+
+def verify_manifest(manifest: dict[str, object], *, golden_path: str | Path,
+                    page_dir: str | Path, gather_dir: str | Path) -> list[str]:
+    """Recompute the manifest from current disk state and list every mismatch.
+    Empty list = artifacts unchanged since the report was produced."""
+    if not manifest:
+        return ["report carries no manifest (pre-manifest artifact)"]
+    problems: list[str] = []
+    current = build_manifest(golden_path=golden_path, page_dir=page_dir,
+                             gather_dir=gather_dir, model_a="", model_b="")
+    if current["golden_sha256"] != manifest.get("golden_sha256"):
+        problems.append("golden set hash changed")
+    for name, sha in (current.get("prompt_sha256") or {}).items():
+        if sha != (manifest.get("prompt_sha256") or {}).get(name):
+            problems.append(f"prompt {name} changed")
+    if current["git_sha"] != manifest.get("git_sha"):
+        problems.append("git sha changed")
+    for fid, sha in (current.get("pages") or {}).items():
+        if sha != (manifest.get("pages") or {}).get(fid):
+            problems.append(f"page {fid}.md changed")
+    for cid, sha in (current.get("gather_sidecars") or {}).items():
+        if sha != (manifest.get("gather_sidecars") or {}).get(cid):
+            problems.append(f"gather sidecar {cid} changed")
+    return problems
 
 
 def _verdict(consensus_recall: float, contested_count: int, invalid: bool) -> str:
@@ -382,7 +456,8 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
                          page_dir: str | Path, gather_dir: str | Path,
                          llm_a, llm_b, *, model_a: str | None = None,
                          model_b: str | None = None,
-                         adjudications: dict[str, bool] | None = None) -> FactRecallReport:
+                         adjudications: dict[str, bool] | None = None,
+                         golden_path: str | Path | None = None) -> FactRecallReport:
     """Grade every entry's frozen page against its golden facts, with explicit
     run-status separation (Red review rounds 1-2, 2026-08-05):
 
@@ -512,6 +587,9 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
             "page_dir": str(pages),
             "gather_dir": str(gathers),
         },
+        manifest=(build_manifest(golden_path=golden_path, page_dir=pages, gather_dir=gathers,
+                                 model_a=model_a or "default", model_b=model_b or "default")
+                  if golden_path is not None else {}),
     )
 
 

@@ -664,3 +664,71 @@ def test_driver_persists_failed_claim_details(tmp_path):
     assert details and details[0]["id"] == "c1"
     assert details[0]["text"] == "The fix shipped on Tuesday."
     assert details[0]["citations"][0]["doc_id"] == "sources/f1"
+
+
+# ---- immutable run manifest (Red round-2 deferral, now implemented) ----
+
+
+def _manifest_fixture(tmp_path):
+    from alexandria.eval.synthesis_fact_recall import run_fact_recall_eval
+    golden = tmp_path / "golden.jsonl"
+    golden.write_text(json.dumps({"id": "cluster-a", "topic": "topic",
+                                  "source_docs": ["sources/f1"],
+                                  "load_bearing_facts": [
+                                      {"id": "f1", "text": "The fix shipped on Tuesday.",
+                                       "supported_by": ["sources/f1"]}],
+                                  "provenance": "hand"}) + "\n", encoding="utf-8")
+    pages, gather = _write_fixture(tmp_path, "cluster-a", PAGE, ("f1",))
+    a = ScriptedClient([_resp(_covered("f1"))])
+    b = ScriptedClient([_resp(_covered("f1"))])
+    report = run_fact_recall_eval([_entry("cluster-a", "topic", ("f1",))], pages, gather,
+                                  a, b, model_a="m-a", model_b="m-b", golden_path=golden)
+    return report, golden, pages, gather
+
+
+def test_manifest_hashes_artifacts_and_prompts(tmp_path):
+    report, golden, pages, gather = _manifest_fixture(tmp_path)
+    manifest = report.manifest
+    assert manifest["aggregation_version"]
+    assert manifest["git_sha"]
+    assert manifest["golden_sha256"]
+    assert manifest["prompt_sha256"]["writer"]
+    assert manifest["prompt_sha256"]["repair"]
+    assert manifest["prompt_sha256"]["grader"]
+    assert manifest["models"] == {"model_a": "m-a", "model_b": "m-b"}
+    assert manifest["pages"]["cluster-a"]
+    assert manifest["gather_sidecars"]["cluster-a"]
+
+
+def test_verify_manifest_clean_when_unchanged(tmp_path):
+    from alexandria.eval.synthesis_fact_recall import verify_manifest
+    report, golden, pages, gather = _manifest_fixture(tmp_path)
+    assert verify_manifest(report.manifest, golden_path=golden, page_dir=pages,
+                           gather_dir=gather) == []
+
+
+def test_verify_manifest_detects_page_edit(tmp_path):
+    from alexandria.eval.synthesis_fact_recall import verify_manifest
+    report, golden, pages, gather = _manifest_fixture(tmp_path)
+    (pages / "cluster-a.md").write_text(PAGE + "\nedited later\n", encoding="utf-8")
+    problems = verify_manifest(report.manifest, golden_path=golden, page_dir=pages,
+                               gather_dir=gather)
+    assert any("cluster-a.md" in p for p in problems)
+
+
+def test_verify_manifest_detects_golden_edit(tmp_path):
+    from alexandria.eval.synthesis_fact_recall import verify_manifest
+    report, golden, pages, gather = _manifest_fixture(tmp_path)
+    golden.write_text(golden.read_text() + "extra\n", encoding="utf-8")
+    problems = verify_manifest(report.manifest, golden_path=golden, page_dir=pages,
+                               gather_dir=gather)
+    assert any("golden" in p for p in problems)
+
+
+def test_manifest_empty_when_no_golden_path_given(tmp_path):
+    pages, gather = _write_fixture(tmp_path, "cluster-a", PAGE, ("f1",))
+    a = ScriptedClient([_resp(_covered("f1"))])
+    b = ScriptedClient([_resp(_covered("f1"))])
+    report = run_fact_recall_eval([_entry("cluster-a", "topic", ("f1",))], pages, gather,
+                                  a, b)
+    assert report.manifest == {}

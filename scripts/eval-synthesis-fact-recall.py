@@ -27,6 +27,7 @@ from alexandria.eval.synthesis_fact_recall import (
     VERDICT_PASS,
     VERDICT_PROVISIONAL_FAIL,
     run_fact_recall_eval,
+    verify_manifest,
 )
 from alexandria.eval.synthesis_golden import load_synthesis_golden
 from alexandria.llm import LLMClient
@@ -51,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "overrides applied to both graders before scoring")
     p.add_argument("--output", type=Path, default=None,
                    help="JSON destination (default docs/calibration/synthesis-fact-recall-v1-<UTC>.json)")
+    p.add_argument("--verify", type=Path, default=None, metavar="REPORT.json",
+                   help="verify a persisted report's manifest against current disk state and exit")
     return p
 
 
@@ -84,6 +87,18 @@ def _as_dict(report) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.verify is not None:
+        report = json.loads(args.verify.read_text(encoding="utf-8"))
+        problems = verify_manifest(report.get("manifest") or {},
+                                   golden_path=args.golden,
+                                   page_dir=args.pages, gather_dir=args.gather)
+        if not problems:
+            print(f"manifest verifies clean: {args.verify}")
+            return 0
+        print("manifest MISMATCHES:")
+        for p in problems:
+            print(f"  - {p}")
+        return 1
     if not args.golden.exists() or not args.pages.is_dir() or not args.gather.is_dir():
         print("eval-synthesis-fact-recall: --golden must exist and --pages/--gather must be dirs",
               file=sys.stderr)
@@ -97,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report = run_fact_recall_eval(entries, args.pages, args.gather, llm_a, llm_b,
                                   model_a=args.model_a, model_b=args.model_b,
-                                  adjudications=adjudications)
+                                  adjudications=adjudications, golden_path=args.golden)
 
     print(f"\nper-cluster (gate >= {int(GATE_THRESHOLD * 100)}%):")
     print(f"  {'cluster':<28} {'status':<19} {'recall_a':>8} {'recall_b':>8} {'consensus':>9} "
