@@ -15,7 +15,8 @@ echo "==> fresh clone into $WORK"
 git clone -q --depth 1 "$REPO_URL" "$WORK/alexandria"
 
 cd "$WORK/alexandria"
-python -m venv .venv
+PY="$(command -v python3.12 || command -v python3)"
+"$PY" -m venv .venv
 .venv/bin/pip install -q -e ".[dev]"
 
 echo "==> [1/5] lint"
