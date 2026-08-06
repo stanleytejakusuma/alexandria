@@ -27,6 +27,12 @@ Return only JSON with this shape:
 }
 The structured claims are authoritative for citation and judging; do not put prose
 outside the JSON object.
+
+Coverage is mandatory: every load-bearing proposition in the sources you cite
+(actor, event, cause, chronology, numeric threshold, outcome) must be stated on
+the page. Omitting a load-bearing fact from a source you cite is a failure;
+prefer more claims over fewer. You may omit only immaterial or duplicated
+material.
 """
 
 

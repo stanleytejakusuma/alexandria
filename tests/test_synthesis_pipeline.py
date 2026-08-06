@@ -184,3 +184,24 @@ def test_repair_deletion_is_logged_then_coverage_rejects_gutting_and_pipeline_em
     assert len(coverage_llm_b.calls) == 3
     assert not list((tmp_path / "wiki").glob("*.md"))
     assert not list((tmp_path / "wiki").glob("*.skip-log.json"))
+
+
+def test_writer_prompt_demands_load_bearing_coverage():
+    """Regression for the measured writer layer (~72% consensus on emitted
+    pages): WRITER_SYSTEM must direct the writer to state load-bearing
+    propositions from the sources it cites, not merely avoid fabrication."""
+    from alexandria.synthesis.write import WRITER_SYSTEM
+    text = WRITER_SYSTEM.lower()
+    assert "load-bearing" in text
+    assert "omit" in text
+
+
+def test_repair_prompt_demands_support_or_removal_not_regeneration():
+    """Regression for the magpie stuck-claim failure: REPAIR_SYSTEM must force a
+    per-failed-claim decision (cite gathered support or remove the claim) and
+    forbid regenerating failed claims with new wording."""
+    from alexandria.synthesis.repair import REPAIR_SYSTEM
+    text = REPAIR_SYSTEM.lower()
+    assert "remove" in text
+    assert "support" in text
+    assert "regenerat" in text

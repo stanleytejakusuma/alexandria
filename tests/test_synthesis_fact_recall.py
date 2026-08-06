@@ -577,3 +577,90 @@ def test_report_serialization_retains_agreement_and_raw_responses(tmp_path):
     assert agreement["result_a"]["verdicts"][0]["evidence"] == EVIDENCE
     assert cluster["contested_ids"] == ["f1"]
     assert cluster["consensus_covered"] == []
+
+
+def _retry_clients():
+    # attempt 1: writer cites an unknown chunk -> expected failure.
+    # attempt 2: writer cites the gathered chunk -> emitted.
+    return {
+        "gather": ScriptedClient([json.dumps({"queries": []}), json.dumps({"queries": []})]),
+        "writer": ScriptedClient([
+            _page("Bad page.", [{"id": "c1", "text": "x",
+                                 "citations": [{"doc_id": "sources/ghost", "chunk_id": "sources/ghost#1"}]}]),
+            _page("Good page.", [{"id": "c1", "text": "The fix shipped on Tuesday.",
+                                  "citations": [{"doc_id": "sources/f1", "chunk_id": "sources/f1#1"}]}]),
+        ]),
+        "repair": ScriptedClient([]),
+        "audit": ScriptedClient([_audit_response("supported")]),
+        "coverage_a": ScriptedClient([]),
+        "coverage_b": ScriptedClient([]),
+    }
+
+
+def test_driver_retries_failed_attempt_and_records_attempts(tmp_path):
+    driver = _load_script("synthesize_golden_pages")
+    engine = FakeEngine({"topic": [Result("sources/f1#1", "sources/f1", "The fix shipped on Tuesday.")]})
+    out = tmp_path / "out"
+
+    results = driver.synthesize_golden_pages(
+        [_entry("cluster-a", "topic", ("f1",))], out, engine, _retry_clients(), seed_k=8, retries=1)
+
+    assert results[0]["emitted"] is True
+    sidecar = json.loads((out / "gather" / "cluster-a.gather.json").read_text())
+    assert sidecar["attempt_count"] == 2
+    assert [a["emitted"] for a in sidecar["attempts"]] == [False, True]
+    assert sidecar["error"] is None
+    assert (out / "pages" / "cluster-a.md").exists()
+
+
+def test_driver_exhausts_retries_and_records_failure(tmp_path):
+    driver = _load_script("synthesize_golden_pages")
+    engine = FakeEngine({"topic": [Result("sources/f1#1", "sources/f1", "The fix shipped on Tuesday.")]})
+    bad = _page("Bad page.", [{"id": "c1", "text": "x",
+                               "citations": [{"doc_id": "sources/ghost", "chunk_id": "sources/ghost#1"}]}])
+    clients = {
+        "gather": ScriptedClient([json.dumps({"queries": []}), json.dumps({"queries": []})]),
+        "writer": ScriptedClient([bad, bad]),
+        "repair": ScriptedClient([]),
+        "audit": ScriptedClient([]),
+        "coverage_a": ScriptedClient([]),
+        "coverage_b": ScriptedClient([]),
+    }
+    out = tmp_path / "out"
+
+    results = driver.synthesize_golden_pages(
+        [_entry("cluster-a", "topic", ("f1",))], out, engine, clients, seed_k=8, retries=1)
+
+    assert results[0]["emitted"] is False
+    sidecar = json.loads((out / "gather" / "cluster-a.gather.json").read_text())
+    assert sidecar["attempt_count"] == 2
+    assert all(not a["emitted"] for a in sidecar["attempts"])
+
+
+def test_driver_persists_failed_claim_details(tmp_path):
+    """The magpie-type case: a returned (not raised) failing result must persist
+    the failed claims' texts so a stuck claim is diagnosable after the run."""
+    driver = _load_script("synthesize_golden_pages")
+    engine = FakeEngine({"topic": [Result("sources/f1#1", "sources/f1", "The fix shipped on Tuesday.")]})
+    clients = {
+        "gather": ScriptedClient([json.dumps({"queries": []})]),
+        "writer": ScriptedClient([_page("Page text.", [{
+            "id": "c1", "text": "The fix shipped on Tuesday.",
+            "citations": [{"doc_id": "sources/f1", "chunk_id": "sources/f1#1"}],
+        }])]),
+        "repair": ScriptedClient([]),          # exhausted -> repair error, loop breaks
+        "audit": ScriptedClient([_audit_response("fabricated")]),
+        "coverage_a": ScriptedClient([]),
+        "coverage_b": ScriptedClient([]),
+    }
+    out = tmp_path / "out"
+
+    results = driver.synthesize_golden_pages(
+        [_entry("cluster-a", "topic", ("f1",))], out, engine, clients, seed_k=8)
+
+    assert results[0]["emitted"] is False
+    sidecar = json.loads((out / "gather" / "cluster-a.gather.json").read_text())
+    details = sidecar["failed_claim_details"]
+    assert details and details[0]["id"] == "c1"
+    assert details[0]["text"] == "The fix shipped on Tuesday."
+    assert details[0]["citations"][0]["doc_id"] == "sources/f1"

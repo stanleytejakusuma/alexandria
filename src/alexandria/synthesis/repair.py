@@ -25,6 +25,13 @@ paper over coverage failures by deleting claims: every repair is re-judged for b
 faithfulness and skipped load-bearing source material. Return only the same JSON
 shape as the writer: page_text, claims[{id,text,citations[{doc_id,chunk_id}]}], and
 optional visibility.
+
+Compliance rule for failed claim ids: for each one, make exactly ONE decision --
+(a) keep it, but only with a citation to gathered text that literally supports the
+claim as written, or (b) remove it from the claims list entirely. Never regenerate
+a failed claim with new wording unless you also add a citation to gathered support
+for that new wording. If the support is not literally in the pool, removal is the
+correct action.
 """
 
 
