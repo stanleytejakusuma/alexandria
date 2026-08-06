@@ -295,6 +295,21 @@ def cmd_answer(args) -> int:
     return 0
 
 
+def cmd_wiki_site(args) -> int:
+    """Render a wiki dir (the shape run_pipeline emits) into a static site."""
+    from .wiki_site import render_site
+
+    config = _config_for(args)
+    corpus = config.corpus_path
+    wiki = Path(args.wiki).expanduser() if args.wiki else corpus / "wiki"
+    if not wiki.is_dir():
+        print(f"wiki-site: no wiki dir at {wiki}", file=sys.stderr)
+        return 2
+    slugs = render_site(wiki, args.out)
+    print(f"wiki-site: {len(slugs)} page(s) rendered to {args.out}")
+    return 0
+
+
 def cmd_eval(args) -> int:
     """Measure current retrieval against the private golden set without changing it."""
     if args.k is not None and args.k < 0:
@@ -520,6 +535,11 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("--save-dir", default=None,
                         help="emit the page here (default: temp dir, page printed only)")
     answer.set_defaults(func=cmd_answer)
+
+    ws = sub.add_parser("wiki-site", help="render a wiki dir into a static site")
+    ws.add_argument("--wiki", default=None, help="wiki dir (default: <corpus>/wiki)")
+    ws.add_argument("--out", type=Path, required=True)
+    ws.set_defaults(func=cmd_wiki_site)
 
     d = sub.add_parser("decay", help="propose eviction from a capped memory store")
     d.add_argument("stores", nargs="+")

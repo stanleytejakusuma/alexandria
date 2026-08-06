@@ -191,3 +191,18 @@ def test_answer_failure_exits_one_with_failed_claims(tmp_path, monkeypatch, caps
     err = capsys.readouterr().err
     assert "failed its native checks" in err
     assert "c1" in err
+
+
+def test_wiki_site_verb_renders(tmp_path, capsys):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "p.md").write_text("# P\n\nbody\n", encoding="utf-8")
+    out = tmp_path / "site"
+    assert app(["--corpus", str(tmp_path), "wiki-site", "--wiki", str(wiki), "--out", str(out)]) == 0
+    assert (out / "index.html").exists()
+    assert "1 page(s)" in (out / "index.html").read_text(encoding="utf-8")
+
+
+def test_wiki_site_missing_wiki_dir_fails(tmp_path):
+    assert app(["--corpus", str(tmp_path), "wiki-site", "--wiki", str(tmp_path / "nope"),
+                "--out", str(tmp_path / "site")]) == 2
