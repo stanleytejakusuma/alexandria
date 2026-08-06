@@ -21,10 +21,10 @@ PY="$(command -v python3.12 || command -v python3)"
 
 echo "==> [1/5] lint"
 .venv/bin/alexandria --corpus demo-corpus lint
-echo "==> [2/5] index (offline)"
-.venv/bin/alexandria --corpus demo-corpus index --limit 0
+echo "==> [2/5] index (offline, torch provider: mlx is a dev-only extra)"
+ALEXANDRIA_EMBED_PROVIDER=local .venv/bin/alexandria --corpus demo-corpus index --limit 0
 echo "==> [3/5] search"
-.venv/bin/alexandria --corpus demo-corpus search "Proxima deal status and next steps" | head -4
+ALEXANDRIA_EMBED_PROVIDER=local .venv/bin/alexandria --corpus demo-corpus search "Proxima deal status and next steps" | head -4
 echo "==> [4/5] wiki-site"
 .venv/bin/alexandria --corpus demo-corpus wiki-site --wiki demo-corpus/wiki --out "$WORK/site" || true
 if [ -n "${ALEX_BASE_URL:-}" ] && [ -n "${ALEX_API_KEY_ENV:-}" ]; then
