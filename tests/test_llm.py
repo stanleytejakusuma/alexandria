@@ -143,3 +143,30 @@ def test_the_nonce_is_actually_unique_per_call():
     a = client._with_cache_buster("system text")
     b = client._with_cache_buster("system text")
     assert a != b
+
+
+def test_read_with_deadline_fires_on_silent_stream():
+    """The stall class found 2026-08-07: a connection that stays alive but
+    sends nothing must still hit a hard deadline (urllib's socket timeout
+    does not bound a blocked stream read)."""
+    import time
+    from alexandria.llm import _read_with_deadline
+
+    class SilentStream:
+        def read(self):
+            time.sleep(30)  # never returns data
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        _read_with_deadline(SilentStream(), timeout=1)
+    assert time.monotonic() - started < 5
+
+
+def test_read_with_deadline_returns_body():
+    from alexandria.llm import _read_with_deadline
+
+    class FastStream:
+        def read(self):
+            return b'{"ok": true}'
+
+    assert _read_with_deadline(FastStream(), timeout=5) == b'{"ok": true}'
