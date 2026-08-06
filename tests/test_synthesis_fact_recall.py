@@ -732,3 +732,35 @@ def test_manifest_empty_when_no_golden_path_given(tmp_path):
     report = run_fact_recall_eval([_entry("cluster-a", "topic", ("f1",))], pages, gather,
                                   a, b)
     assert report.manifest == {}
+
+
+def test_compare_reports_deltas_and_version_mismatch(tmp_path):
+    """Offline smoke for scripts/compare-fact-recall.py: pooled deltas and
+    aggregation-version mismatch detection (never silently compare reports
+    scored under different rules)."""
+    cli = _load_script("compare_fact_recall")
+    base = {
+        "manifest": {"aggregation_version": "fact-recall-v1"},
+        "pooled_consensus_recall": 0.45, "pooled_union_recall": 0.525,
+        "pooled_recall_a": 0.45, "pooled_recall_b": 0.525,
+        "macro_consensus_recall": 0.452, "contested_count": 3,
+        "scored_fact_count": 40, "verdict": "PROVISIONAL_FAIL",
+        "clusters": [{"cluster_id": "cluster-a", "status": "graded",
+                      "consensus_recall": 0.5, "contested_ids": ["f1"]}],
+    }
+    curr = json.loads(json.dumps(base))
+    curr["pooled_consensus_recall"] = 0.6
+    curr["verdict"] = "FINAL_FAIL"
+    curr["clusters"][0]["consensus_recall"] = 0.66
+    curr["clusters"][0]["contested_ids"] = []
+
+    d = cli.compare_reports(base, curr)
+
+    assert d["aggregation_version_match"] is True
+    assert d["base"]["pooled_consensus_recall"] == 0.45
+    assert d["current"]["pooled_consensus_recall"] == 0.6
+    assert d["rows"][0]["base_contested"] == 1
+    assert d["rows"][0]["curr_contested"] == 0
+
+    curr["manifest"] = {"aggregation_version": "fact-recall-v2"}
+    assert cli.compare_reports(base, curr)["aggregation_version_match"] is False
