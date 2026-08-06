@@ -41,6 +41,18 @@ DEFAULT_GOLDEN = Path.home() / "alexandria-corpus" / ".alexandria" / "golden" / 
 CORPUS = Path.home() / "alexandria-corpus"
 
 
+def _pipeline_page_failure(*args, **kwargs):
+    """run_pipeline raises ValueError when an LLM emits structurally-wrong page
+    JSON (write.py parse_page_response) -- an expected pipeline failure, not a
+    driver bug. Converting at this boundary keeps the driver's catch scoped to
+    (LLMError, ChunkAccountingError); any other ValueError propagates and aborts
+    the batch (Red round 2: generic ValueError catching is too broad)."""
+    try:
+        return run_pipeline(*args, **kwargs)
+    except ValueError as exc:
+        raise LLMError(f"pipeline page-validation failure: {exc}") from exc
+
+
 def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: Path,
                             engine, clients: dict[str, Any], *, seed_k: int = 8) -> list[dict]:
     """Run the single-page pipeline for every cluster in order, freezing outputs.
@@ -75,7 +87,7 @@ def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: P
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            result = run_pipeline(
+            result = _pipeline_page_failure(
                 engine, entry.topic,
                 gather_llm=clients["gather"],
                 writer_llm=clients["writer"],
@@ -101,7 +113,7 @@ def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: P
                 "follow_up_queries": list(result.gathered.follow_up_queries),
                 "repair_iterations": result.repair.iterations,
             })
-        except (LLMError, ChunkAccountingError, ValueError) as exc:
+        except (LLMError, ChunkAccountingError) as exc:
             # Expected pipeline failure modes -- a failed page is data, not an
             # abort. Anything else (a bug in the driver itself, I/O, assertion
             # failures) must propagate: recording programmer errors as pipeline

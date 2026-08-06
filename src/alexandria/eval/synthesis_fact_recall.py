@@ -9,26 +9,42 @@ the page expressed every load-bearing proposition inside evidence it DID cite.
 This module is the missing instrument, and it is evaluation-only: it grades an
 already-produced page against hand-curated golden facts with two independent
 model-family graders, and it does not touch the runtime pipeline, its prompts,
-retrieval, or coverage.py. Design decisions are load-bearing (independent
-review, 2026-08-05):
+retrieval, or coverage.py.
+
+Design decisions are load-bearing (Red review rounds 1-2, 2026-08-05):
 
 1. Grade the rendered reader-visible page body, not the internal structured
    claims object -- otherwise we silently measure an easier, different quantity.
-2. Every `covered: true` verdict must carry a quoted page evidence span, or a
-   grader can hallucinate coverage un-auditably.
+2. Every `covered: true` verdict must carry a quoted page evidence span that is
+   a whitespace-normalized substring of the rendered body, or the response
+   fails loudly (a grader can hallucinate coverage un-auditably).
 3. Do not gate on blind strict-AND consensus alone: each grader's recall,
-   per-fact agreement/disagreement, and a conservative consensus recall are
-   all reported, and every disagreement is listed for manual adjudication.
+   per-fact agreement/disagreement, and a conservative consensus recall are all
+   reported, and every disagreement is listed for manual adjudication.
 4. Every consensus-miss is joined against the captured gather output
    deterministically, separating "evidence never gathered" (retrieval failure)
-   from "evidence gathered but the page omitted it" (writer/repair failure).
+   from "evidence gathered but the page omitted it" (writer/repair failure);
+   the taxonomy is explicitly PROVISIONAL because golden facts reference whole
+   documents and a gathered doc does not prove its passage was gathered.
+5. Run-status separation: only attributable pipeline failures count as recall
+   misses; measurement-invalid clusters are excluded from the denominator and
+   force an INVALID verdict (never encoded as FAIL).
+6. Verdict states are distinct: PASS / PROVISIONAL_FAIL (near-threshold band or
+   unresolved grader disagreement -- adjudication required) / FINAL_FAIL /
+   INVALID. Adjudications can be supplied to resolve contested and
+   near-threshold facts; they are recorded, never silent.
+
+Known deferral (Red round 2, not a merge blocker for the experimental
+evaluator): a full immutable run manifest binding golden-set hashes, prompts,
+model config, pages/sidecars, and code revision, plus atomic write/no-silent-
+overwrite enforcement. Required before this becomes the authoritative gate;
+scoped as a separate work order.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,8 +55,16 @@ from ..llm import LLMError
 from .synthesis_golden import LoadBearingFact, SynthesisClusterEntry
 
 __all__ = [
+    "BAND_LOW",
     "GATE_THRESHOLD",
     "GRADER_SYSTEM",
+    "STATUS_GRADED",
+    "STATUS_MEASUREMENT_INVALID",
+    "STATUS_PIPELINE_FAILURE",
+    "VERDICT_FINAL_FAIL",
+    "VERDICT_INVALID",
+    "VERDICT_PASS",
+    "VERDICT_PROVISIONAL_FAIL",
     "ClusterFactRecall",
     "FactRecallAgreement",
     "FactRecallReport",
@@ -56,6 +80,19 @@ __all__ = [
 ]
 
 GATE_THRESHOLD = 0.90
+# Near-threshold band: a consensus recall in [BAND_LOW, GATE_THRESHOLD) cannot
+# become FINAL_FAIL without adjudication (a fixable near-miss must be reviewed,
+# not silently declared dead). Predeclared, not tuned per run.
+BAND_LOW = 0.85
+
+STATUS_GRADED = "graded"
+STATUS_PIPELINE_FAILURE = "pipeline_failure"
+STATUS_MEASUREMENT_INVALID = "measurement_invalid"
+
+VERDICT_PASS = "PASS"
+VERDICT_PROVISIONAL_FAIL = "PROVISIONAL_FAIL"
+VERDICT_FINAL_FAIL = "FINAL_FAIL"
+VERDICT_INVALID = "INVALID"
 
 GRADER_SYSTEM = """You are grading whether a generated knowledge page covers a fixed set of
 hand-curated facts. Grade only what a reader sees in the page text: the prose
@@ -88,7 +125,7 @@ class FactRecallResult:
     verdicts: tuple[FactVerdict, ...]
     recall: float
     errors: tuple[str, ...]
-    raw: str = ""   # the grader's raw response, retained for audit
+    raw: str = ""          # the grader's raw response, retained for audit
 
     @property
     def passed(self) -> bool:
@@ -144,7 +181,7 @@ def parse_fact_recall_response(raw: str, expected_ids: tuple[str, ...],
     eval that cannot fail correctly is worse than no eval (never partial accept).
 
     When page_body is given, every covered verdict's evidence span must be a
-    substring of the rendered page body (whitespace-normalized) -- a grader
+    whitespace-normalized substring of the rendered page body -- a grader
     quoting evidence that is not in the page is lying and must fail."""
     try:
         payload = json.loads(raw, object_pairs_hook=_no_duplicate_keys)
@@ -245,15 +282,50 @@ def passes_gate(recall: float) -> bool:
 
 def classify_miss(fact: LoadBearingFact, gathered_doc_ids: set[str]) -> str:
     """Deterministic miss taxonomy (no LLM): was the fact's evidence ever
-    gathered? Separates retrieval failure from writer/repair failure."""
+    gathered? Separates retrieval failure from writer/repair failure. PROVISIONAL
+    by design -- golden facts reference whole docs, not passages."""
     if any(doc in gathered_doc_ids for doc in fact.supported_by):
         return "evidence_gathered_but_omitted"
     return "evidence_not_gathered"
 
 
-STATUS_GRADED = "graded"
-STATUS_PIPELINE_FAILURE = "pipeline_failure"
-STATUS_MEASUREMENT_INVALID = "measurement_invalid"
+def _cluster_outcome(entry: SynthesisClusterEntry, agreement: FactRecallAgreement,
+                     adjudications: dict[str, bool] | None, gathered: set[str]):
+    """Apply adjudications to the raw agreement. Adjudication keys are
+    \"<cluster_id>::<fact_id>\" and override BOTH graders' verdicts for that fact
+    (the adjudicated label is ground truth for it). Returns
+    (consensus_ids, contested_ids, miss_taxonomy)."""
+    a_by_id = {v.fact_id: v for v in agreement.result_a.verdicts}
+    b_by_id = {v.fact_id: v for v in agreement.result_b.verdicts}
+    consensus: list[str] = []
+    contested: list[str] = []
+    misses: list[dict[str, str]] = []
+    for fact in entry.load_bearing_facts:
+        adj = adjudications.get(f"{entry.id}::{fact.id}") if adjudications else None
+        if adj is True:
+            consensus.append(fact.id)
+            continue
+        if adj is False:
+            misses.append({
+                "fact_id": fact.id,
+                "fact_text": fact.text,
+                "classification": "adjudicated_not_covered",
+                "provisional": False,
+            })
+            continue
+        a_cov, b_cov = a_by_id[fact.id].covered, b_by_id[fact.id].covered
+        if a_cov and b_cov:
+            consensus.append(fact.id)
+        elif a_cov != b_cov:
+            contested.append(fact.id)
+        else:
+            misses.append({
+                "fact_id": fact.id,
+                "fact_text": fact.text,
+                "classification": classify_miss(fact, gathered),
+                "provisional": True,
+            })
+    return tuple(consensus), tuple(contested), tuple(misses)
 
 
 @dataclass(frozen=True)
@@ -262,6 +334,7 @@ class ClusterFactRecall:
     topic: str
     agreement: FactRecallAgreement | None
     status: str                      # graded | pipeline_failure | measurement_invalid
+    consensus_fact_count: int
     contested_ids: tuple[str, ...]
     consensus_recall: float
     union_recall: float
@@ -269,6 +342,7 @@ class ClusterFactRecall:
     recall_b: float
     errors: tuple[str, ...]
     miss_taxonomy: tuple[dict[str, str], ...]
+    adjudicated_fact_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -276,27 +350,41 @@ class FactRecallReport:
     clusters: tuple[ClusterFactRecall, ...]
     total_facts: int                 # every fact across all clusters
     scored_fact_count: int           # facts in graded + pipeline_failure clusters
-    consensus_count: int             # both-graders-covered facts in graded clusters
+    consensus_count: int             # adjudicated-consensus-covered facts, graded clusters
     pooled_consensus_recall: float   # consensus_count / scored_fact_count
     pooled_union_recall: float
     pooled_recall_a: float
     pooled_recall_b: float
     macro_consensus_recall: float    # unweighted mean of per-cluster consensus recall
     contested_count: int
+    adjudicated_count: int
     pipeline_failure_cluster_ids: tuple[str, ...]
     invalid_cluster_ids: tuple[str, ...]
-    gate: bool                       # consensus gate AND zero invalid clusters
+    verdict: str                     # PASS | PROVISIONAL_FAIL | FINAL_FAIL | INVALID
     timestamp: str
     git_sha: str
     config: dict[str, object]
 
 
+def _verdict(consensus_recall: float, contested_count: int, invalid: bool) -> str:
+    if invalid:
+        return VERDICT_INVALID
+    if consensus_recall >= GATE_THRESHOLD:
+        return VERDICT_PASS
+    if contested_count or consensus_recall >= BAND_LOW:
+        # unresolved disagreement or a near-threshold miss: adjudication required
+        # before this can be declared dead.
+        return VERDICT_PROVISIONAL_FAIL
+    return VERDICT_FINAL_FAIL
+
+
 def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
                          page_dir: str | Path, gather_dir: str | Path,
                          llm_a, llm_b, *, model_a: str | None = None,
-                         model_b: str | None = None) -> FactRecallReport:
+                         model_b: str | None = None,
+                         adjudications: dict[str, bool] | None = None) -> FactRecallReport:
     """Grade every entry's frozen page against its golden facts, with explicit
-    run-status separation (per Red review, 2026-08-05):
+    run-status separation (Red review rounds 1-2, 2026-08-05):
 
     - graded: page + readable gather sidecar + both graders returned verdicts.
     - pipeline_failure: the gather sidecar records emitted=false (a real
@@ -304,8 +392,11 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
       closed, attributable.
     - measurement_invalid: missing page, missing/unreadable sidecar, or a
       grader error. The run cannot produce a trustworthy score; the facts are
-      excluded from the denominator and the gate is forced FAIL until the
-      invalid cluster is fixed."""
+      excluded from the denominator and the verdict is INVALID (never FAIL).
+
+    Adjudications (optional) override both graders per fact, keyed
+    \"<cluster_id>::<fact_id>\" -> bool. They are recorded in the report and
+    recompute consensus/contested/misses."""
     pages, gathers = Path(page_dir), Path(gather_dir)
     clusters: list[ClusterFactRecall] = []
     for entry in entries:
@@ -332,21 +423,21 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
                 clusters.append(_invalid_cluster(
                     entry, (sidecar_error or "page missing",)))
             continue
+        if sidecar_error is not None:
+            # An unreadable/missing sidecar makes the run invalid even with a
+            # valid page: without it, attribution and integrity cannot be
+            # established, and folding the cluster's facts in as misses would
+            # produce a conservative but false quality estimate.
+            clusters.append(_invalid_cluster(entry, (sidecar_error,)))
+            continue
         if sidecar_emitted is False:
             # page exists but the pipeline recorded no emission: stale/mismatched
             # artifacts -- a measurement-integrity problem, not a graded page.
-            clusters.append(_invalid_cluster(entry, ("page present but sidecar records emitted=false",)))
+            clusters.append(_invalid_cluster(
+                entry, ("page present but sidecar records emitted=false",)))
             continue
 
         _, body = split_frontmatter(page_path.read_text(encoding="utf-8"))
-        if sidecar_error is not None:
-            # An unreadable/missing sidecar makes the run invalid (Red review):
-            # without it, attribution and integrity cannot be established, and
-            # folding the cluster's facts in as misses would produce a
-            # conservative but false quality estimate.
-            clusters.append(_invalid_cluster(entry, (sidecar_error,)))
-            continue
-
         try:
             agreement = grade_fact_recall_twice(
                 llm_a, llm_b, body, entry.load_bearing_facts,
@@ -356,32 +447,26 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
             clusters.append(_invalid_cluster(entry, (f"grader failed: {exc}",)))
             continue
 
-        a_by_id = {v.fact_id: v for v in agreement.result_a.verdicts}
-        b_by_id = {v.fact_id: v for v in agreement.result_b.verdicts}
-        miss_taxonomy = []
-        for fact in entry.load_bearing_facts:
-            if not a_by_id[fact.id].covered and not b_by_id[fact.id].covered:
-                miss_taxonomy.append({
-                    "fact_id": fact.id,
-                    "fact_text": fact.text,
-                    "classification": classify_miss(fact, gathered),
-                    # Golden facts reference whole documents; a doc being gathered
-                    # does not prove its supporting passage was. Provisional only.
-                    "provisional": True,
-                })
-
+        consensus_ids, contested_ids, misses = _cluster_outcome(
+            entry, agreement, adjudications, gathered)
+        n = len(entry.load_bearing_facts) or 1
+        adjudicated_here = sum(
+            1 for fact in entry.load_bearing_facts
+            if adjudications and f"{entry.id}::{fact.id}" in adjudications)
         clusters.append(ClusterFactRecall(
             cluster_id=entry.id,
             topic=entry.topic,
             agreement=agreement,
             status=STATUS_GRADED,
-            contested_ids=agreement.contested_ids,
-            consensus_recall=agreement.consensus_recall,
-            union_recall=agreement.union_recall,
+            consensus_fact_count=len(consensus_ids),
+            contested_ids=contested_ids,
+            consensus_recall=len(consensus_ids) / n,
+            union_recall=(len(consensus_ids) + len(contested_ids)) / n,
             recall_a=agreement.result_a.recall,
             recall_b=agreement.result_b.recall,
-            errors=tuple(),
-            miss_taxonomy=tuple(miss_taxonomy),
+            errors=(),
+            miss_taxonomy=misses,
+            adjudicated_fact_count=adjudicated_here,
         ))
 
     per_cluster_facts = {e.id: len(e.load_bearing_facts) for e in entries}
@@ -392,35 +477,38 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
 
     scored_facts = sum(per_cluster_facts[c.cluster_id] for c in scored)
     denom = scored_facts or 1
-    consensus_count = sum(len(c.agreement.consensus_covered) for c in graded)
-    union_count = sum(len(c.agreement.consensus_covered) + len(c.agreement.contested_ids)
-                      for c in graded)
+    consensus_count = sum(c.consensus_fact_count for c in graded)
+    union_count = sum(c.consensus_fact_count + len(c.contested_ids) for c in graded)
     recall_a = sum(c.recall_a * per_cluster_facts[c.cluster_id] for c in graded) / denom
     recall_b = sum(c.recall_b * per_cluster_facts[c.cluster_id] for c in graded) / denom
     macro = (sum(c.consensus_recall for c in scored) / len(scored)
              if scored else 0.0)
     contested_count = sum(len(c.contested_ids) for c in graded)
+    adjudicated_count = sum(c.adjudicated_fact_count for c in graded)
+    consensus_recall = consensus_count / denom
 
     return FactRecallReport(
         clusters=tuple(clusters),
         total_facts=sum(per_cluster_facts.values()),
         scored_fact_count=scored_facts,
         consensus_count=consensus_count,
-        pooled_consensus_recall=consensus_count / denom,
+        pooled_consensus_recall=consensus_recall,
         pooled_union_recall=union_count / denom,
         pooled_recall_a=recall_a,
         pooled_recall_b=recall_b,
         macro_consensus_recall=macro,
         contested_count=contested_count,
+        adjudicated_count=adjudicated_count,
         pipeline_failure_cluster_ids=tuple(c.cluster_id for c in failures),
         invalid_cluster_ids=tuple(c.cluster_id for c in invalid),
-        gate=passes_gate(consensus_count / denom) and not invalid,
+        verdict=_verdict(consensus_recall, contested_count, bool(invalid)),
         timestamp=datetime.now(timezone.utc).isoformat(),
         git_sha=_git_sha(),
         config={
             "model_a": model_a or "default",
             "model_b": model_b or "default",
             "gate_threshold": GATE_THRESHOLD,
+            "band_low": BAND_LOW,
             "page_dir": str(pages),
             "gather_dir": str(gathers),
         },
@@ -431,7 +519,7 @@ def _invalid_cluster(entry: SynthesisClusterEntry,
                      errors: tuple[str, ...]) -> ClusterFactRecall:
     return ClusterFactRecall(
         cluster_id=entry.id, topic=entry.topic, agreement=None,
-        status=STATUS_MEASUREMENT_INVALID, contested_ids=(),
+        status=STATUS_MEASUREMENT_INVALID, consensus_fact_count=0, contested_ids=(),
         consensus_recall=0.0, union_recall=0.0, recall_a=0.0, recall_b=0.0,
         errors=errors, miss_taxonomy=(),
     )
@@ -441,7 +529,7 @@ def _failure_cluster(entry: SynthesisClusterEntry,
                      errors: tuple[str, ...]) -> ClusterFactRecall:
     return ClusterFactRecall(
         cluster_id=entry.id, topic=entry.topic, agreement=None,
-        status=STATUS_PIPELINE_FAILURE, contested_ids=(),
+        status=STATUS_PIPELINE_FAILURE, consensus_fact_count=0, contested_ids=(),
         consensus_recall=0.0, union_recall=0.0, recall_a=0.0, recall_b=0.0,
         errors=errors, miss_taxonomy=(),
     )

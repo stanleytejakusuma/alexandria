@@ -17,7 +17,11 @@ import pytest
 
 from alexandria.eval.synthesis_fact_recall import (
     GRADER_SYSTEM,
-    FactRecallResult,
+    VERDICT_FINAL_FAIL,
+    VERDICT_INVALID,
+    VERDICT_PASS,
+    VERDICT_PROVISIONAL_FAIL,
+    _verdict,
     build_fact_recall_prompt,
     classify_miss,
     grade_fact_recall,
@@ -139,8 +143,6 @@ def test_parse_accepts_whitespace_normalized_evidence():
 def test_grade_fact_recall_computes_recall_and_records_model():
     llm = ScriptedClient([_resp(_covered("f1"), _uncovered("f2"))])
     result = grade_fact_recall(llm, PAGE, _facts("f1", "f2"), model="grader-x")
-    assert isinstance(result, FactRecallResult)
-    assert result.model == "grader-x"
     assert result.recall == 0.5
     assert result.errors == ()
     assert result.passed is False
@@ -286,7 +288,7 @@ def test_run_fact_recall_eval_reports_consensus_and_contested_per_cluster(tmp_pa
     assert report.macro_consensus_recall == pytest.approx((1.0 + 1 / 3) / 2)
     assert report.contested_count == 1
     assert report.invalid_cluster_ids == ()
-    assert report.gate is False
+    assert report.verdict == VERDICT_PROVISIONAL_FAIL   # unresolved disagreement
     assert report.config["model_a"] == "m-a" and report.config["model_b"] == "m-b"
     assert report.git_sha
     cluster_b = report.clusters[1]
@@ -311,7 +313,7 @@ def test_run_fact_recall_eval_missing_page_is_measurement_invalid(tmp_path):
     assert cluster.errors == ("gather sidecar missing",)
     assert report.invalid_cluster_ids == ("cluster-a",)
     assert report.scored_fact_count == 0
-    assert report.gate is False
+    assert report.verdict == VERDICT_INVALID
 
 
 def test_run_fact_recall_eval_missing_gather_sidecar_is_measurement_invalid(tmp_path):
@@ -328,6 +330,7 @@ def test_run_fact_recall_eval_missing_gather_sidecar_is_measurement_invalid(tmp_
     assert cluster.status == "measurement_invalid"
     assert "gather sidecar missing" in cluster.errors
     assert cluster.miss_taxonomy == ()
+    assert report.verdict == VERDICT_INVALID
 
 
 def test_run_fact_recall_eval_pipeline_failure_facts_count_as_misses(tmp_path):
@@ -349,7 +352,7 @@ def test_run_fact_recall_eval_pipeline_failure_facts_count_as_misses(tmp_path):
     assert report.pipeline_failure_cluster_ids == ("cluster-a",)
     assert report.scored_fact_count == 2
     assert report.pooled_consensus_recall == 0.0
-    assert report.gate is False
+    assert report.verdict == VERDICT_FINAL_FAIL
 
 
 def test_run_fact_recall_eval_gate_forced_fail_when_any_cluster_invalid(tmp_path):
@@ -368,8 +371,66 @@ def test_run_fact_recall_eval_gate_forced_fail_when_any_cluster_invalid(tmp_path
     )
     assert report.clusters[0].status == "graded"
     assert report.pooled_consensus_recall == 1.0
-    assert report.gate is False          # fail closed: one invalid cluster
+    assert report.verdict == VERDICT_INVALID   # fail closed: one invalid cluster
     assert report.invalid_cluster_ids == ("cluster-b",)
+
+
+def test_verdict_boundaries():
+    assert _verdict(0.95, 0, False) == VERDICT_PASS
+    assert _verdict(0.90, 0, False) == VERDICT_PASS
+    assert _verdict(0.89, 0, False) == VERDICT_PROVISIONAL_FAIL   # in band
+    assert _verdict(0.85, 0, False) == VERDICT_PROVISIONAL_FAIL   # band edge
+    assert _verdict(0.84, 0, False) == VERDICT_FINAL_FAIL
+    assert _verdict(0.90, 1, False) == VERDICT_PASS   # contested already counts as a miss; gate met
+    assert _verdict(0.0, 0, True) == VERDICT_INVALID
+    assert _verdict(0.99, 0, True) == VERDICT_INVALID             # invalid is never FAIL
+
+
+def test_adjudication_resolves_contested_and_recomputes_verdict(tmp_path):
+    a_llm = ScriptedClient([
+        _resp(_covered("f1"), _covered("f2")),
+        _resp(_covered("f3"), _uncovered("f4"), _uncovered("f5")),
+    ])
+    b_llm = ScriptedClient([
+        _resp(_covered("f1"), _covered("f2")),
+        _resp(_covered("f3"), _uncovered("f4"), _covered("f5")),
+    ])
+    pages, gather = _write_fixture(tmp_path, "cluster-a", PAGE, ("f1", "f2"))
+    _write_fixture(tmp_path, "cluster-b", PAGE, ("f3", "f4", "f5"))
+    entries = [_entry("cluster-a", "topic a", ("f1", "f2")), _entry("cluster-b", "topic b", ("f3", "f4", "f5"))]
+    # f4: consensus miss -> adjudicated covered. f5: contested -> adjudicated covered.
+    adjudications = {"cluster-b::f4": True, "cluster-b::f5": True}
+
+    report = run_fact_recall_eval(entries, pages, gather, a_llm, b_llm,
+                                  adjudications=adjudications)
+
+    assert report.consensus_count == 5
+    assert report.pooled_consensus_recall == 1.0
+    assert report.contested_count == 0
+    assert report.adjudicated_count == 2
+    assert report.verdict == VERDICT_PASS
+    cluster_b = report.clusters[1]
+    assert cluster_b.miss_taxonomy == ()
+    # Raw grader verdicts are retained for audit even where adjudication overrode them.
+    assert cluster_b.agreement.result_a.verdicts[2].covered is False  # f5, grader a
+    assert cluster_b.agreement.result_b.verdicts[2].covered is True   # f5, grader b
+
+
+def test_adjudication_false_records_miss_and_affects_verdict(tmp_path):
+    a_llm = ScriptedClient([_resp(_covered("f1"))])
+    b_llm = ScriptedClient([_resp(_covered("f1"))])
+    pages, gather = _write_fixture(tmp_path, "cluster-a", PAGE, ("f1",))
+    adjudications = {"cluster-a::f1": False}
+
+    report = run_fact_recall_eval([_entry("cluster-a", "topic", ("f1",))], pages, gather,
+                                  a_llm, b_llm, adjudications=adjudications)
+
+    assert report.consensus_count == 0
+    assert report.verdict == VERDICT_FINAL_FAIL
+    assert report.clusters[0].miss_taxonomy == (
+        {"fact_id": "f1", "fact_text": "golden fact f1",
+         "classification": "adjudicated_not_covered", "provisional": False},
+    )
 
 
 # ---- measurement driver (scripts/synthesize-golden-pages.py) ----

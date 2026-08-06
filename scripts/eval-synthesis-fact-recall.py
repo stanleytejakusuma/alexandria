@@ -19,7 +19,15 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from alexandria.eval.synthesis_fact_recall import GATE_THRESHOLD, run_fact_recall_eval
+from alexandria.eval.synthesis_fact_recall import (
+    BAND_LOW,
+    GATE_THRESHOLD,
+    VERDICT_FINAL_FAIL,
+    VERDICT_INVALID,
+    VERDICT_PASS,
+    VERDICT_PROVISIONAL_FAIL,
+    run_fact_recall_eval,
+)
 from alexandria.eval.synthesis_golden import load_synthesis_golden
 from alexandria.llm import LLMClient
 
@@ -33,9 +41,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN)
     p.add_argument("--model-a", default="claude-fable-5")
     p.add_argument("--model-b", default="deepseek-v4-pro")
+    p.add_argument("--adjudication", type=Path, default=None,
+                   help="JSONL of {\"fact_id\": \"<cluster>::<fact>\", \"covered\": bool} "
+                        "overrides applied to both graders before scoring")
     p.add_argument("--output", type=Path, default=None,
                    help="JSON destination (default docs/calibration/synthesis-fact-recall-v1-<UTC>.json)")
     return p
+
+
+def _load_adjudications(path: Path | None) -> dict[str, bool]:
+    if path is None:
+        return {}
+    out: dict[str, bool] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        fact_id, covered = row.get("fact_id"), row.get("covered")
+        if not isinstance(fact_id, str) or not isinstance(covered, bool):
+            raise ValueError(f"adjudication line {line_number}: need fact_id and covered")
+        out[fact_id] = covered
+    return out
 
 
 def _as_dict(report) -> dict:
@@ -57,9 +83,11 @@ def main(argv: list[str] | None = None) -> int:
     entries = load_synthesis_golden(args.golden)
     llm_a = LLMClient(model=args.model_a, timeout=180, max_retries=3, base_delay=2.0, min_interval=0.5)
     llm_b = LLMClient(model=args.model_b, timeout=240, max_retries=3, base_delay=2.0, min_interval=0.5)
+    adjudications = _load_adjudications(args.adjudication)
 
     report = run_fact_recall_eval(entries, args.pages, args.gather, llm_a, llm_b,
-                                  model_a=args.model_a, model_b=args.model_b)
+                                  model_a=args.model_a, model_b=args.model_b,
+                                  adjudications=adjudications)
 
     print(f"\nper-cluster (gate >= {int(GATE_THRESHOLD * 100)}%):")
     print(f"  {'cluster':<28} {'status':<19} {'recall_a':>8} {'recall_b':>8} {'consensus':>9} "
@@ -72,14 +100,18 @@ def main(argv: list[str] | None = None) -> int:
           f"recall_a={report.pooled_recall_a:.3f} recall_b={report.pooled_recall_b:.3f} "
           f"consensus={report.pooled_consensus_recall:.3f} ({report.consensus_count}/{report.scored_fact_count}) "
           f"union={report.pooled_union_recall:.3f} macro={report.macro_consensus_recall:.3f} "
-          f"contested={report.contested_count}")
-    print(f"GATE: {'PASS' if report.gate else 'FAIL'} (consensus recall "
-          f"{report.pooled_consensus_recall:.3f} vs {GATE_THRESHOLD:.2f})")
+          f"contested={report.contested_count} adjudicated={report.adjudicated_count}")
+    print(f"VERDICT: {report.verdict} (gate >= {int(GATE_THRESHOLD * 100)}%, "
+          f"band [{int(BAND_LOW * 100)}%, {int(GATE_THRESHOLD * 100)}%))")
     if report.invalid_cluster_ids:
-        print(f"\nMEASUREMENT INVALID (gate forced FAIL): {', '.join(report.invalid_cluster_ids)}")
+        print(f"\nMEASUREMENT INVALID (verdict {report.verdict}, never FAIL): "
+              f"{', '.join(report.invalid_cluster_ids)}")
     if report.pipeline_failure_cluster_ids:
         print(f"pipeline failures (facts counted as misses): "
               f"{', '.join(report.pipeline_failure_cluster_ids)}")
+    if report.verdict == VERDICT_PROVISIONAL_FAIL:
+        print("\nPROVISIONAL: adjudication required before a final verdict -- "
+              "supply --adjudication with contested/near-threshold facts")
     if report.contested_count:
         print("\ncontested facts (manual adjudication required):")
         for c in report.clusters:
@@ -97,7 +129,11 @@ def main(argv: list[str] | None = None) -> int:
     payload["command"] = " ".join(sys.argv)
     output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"\nreport written: {output}")
-    return 0 if report.gate else 1
+    if report.verdict == VERDICT_INVALID:
+        return 3                      # infrastructure failure, distinct from a recall FAIL
+    if report.verdict == VERDICT_PASS:
+        return 0
+    return 1                          # PROVISIONAL_FAIL and FINAL_FAIL both block
 
 
 if __name__ == "__main__":
