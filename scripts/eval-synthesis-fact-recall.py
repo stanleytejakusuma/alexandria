@@ -26,6 +26,7 @@ from alexandria.eval.synthesis_fact_recall import (
     VERDICT_INVALID,
     VERDICT_PASS,
     VERDICT_PROVISIONAL_FAIL,
+    _verdict,
     run_fact_recall_eval,
     verify_manifest,
 )
@@ -54,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="JSON destination (default docs/calibration/synthesis-fact-recall-v1-<UTC>.json)")
     p.add_argument("--verify", type=Path, default=None, metavar="REPORT.json",
                    help="verify a persisted report's manifest against current disk state and exit")
+    p.add_argument("--replay", type=Path, default=None, metavar="REPORT.json",
+                   help="apply --adjudication to a persisted report WITHOUT re-grading "
+                        "(no LLM calls) and print the recomputed verdict")
     return p
 
 
@@ -72,6 +76,84 @@ def _load_adjudications(path: Path | None) -> dict[str, bool]:
     return out
 
 
+def replay_report(report: dict, adjudications: dict[str, bool]) -> dict:
+    """Apply adjudication overrides to a PERSISTED report and recompute
+    consensus/contested/pooled/verdict WITHOUT re-grading (no LLM calls --
+    adjudication is a delta over the already-graded verdicts). The report's
+    raw agreement data is preserved untouched for audit."""
+    known = set()
+    for c in report.get("clusters", []):
+        agreement = c.get("agreement")
+        if c.get("status") == "graded" and agreement:
+            known.update(f"{c['cluster_id']}::{v['fact_id']}"
+                         for v in agreement["result_a"]["verdicts"])
+    unknown = sorted(set(adjudications) - known)
+    if unknown:
+        raise ValueError(f"adjudication references unknown fact(s): {unknown}")
+
+    clusters = []
+    consensus_delta = 0
+    contested_delta = 0
+    for c in report["clusters"]:
+        if c.get("status") != "graded" or not c.get("agreement"):
+            clusters.append(c)
+            continue
+        agreement = c["agreement"]
+        va = {v["fact_id"]: v for v in agreement["result_a"]["verdicts"]}
+        vb = {v["fact_id"]: v for v in agreement["result_b"]["verdicts"]}
+        ids = [v["fact_id"] for v in agreement["result_a"]["verdicts"]]
+        consensus, contested = [], []
+        adjudicated_here = 0
+        for fid in ids:
+            adj = adjudications.get(f"{c['cluster_id']}::{fid}")
+            both = va[fid]["covered"] and vb[fid]["covered"]
+            if adj is True:
+                consensus.append(fid)
+                adjudicated_here += 1
+                if not both:
+                    consensus_delta += 1
+                if va[fid]["covered"] != vb[fid]["covered"]:
+                    contested_delta -= 1
+            elif adj is False:
+                adjudicated_here += 1
+                if both:
+                    consensus_delta -= 1
+            elif both:
+                consensus.append(fid)
+            elif va[fid]["covered"] != vb[fid]["covered"]:
+                contested.append(fid)
+        n = len(ids) or 1
+        c = dict(c)
+        c["consensus_fact_count"] = len(consensus)
+        c["consensus_covered"] = consensus
+        c["contested_ids"] = contested
+        c["consensus_recall"] = len(consensus) / n
+        c["union_recall"] = (len(consensus) + len(contested)) / n
+        c["adjudicated_fact_count"] = c.get("adjudicated_fact_count", 0) + adjudicated_here
+        clusters.append(c)
+
+    out = dict(report)
+    scored = out.get("scored_fact_count", 0) or 1
+    consensus_count = out.get("consensus_count", 0) + consensus_delta
+    contested_count = out.get("contested_count", 0) + contested_delta
+    consensus_recall = consensus_count / scored
+    graded = [c for c in clusters if c.get("status") == "graded"]
+    macro = (sum(c["consensus_recall"] for c in clusters if c.get("status") != "measurement_invalid")
+             / max(1, sum(1 for c in clusters if c.get("status") != "measurement_invalid")))
+    out.update({
+        "clusters": clusters,
+        "consensus_count": consensus_count,
+        "contested_count": contested_count,
+        "pooled_consensus_recall": consensus_recall,
+        "pooled_union_recall": (consensus_count + contested_count) / scored,
+        "macro_consensus_recall": macro,
+        "adjudicated_count": sum(c.get("adjudicated_fact_count", 0) for c in graded),
+        "verdict": _verdict(consensus_recall, contested_count,
+                             bool(out.get("invalid_cluster_ids"))),
+    })
+    return out
+
+
 def _as_dict(report) -> dict:
     """Persist the FULL report: cluster fields plus the complete agreement
     (both graders' per-fact verdicts, evidence spans, and raw responses) -- the
@@ -87,6 +169,21 @@ def _as_dict(report) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.replay is not None:
+        report = json.loads(args.replay.read_text(encoding="utf-8"))
+        adjudications = _load_adjudications(args.adjudication)
+        replayed = replay_report(report, adjudications)
+        print(f"replayed {args.replay} with {len(adjudications)} adjudication(s):")
+        print(f"  pooled_consensus: {replayed['pooled_consensus_recall']:.3f} "
+              f"({replayed['consensus_count']}/{replayed['scored_fact_count']})")
+        print(f"  contested: {replayed['contested_count']}  "
+              f"adjudicated: {replayed['adjudicated_count']}")
+        print(f"  VERDICT: {replayed['verdict']}")
+        if args.output is not None:
+            args.output.write_text(json.dumps(replayed, indent=2, ensure_ascii=False) + "\n",
+                                   encoding="utf-8")
+            print(f"replayed report written: {args.output}")
+        return 0
     if args.verify is not None:
         report = json.loads(args.verify.read_text(encoding="utf-8"))
         problems = verify_manifest(report.get("manifest") or {},

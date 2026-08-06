@@ -764,3 +764,87 @@ def test_compare_reports_deltas_and_version_mismatch(tmp_path):
 
     curr["manifest"] = {"aggregation_version": "fact-recall-v2"}
     assert cli.compare_reports(base, curr)["aggregation_version_match"] is False
+
+
+def test_replay_report_applies_adjudications_without_regrading(tmp_path):
+    """The v1 adjudication scenario: 3 contested facts adjudicated false pins the
+    verdict from PROVISIONAL to FINAL without re-running the 80-LLM-call grading."""
+    cli = _load_script("eval_synthesis_fact_recall")
+    base = {
+        "scored_fact_count": 40, "consensus_count": 18, "contested_count": 3,
+        "adjudicated_count": 0, "invalid_cluster_ids": [],
+        "pooled_consensus_recall": 0.45, "pooled_union_recall": 0.525,
+        "pooled_recall_a": 0.45, "pooled_recall_b": 0.525,
+        "macro_consensus_recall": 0.452, "verdict": "PROVISIONAL_FAIL",
+        "clusters": [
+            {"cluster_id": "c1", "status": "graded", "consensus_recall": 0.5,
+             "consensus_covered": ["f1"], "contested_ids": ["f2"],
+             "adjudicated_fact_count": 0,
+             "agreement": {"result_a": {"verdicts": [
+                 {"fact_id": "f1", "covered": True}, {"fact_id": "f2", "covered": True}]},
+                 "result_b": {"verdicts": [
+                 {"fact_id": "f1", "covered": True}, {"fact_id": "f2", "covered": False}]}}},
+            {"cluster_id": "c2", "status": "pipeline_failure",
+             "consensus_recall": 0.0, "contested_ids": [], "agreement": None},
+        ],
+    }
+    # c1::f2 contested -> adjudicated covered: consensus 18->19, contested 3->2.
+    replayed = cli.replay_report(base, {"c1::f2": True})
+    assert replayed["consensus_count"] == 19
+    assert replayed["contested_count"] == 2
+    assert replayed["pooled_consensus_recall"] == pytest.approx(19 / 40)
+    assert replayed["clusters"][0]["consensus_covered"] == ["f1", "f2"]
+    assert replayed["clusters"][0]["contested_ids"] == []
+    # raw agreement preserved for audit
+    assert replayed["clusters"][0]["agreement"]["result_a"]["verdicts"][1]["covered"] is True
+
+
+def test_replay_report_rejects_unknown_adjudication_key(tmp_path):
+    cli = _load_script("eval_synthesis_fact_recall")
+    base = {"scored_fact_count": 1, "consensus_count": 1, "contested_count": 0,
+            "adjudicated_count": 0, "invalid_cluster_ids": [],
+            "pooled_consensus_recall": 1.0, "pooled_union_recall": 1.0,
+            "pooled_recall_a": 1.0, "pooled_recall_b": 1.0, "macro_consensus_recall": 1.0,
+            "verdict": "PASS",
+            "clusters": [{"cluster_id": "c1", "status": "graded",
+                          "consensus_recall": 1.0, "consensus_covered": ["f1"],
+                          "contested_ids": [], "adjudicated_fact_count": 0,
+                          "agreement": {"result_a": {"verdicts": [
+                              {"fact_id": "f1", "covered": True}]},
+                              "result_b": {"verdicts": [
+                              {"fact_id": "f1", "covered": True}]}}}]}
+    with pytest.raises(ValueError, match="unknown"):
+        cli.replay_report(base, {"c9::f9": True})
+
+
+def test_emit_summary_anonymizes_cluster_ids(tmp_path):
+    gen = _load_script("emit_fact_recall_summary")
+    report = {
+        "git_sha": "abc123", "timestamp": "2026-08-06T00:00:00+00:00",
+        "manifest": {"aggregation_version": "fact-recall-v1"},
+        "scored_fact_count": 3, "consensus_count": 2, "contested_count": 0,
+        "adjudicated_count": 0, "invalid_cluster_ids": [],
+        "pipeline_failure_cluster_ids": ["zebra-cluster"],
+        "pooled_consensus_recall": 2 / 3, "pooled_union_recall": 2 / 3,
+        "pooled_recall_a": 2 / 3, "pooled_recall_b": 2 / 3,
+        "macro_consensus_recall": 2 / 3, "verdict": "FINAL_FAIL",
+        "total_facts": 3,
+        "clusters": [
+            {"cluster_id": "alpha-cluster", "status": "graded",
+             "consensus_recall": 1.0, "recall_a": 1.0, "recall_b": 1.0,
+             "contested_ids": []},
+            {"cluster_id": "zebra-cluster", "status": "pipeline_failure",
+             "consensus_recall": 0.0, "recall_a": None, "recall_b": None,
+             "contested_ids": []},
+        ],
+    }
+    golden = [{"id": "alpha-cluster", "load_bearing_facts": [{"id": "a"}, {"id": "b"}]},
+              {"id": "zebra-cluster", "load_bearing_facts": [{"id": "c"}]}]
+    summary = gen.build_summary(report, golden)
+    markdown = gen.render_markdown(summary, title="t", source_report="/tmp/report.json")
+    assert summary["mapping"] == {"alpha-cluster": "cluster-1", "zebra-cluster": "cluster-2"}
+    assert "alpha-cluster" not in markdown
+    assert "zebra-cluster" not in markdown
+    assert "cluster-1" in markdown and "cluster-2" in markdown
+    assert "FINAL_FAIL" in markdown
+    assert summary["pipeline_failures"] == ["cluster-2"]
