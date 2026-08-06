@@ -41,6 +41,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN)
     p.add_argument("--model-a", default="claude-fable-5")
     p.add_argument("--model-b", default="deepseek-v4-pro")
+    p.add_argument("--base-url", default="http://127.0.0.1:20128/v1",
+                   help="OpenAI-compatible gateway base URL (remote unattended gateway "
+                        "for long runs)")
+    p.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY",
+                   help="env var holding the gateway API key")
     p.add_argument("--adjudication", type=Path, default=None,
                    help="JSONL of {\"fact_id\": \"<cluster>::<fact>\", \"covered\": bool} "
                         "overrides applied to both graders before scoring")
@@ -81,8 +86,10 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     entries = load_synthesis_golden(args.golden)
-    llm_a = LLMClient(model=args.model_a, timeout=180, max_retries=3, base_delay=2.0, min_interval=0.5)
-    llm_b = LLMClient(model=args.model_b, timeout=240, max_retries=3, base_delay=2.0, min_interval=0.5)
+    llm_a = LLMClient(model=args.model_a, base_url=args.base_url, api_key_env=args.api_key_env,
+                      timeout=180, max_retries=3, base_delay=2.0, min_interval=0.5)
+    llm_b = LLMClient(model=args.model_b, base_url=args.base_url, api_key_env=args.api_key_env,
+                      timeout=240, max_retries=3, base_delay=2.0, min_interval=0.5)
     adjudications = _load_adjudications(args.adjudication)
 
     report = run_fact_recall_eval(entries, args.pages, args.gather, llm_a, llm_b,

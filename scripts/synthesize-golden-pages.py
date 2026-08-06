@@ -145,8 +145,9 @@ def _copy_outputs(page_path, skip_log_path, pages_dir: Path, cluster_id: str) ->
         shutil.copyfile(Path(skip_log_path), Path(pages_dir) / f"{cluster_id}.skip-log.json")
 
 
-def _client(model: str) -> LLMClient:
-    return LLMClient(model=model, timeout=180, max_retries=3, base_delay=2.0, min_interval=0.5)
+def _client(model: str, base_url: str, api_key_env: str) -> LLMClient:
+    return LLMClient(model=model, base_url=base_url, api_key_env=api_key_env,
+                     timeout=180, max_retries=3, base_delay=2.0, min_interval=0.5)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -155,6 +156,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, required=True, help="output dir (created if missing)")
     p.add_argument("--limit", type=int, default=None, help="cap the number of clusters (smoke runs)")
     p.add_argument("--seed-k", type=int, default=8)
+    p.add_argument("--base-url", default="http://127.0.0.1:20128/v1",
+                   help="OpenAI-compatible gateway base URL (the remote unattended "
+                        "gateway for long/unattended runs)")
+    p.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY",
+                   help="env var holding the gateway API key")
     p.add_argument("--gather-model", default="claude-sonnet-5")
     p.add_argument("--writer-model", default="claude-sonnet-5")
     p.add_argument("--repair-model", default="claude-sonnet-5")
@@ -182,12 +188,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"engine warmed; synthesizing {len(entries)} cluster(s) serially ...", flush=True)
 
     clients = {
-        "gather": _client(args.gather_model),
-        "writer": _client(args.writer_model),
-        "repair": _client(args.repair_model),
-        "audit": _client(args.audit_model),
-        "coverage_a": _client(args.coverage_a),
-        "coverage_b": _client(args.coverage_b),
+        "gather": _client(args.gather_model, args.base_url, args.api_key_env),
+        "writer": _client(args.writer_model, args.base_url, args.api_key_env),
+        "repair": _client(args.repair_model, args.base_url, args.api_key_env),
+        "audit": _client(args.audit_model, args.base_url, args.api_key_env),
+        "coverage_a": _client(args.coverage_a, args.base_url, args.api_key_env),
+        "coverage_b": _client(args.coverage_b, args.base_url, args.api_key_env),
     }
     started = time.monotonic()
     results = synthesize_golden_pages(entries, args.out, engine, clients, seed_k=args.seed_k)
