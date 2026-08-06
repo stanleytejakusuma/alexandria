@@ -70,12 +70,15 @@ def _load_adjudications(path: Path | None) -> dict[str, bool]:
 
 
 def _as_dict(report) -> dict:
+    """Persist the FULL report: cluster fields plus the complete agreement
+    (both graders' per-fact verdicts, evidence spans, and raw responses) -- the
+    audit trail Red required. The flattened consensus_covered/contested_ids are
+    kept for convenient table rendering; agreement is retained, never dropped."""
     data = asdict(report)
     for cluster in data["clusters"]:
         if cluster["agreement"] is not None:
             cluster["consensus_covered"] = list(cluster["agreement"]["consensus_covered"])
             cluster["contested_ids"] = list(cluster["agreement"]["contested_ids"])
-        cluster["agreement"] = None  # flattened above; verdicts live in per-fact report
     return data
 
 

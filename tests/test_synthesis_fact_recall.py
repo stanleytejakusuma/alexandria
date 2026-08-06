@@ -546,3 +546,28 @@ def test_driver_propagates_unexpected_exception(tmp_path):
 
     with pytest.raises(RuntimeError, match="gather exploded"):
         driver.synthesize_golden_pages(entries, out, engine, _clients(), seed_k=8)
+
+
+def test_report_serialization_retains_agreement_and_raw_responses(tmp_path):
+    """Regression: the CLI serializer once dropped the entire agreement (per-fact
+    verdicts, evidence spans, raw responses) before persisting -- destroying the
+    audit trail. The persisted payload must keep it."""
+    cli = _load_script("eval_synthesis_fact_recall")
+    raw_a = _resp(_covered("f1"))
+    raw_b = _resp(_uncovered("f1"))
+    a_llm = ScriptedClient([raw_a])
+    b_llm = ScriptedClient([raw_b])
+    pages, gather = _write_fixture(tmp_path, "cluster-a", PAGE, ("f1",))
+    report = run_fact_recall_eval([_entry("cluster-a", "topic", ("f1",))], pages, gather,
+                                  a_llm, b_llm)
+
+    payload = cli._as_dict(report)
+
+    cluster = payload["clusters"][0]
+    agreement = cluster["agreement"]
+    assert agreement is not None
+    assert agreement["result_a"]["raw"] == raw_a
+    assert agreement["result_b"]["raw"] == raw_b
+    assert agreement["result_a"]["verdicts"][0]["evidence"] == EVIDENCE
+    assert cluster["contested_ids"] == ["f1"]
+    assert cluster["consensus_covered"] == []
