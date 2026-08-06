@@ -29,7 +29,7 @@ from alexandria.eval.golden import load_golden
 from alexandria.eval.synthesis_golden import load_synthesis_golden
 from alexandria.index.chunker import chunk_document
 from alexandria.index.embedder import CachedEmbedder, MLXEmbedder
-from alexandria.synthesis.clustering import find_topic_clusters
+from alexandria.synthesis.clustering import _UnionFind, find_topic_clusters
 
 DEFAULT_CORPUS = Path.home() / "alexandria-corpus"
 SEED = 7
@@ -157,17 +157,35 @@ def sweep_topic(embedder, corpus: Path, chunks) -> None:
     golden_docs = {e.id: set(e.source_docs) for e in synth}
     chunk_by_id = {c.chunk_id: c for c in chunks}
 
+    # Embed ONCE and compute the >= 0.35 pair set ONCE; thresholds are then a
+    # filter over the same pairs -- the full re-embed + re-matrix per threshold
+    # measured ~15min for the first sweep, which was absurd for a filter.
+    import numpy as np
+    from alexandria.synthesis.clustering import _pairs_above
+    vectors = np.asarray(embedder.embed([c.text for c in chunks]), dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms < 1e-8] = 1.0
+    vectors = vectors / norms
+    all_pairs = list(_pairs_above(vectors, 0.35))
+    print(f"topic sweep: {len(chunks)} chunks, {len(all_pairs)} pairs >= 0.35")
+
     print(f"\ntopic overlap sweep over {len(chunks)} probe chunks (one per doc), "
           f"{len(synth)} known-good clusters")
     print(f"{'t':>6} {'meanJ':>6} {'recalled':>10}")
     best = (0.0, None)
     for t in [0.75, 0.70, 0.65, 0.60, 0.55, 0.50, 0.45, 0.40, 0.35]:
-        clusters = find_topic_clusters(chunks, threshold=t, embedder=embedder)
+        uf = _UnionFind(len(chunks))
+        for i, j in all_pairs:
+            if vectors[i] @ vectors[j] >= t:
+                uf.union(i, j)
+        clusters: dict[int, list[int]] = {}
+        for i in range(len(chunks)):
+            clusters.setdefault(uf.find(i), []).append(i)
         matched = []
         for docs in golden_docs.values():
             cbest = 0.0
-            for c in clusters:
-                cdocs = {chunk_by_id[m].doc_id for m in c.member_ids}
+            for members in clusters.values():
+                cdocs = {chunk_by_id[chunks[m].chunk_id].doc_id for m in members}
                 inter = len(cdocs & docs)
                 union = len(cdocs | docs) or 1
                 cbest = max(cbest, inter / union)
