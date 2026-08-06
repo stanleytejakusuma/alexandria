@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Offline test suite
+        run: python -m pytest tests/ -q
+
+      - name: Leak scanner (unconditional)
+        run: python scripts/precommit-scan.py --all
+
+      # eval-gate.py skips itself on CI (no private corpus/index here) -- its
+      # retrieval regression measurement is a local-machine gate by design.

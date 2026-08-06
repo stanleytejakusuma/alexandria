@@ -108,26 +108,31 @@ Everything is markdown with YAML frontmatter — readable in Obsidian, greppable
 
 ## Status & roadmap
 
-**Pre-alpha — phase 0, building in public.** The design is complete and adversarially reviewed; implementation is starting. Stars and issues welcome; production use is not yet advisable.
+**Pre-alpha — phase 2, building in public.** The design is complete and adversarially reviewed; the phase-0 corpus scaffold and phase-1 retrieval stack are built and gate-passing; phase-2's synthesis core is built and under measurement. Stars and issues welcome; production use is not yet advisable.
 
 | Phase | Deliverable | Gate (evidence, not vibes) |
 |---|---|---|
 | **0** | Corpus scaffold · schema validator · migration · session connector | Counts reconcile exactly · schema lint clean · 50-note body-identical spot check |
 | **1** | Chunker · embeddings · LanceDB · hybrid + rerank · search API | **Golden query set passes** · full rebuild < 30 min · p50 < 500 ms |
-| **2** | Synthesis sweep · adjudication · full lint · document ingest | Faithfulness ≥ 95% · **entailment audit ≥ 95%, zero contradicted** · 2 weeks of clean reviewed diffs |
+| **2** | Synthesis sweep · adjudication · full lint · document ingest | Faithfulness ≥ 95% · **entailment audit ≥ 95%, zero contradicted** · **golden fact recall ≥ 90% (dual-grader)** · 2 weeks of clean reviewed diffs |
 | **3** | Harness extensions (Pi, others) | **Blinded side-by-side** vs the incumbent memory tool — must win recall@5 before anything switches |
 | **4** | Answer endpoint · static wiki site · demo corpus · docs | **Fresh-clone test:** end-to-end on demo data, zero private content in history |
 
 Every gate is a measurement, not an opinion. Phases don't advance because they feel done.
 
-**Phase-2 status (2026-08-05):** the single-page synthesis core
+**Phase-2 status (2026-08-06):** the single-page synthesis core
 (gather → write → judge → repair → emit) is merged as a verified *component* —
 its native checks pass (deterministic chunk accounting, entailment audit,
-sampled skip-log coverage, anti-gutting repair). Phase 2 itself is **not**
-certified: the golden-synthesis load-bearing-fact recall gate
-(`SPEC-phase2-eval.md` ≥ 90%) measured only 3/5 and 4/5 on the first live
-cluster via two independent graders. The dual-grader fact-recall evaluator
-and the full 8-cluster measurement are the pending gate evidence.
+sampled skip-log coverage, anti-gutting repair). The golden-synthesis
+dual-grader fact-recall evaluator exists, is adversarially reviewed, and
+carries an immutable run manifest; a full 8-cluster / 40-fact measurement is
+the gate evidence. The gate is **not** yet certified: the first measurement
+(`fact-recall-v1`) scored **45% pooled consensus vs the ≥ 90% gate**, with the
+failures decomposed into writer-layer omissions (gathered-but-not-stated),
+pipeline emission misses, and two verdict-contested facts. Fix round 1
+(per-claim repair compliance + writer coverage directives) shipped; the v2
+re-measurement is the current evidence cycle. Per-cluster details are
+[`docs/calibration/synthesis-fact-recall-summary.md`](docs/calibration/synthesis-fact-recall-summary.md) (anonymized).
 
 The phase 3 → 4 boundary also carries a standing checkpoint: whether
 Alexandria adopts graph-structured retrieval, formally re-examined against

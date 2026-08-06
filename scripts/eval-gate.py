@@ -32,6 +32,30 @@ WATCHED = (
     "src/alexandria/config.py",
 )
 
+# Paths whose change can move SYNTHESIS quality (SPEC-phase2-eval.md: "eval-gate.py
+# watched paths extend to src/alexandria/synthesis/"). The LLM-judge measurement
+# itself (golden fact recall) needs the live gateway and is NOT run here -- a
+# prompt change must re-measure via scripts/measure-synthesis.sh. This gate runs
+# the fast offline regression net so a change that breaks parsing/accounting/
+# verdict semantics fails immediately, locally.
+SYNTHESIS_WATCHED = (
+    "src/alexandria/synthesis/",
+    "src/alexandria/audit.py",
+    "src/alexandria/coverage.py",
+    "src/alexandria/eval/synthesis_fact_recall.py",
+    "src/alexandria/eval/gather_completeness.py",
+)
+
+SYNTHESIS_TESTS = (
+    "tests/test_synthesis_pipeline.py",
+    "tests/test_synthesis_fact_recall.py",
+    "tests/test_synthesis_golden.py",
+    "tests/test_synthesis_gather.py",
+    "tests/test_audit.py",
+    "tests/test_coverage.py",
+    "tests/test_gather_completeness.py",
+)
+
 
 def staged_files() -> list[str]:
     r = subprocess.run(
@@ -43,8 +67,29 @@ def staged_files() -> list[str]:
 
 def main() -> int:
     changed = staged_files()
-    if not any(f.startswith(WATCHED) for f in changed):
-        return 0  # nothing retrieval-relevant staged -- don't pay the cost
+    synthesis_changed = any(f.startswith(SYNTHESIS_WATCHED) for f in changed)
+    retrieval_changed = any(f.startswith(WATCHED) for f in changed)
+    if not synthesis_changed and not retrieval_changed:
+        return 0  # nothing gate-relevant staged -- don't pay the cost
+
+    if synthesis_changed:
+        print("eval-gate: synthesis-relevant files changed, running offline "
+              "regression net ...", file=sys.stderr)
+        result = subprocess.run(
+            [str(REPO / ".venv" / "bin" / "python"), "-m", "pytest",
+             *SYNTHESIS_TESTS, "-q"],
+            cwd=REPO, capture_output=True, text=True,
+        )
+        print(result.stdout)
+        if result.returncode != 0:
+            print("eval-gate FAILED -- synthesis regression net red. NOTE: prompt/"
+                  "logic changes also require a LIVE re-measurement of the golden "
+                  "fact-recall gate (scripts/measure-synthesis.sh); this offline "
+                  "net only catches structural breaks.", file=sys.stderr)
+            return 1
+        print("eval-gate: synthesis regression net green (live re-measurement "
+              "still required for prompt changes).", file=sys.stderr)
+        return 0
 
     corpus = Path.home() / "alexandria-corpus"
     golden = corpus / ".alexandria" / "golden" / "golden-v1.jsonl"
