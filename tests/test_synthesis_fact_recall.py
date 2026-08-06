@@ -531,6 +531,12 @@ def test_driver_records_failing_pipeline_as_data_without_aborting_batch(tmp_path
     sidecar_b = json.loads((out / "gather" / "cluster-b.gather.json").read_text())
     assert sidecar_b["emitted"] is False
     assert sidecar_b["page_sha256"] is None
+    # diagnostic verdict details persisted even for failed pages
+    # (1 iteration: the scripted repair client is exhausted and raises)
+    assert sidecar_b["repair_iterations"] == 1
+    assert sidecar_b["entailment_passed"] is False
+    assert sidecar_b["repair_errors"]
+    assert "final_claim_count" in sidecar_b and "failed_claim_ids" in sidecar_b
 
 
 def test_driver_propagates_unexpected_exception(tmp_path):

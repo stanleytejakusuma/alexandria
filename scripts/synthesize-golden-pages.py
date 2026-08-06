@@ -112,6 +112,17 @@ def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: P
                 "round_two_count": len(result.gathered.round_two),
                 "follow_up_queries": list(result.gathered.follow_up_queries),
                 "repair_iterations": result.repair.iterations,
+                # final-state verdict details: why the loop stopped (diagnostic).
+                "repair_errors": list(result.repair.errors),
+                "final_claim_count": len(result.repair.page.claims),
+                "final_skip_log_count": len(result.repair.page.skip_log),
+                "chunk_accounted": bool(result.repair.verdict.chunk_accounted),
+                "entailment_passed": bool(result.repair.verdict.entailment_passed),
+                "coverage_passed": bool(result.repair.verdict.coverage_passed),
+                "failed_claim_ids": list(result.repair.verdict.failed_claim_ids),
+                "failing_skip_ids": list(result.repair.verdict.failing_skip_ids),
+                "borderline_skip_ids": list(result.repair.verdict.borderline_skip_ids),
+                "judge_errors": list(result.repair.verdict.errors),
             })
         except (LLMError, ChunkAccountingError) as exc:
             # Expected pipeline failure modes -- a failed page is data, not an
@@ -155,6 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN)
     p.add_argument("--out", type=Path, required=True, help="output dir (created if missing)")
     p.add_argument("--limit", type=int, default=None, help="cap the number of clusters (smoke runs)")
+    p.add_argument("--only", type=str, default=None,
+                   help="run a single cluster id (diagnostic re-runs)")
     p.add_argument("--seed-k", type=int, default=8)
     p.add_argument("--base-url", default="http://127.0.0.1:20128/v1",
                    help="OpenAI-compatible gateway base URL (the remote unattended "
@@ -176,7 +189,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"synthesize-golden-pages: golden file not found: {args.golden}", file=sys.stderr)
         return 2
     entries = load_synthesis_golden(args.golden)
-    if args.limit is not None:
+    if args.only is not None:
+        entries = [e for e in entries if e.id == args.only]
+        if not entries:
+            print(f"synthesize-golden-pages: no cluster with id {args.only!r}", file=sys.stderr)
+            return 2
+    elif args.limit is not None:
         entries = entries[: args.limit]
     if not entries:
         print("synthesize-golden-pages: no clusters to synthesize", file=sys.stderr)
