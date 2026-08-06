@@ -38,8 +38,8 @@ DEFAULT_GOLDEN = Path.home() / "alexandria-corpus" / ".alexandria" / "golden" / 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--pages", type=Path, required=True, help="dir with <cluster-id>.md (+ .skip-log.json)")
-    p.add_argument("--gather", type=Path, required=True, help="dir with <cluster-id>.gather.json sidecars")
+    p.add_argument("--pages", type=Path, default=None, help="dir with <cluster-id>.md (+ .skip-log.json)")
+    p.add_argument("--gather", type=Path, default=None, help="dir with <cluster-id>.gather.json sidecars")
     p.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN)
     p.add_argument("--model-a", default="claude-fable-5")
     p.add_argument("--model-b", default="deepseek-v4-pro")
@@ -84,9 +84,17 @@ def replay_report(report: dict, adjudications: dict[str, bool]) -> dict:
     known = set()
     for c in report.get("clusters", []):
         agreement = c.get("agreement")
-        if c.get("status") == "graded" and agreement:
-            known.update(f"{c['cluster_id']}::{v['fact_id']}"
-                         for v in agreement["result_a"]["verdicts"])
+        if c.get("status") == "graded":
+            if agreement:
+                known.update(f"{c['cluster_id']}::{v['fact_id']}"
+                             for v in agreement["result_a"]["verdicts"])
+            else:
+                # pre-agreement-persistence reports: only covered/contested ids
+                # are stored; misses are unrecoverable by id -- the adjudicated
+                # facts must be in one of these lists.
+                known.update(f"{c['cluster_id']}::{f}"
+                             for f in (c.get("consensus_covered") or [])
+                             + (c.get("contested_ids") or []))
     unknown = sorted(set(adjudications) - known)
     if unknown:
         raise ValueError(f"adjudication references unknown fact(s): {unknown}")
@@ -95,10 +103,46 @@ def replay_report(report: dict, adjudications: dict[str, bool]) -> dict:
     consensus_delta = 0
     contested_delta = 0
     for c in report["clusters"]:
-        if c.get("status") != "graded" or not c.get("agreement"):
+        if c.get("status") != "graded":
             clusters.append(c)
             continue
-        agreement = c["agreement"]
+        agreement = c.get("agreement")
+        if agreement is None:
+            # Aggregate-level replay: prior status recovered from the flattened
+            # lists instead of raw verdicts. miss_taxonomy is not mutated
+            # (miss fact ids aren't recoverable here) -- pooled counts still
+            # recompute exactly, since totals are fixed.
+            consensus = list(c.get("consensus_covered") or [])
+            contested = list(c.get("contested_ids") or [])
+            adjudicated_here = 0
+            for fid in list(consensus) + list(contested):
+                adj = adjudications.get(f"{c['cluster_id']}::{fid}")
+                if adj is None:
+                    continue
+                adjudicated_here += 1
+                if adj and fid not in consensus:
+                    consensus.append(fid)
+                    consensus_delta += 1
+                    if fid in contested:
+                        contested.remove(fid)
+                        contested_delta -= 1
+                elif adj is False:
+                    if fid in consensus:
+                        consensus.remove(fid)
+                        consensus_delta -= 1
+                    if fid in contested:
+                        contested.remove(fid)
+                        contested_delta -= 1
+            n = (len(consensus) + len(contested) + len(c.get("miss_taxonomy") or [])) or 1
+            c = dict(c)
+            c["consensus_fact_count"] = len(consensus)
+            c["consensus_covered"] = consensus
+            c["contested_ids"] = contested
+            c["consensus_recall"] = len(consensus) / n
+            c["union_recall"] = (len(consensus) + len(contested)) / n
+            c["adjudicated_fact_count"] = c.get("adjudicated_fact_count", 0) + adjudicated_here
+            clusters.append(c)
+            continue
         va = {v["fact_id"]: v for v in agreement["result_a"]["verdicts"]}
         vb = {v["fact_id"]: v for v in agreement["result_b"]["verdicts"]}
         ids = [v["fact_id"] for v in agreement["result_a"]["verdicts"]]
@@ -184,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
                                    encoding="utf-8")
             print(f"replayed report written: {args.output}")
         return 0
+    if not args.pages or not args.gather:
+        raise SystemExit("--pages and --gather are required for a live run")
     if args.verify is not None:
         report = json.loads(args.verify.read_text(encoding="utf-8"))
         problems = verify_manifest(report.get("manifest") or {},

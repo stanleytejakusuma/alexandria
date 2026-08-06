@@ -848,3 +848,36 @@ def test_emit_summary_anonymizes_cluster_ids(tmp_path):
     assert "cluster-1" in markdown and "cluster-2" in markdown
     assert "FINAL_FAIL" in markdown
     assert summary["pipeline_failures"] == ["cluster-2"]
+
+
+def test_replay_aggregate_fallback_without_agreement(tmp_path):
+    """Pre-agreement-persistence reports (v1 artifact) lack raw verdicts; replay
+    must recover prior status from consensus_covered/contested_ids and still
+    recompute the pinned verdict exactly (v1: 3 contested adjudicated false ->
+    FINAL_FAIL, consensus unchanged)."""
+    cli = _load_script("eval_synthesis_fact_recall")
+    base = {
+        "scored_fact_count": 40, "consensus_count": 18, "contested_count": 3,
+        "adjudicated_count": 0, "invalid_cluster_ids": [],
+        "pooled_consensus_recall": 0.45, "pooled_union_recall": 0.525,
+        "pooled_recall_a": 0.45, "pooled_recall_b": 0.525,
+        "macro_consensus_recall": 0.452, "verdict": "PROVISIONAL_FAIL",
+        "clusters": [
+            {"cluster_id": "alpha-cluster", "status": "graded",
+             "consensus_fact_count": 3, "consensus_recall": 0.75,
+             "union_recall": 1.0, "recall_a": 0.75, "recall_b": 1.0,
+             "consensus_covered": ["f1", "f3", "f4"], "contested_ids": ["f2"],
+             "miss_taxonomy": [], "agreement": None,
+             "adjudicated_fact_count": 0},
+            {"cluster_id": "z-cluster", "status": "pipeline_failure",
+             "consensus_recall": 0.0, "contested_ids": [], "agreement": None},
+        ],
+    }
+    adj = {"alpha-cluster::f2": False}
+    replayed = cli.replay_report(base, adj)
+    assert replayed["consensus_count"] == 18
+    assert replayed["contested_count"] == 2
+    assert replayed["pooled_consensus_recall"] == pytest.approx(0.45)
+    assert replayed["clusters"][0]["consensus_covered"] == ["f1", "f3", "f4"]
+    assert replayed["clusters"][0]["contested_ids"] == []
+    assert replayed["verdict"] == "PROVISIONAL_FAIL"  # still contested elsewhere
