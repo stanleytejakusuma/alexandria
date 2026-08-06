@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import shutil
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -245,6 +247,54 @@ def cmd_search(args) -> int:
     return 0
 
 
+def cmd_answer(args) -> int:
+    """Synthesize a cited answer page for a question (phase-4 answer endpoint).
+
+    Runs the full gather -> write -> judge -> repair pipeline over the indexed
+    corpus and prints the emitted page. The page is written to --save-dir (or a
+    temp dir) -- never into the private corpus wiki implicitly.
+    """
+    from .llm import LLMClient
+    from .synthesis.pipeline import run_pipeline
+
+    config = _config_for(args)
+    corpus = config.corpus_path
+    engine = _build_search_engine(config, corpus)
+
+    save_dir = Path(args.save_dir).expanduser() if args.save_dir else None
+    emit_root = save_dir if save_dir else Path(tempfile.mkdtemp(prefix="alexandria-answer-"))
+
+    writer = LLMClient(model=args.llm_model, base_url=args.base_url, api_key_env=args.api_key_env)
+    grader_a = LLMClient(model=args.grader_a_model, base_url=args.base_url, api_key_env=args.api_key_env)
+    grader_b = LLMClient(model=args.grader_b_model, base_url=args.base_url, api_key_env=args.api_key_env)
+    result = run_pipeline(
+        engine,
+        args.question,
+        gather_llm=writer,
+        writer_llm=writer,
+        repair_llm=writer,
+        audit_llm=grader_a,
+        coverage_llm_a=grader_a,
+        coverage_llm_b=grader_b,
+        corpus_root=emit_root,
+        seed_k=args.k,
+        writer_model=args.llm_model,
+        prompt_version=args.prompt_version,
+    )
+    if not result.emitted:
+        print("answer: synthesis failed its native checks; no page emitted.",
+              file=sys.stderr)
+        for claim in result.repair.page.claims:
+            if claim.id in result.repair.failed_claim_ids:
+                print(f"  failed claim {claim.id}: {claim.text[:200]}", file=sys.stderr)
+        return 1
+    page_text = result.page_path.read_text(encoding="utf-8")
+    print(page_text)
+    if not save_dir:
+        shutil.rmtree(emit_root, ignore_errors=True)
+    return 0
+
+
 def cmd_eval(args) -> int:
     """Measure current retrieval against the private golden set without changing it."""
     if args.k is not None and args.k < 0:
@@ -457,6 +507,19 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--fail-on-regression", action="store_true",
                           help="exit 1 when a prior hit becomes a miss")
     evaluate.set_defaults(func=cmd_eval)
+
+    answer = sub.add_parser("answer", help="synthesize a cited answer page for a question")
+    answer.add_argument("question")
+    answer.add_argument("--k", type=int, default=8, help="gather seed depth")
+    answer.add_argument("--base-url", default="http://127.0.0.1:20128/v1")
+    answer.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY")
+    answer.add_argument("--llm-model", default="deepseek-v4-pro")
+    answer.add_argument("--grader-a-model", default="openrouter/anthropic/claude-sonnet-5")
+    answer.add_argument("--grader-b-model", default="deepseek-v4-pro")
+    answer.add_argument("--prompt-version", default="v1")
+    answer.add_argument("--save-dir", default=None,
+                        help="emit the page here (default: temp dir, page printed only)")
+    answer.set_defaults(func=cmd_answer)
 
     d = sub.add_parser("decay", help="propose eviction from a capped memory store")
     d.add_argument("stores", nargs="+")

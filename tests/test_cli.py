@@ -141,3 +141,53 @@ def test_sync_writes_notes_and_is_fail_safe(tmp_path, monkeypatch):
     state = json.loads((tmp_path / "corpus" / ".alexandria" / "state"
                         / "pi-sessions.json").read_text())
     assert len(state["bursts"]) == len(written)   # only successes consumed
+
+
+def test_parser_exposes_answer_verb():
+    verbs = build_parser()._subparsers._group_actions[0].choices
+    assert "answer" in verbs
+
+
+def test_answer_prints_the_emitted_page(tmp_path, monkeypatch, capsys):
+    from pathlib import Path
+    import alexandria.synthesis.pipeline as synth_pipeline
+
+    page = tmp_path / "emitted" / "what-happened.md"
+    page.parent.mkdir()
+    page.write_text("---\ntitle: what happened\n---\n\nThe signer crashed. [^1]\n", encoding="utf-8")
+
+    class FakeRepair:
+        page = type("P", (), {"claims": []})()
+        failed_claim_ids = ()
+
+    class FakeResult:
+        emitted = True
+        page_path = page
+        skip_log_path = None
+        repair = FakeRepair()
+
+    monkeypatch.setattr(synth_pipeline, "run_pipeline", lambda *a, **k: FakeResult())
+    assert app(["--corpus", str(tmp_path), "answer", "what happened"]) == 0
+    out = capsys.readouterr().out
+    assert "The signer crashed." in out
+    assert "title: what happened" in out
+
+
+def test_answer_failure_exits_one_with_failed_claims(tmp_path, monkeypatch, capsys):
+    import alexandria.synthesis.pipeline as synth_pipeline
+
+    claim = type("C", (), {"id": "c1", "text": "a claim that could not be cited"})()
+    page = type("P", (), {"claims": [claim]})()
+    repair_obj = type("R", (), {"page": page, "failed_claim_ids": {"c1"}})()
+
+    class FakeResult:
+        emitted = False
+        page_path = None
+        skip_log_path = None
+        repair = repair_obj
+
+    monkeypatch.setattr(synth_pipeline, "run_pipeline", lambda *a, **k: FakeResult())
+    assert app(["--corpus", str(tmp_path), "answer", "some question"]) == 1
+    err = capsys.readouterr().err
+    assert "failed its native checks" in err
+    assert "c1" in err
