@@ -62,18 +62,24 @@ def main(argv: list[str] | None = None) -> int:
                                   model_a=args.model_a, model_b=args.model_b)
 
     print(f"\nper-cluster (gate >= {int(GATE_THRESHOLD * 100)}%):")
-    print(f"  {'cluster':<28} {'recall_a':>8} {'recall_b':>8} {'consensus':>9} "
+    print(f"  {'cluster':<28} {'status':<19} {'recall_a':>8} {'recall_b':>8} {'consensus':>9} "
           f"{'union':>6} {'contested':>9}  errors")
     for c in report.clusters:
-        print(f"  {c.cluster_id:<28} {c.recall_a:>8.2f} {c.recall_b:>8.2f} "
+        print(f"  {c.cluster_id:<28} {c.status:<19} {c.recall_a:>8.2f} {c.recall_b:>8.2f} "
               f"{c.consensus_recall:>9.2f} {c.union_recall:>6.2f} {len(c.contested_ids):>9}  "
               f"{'; '.join(c.errors) if c.errors else '-'}")
-    print(f"\npooled (n={report.total_facts} facts): recall_a={report.pooled_recall_a:.3f} "
-          f"recall_b={report.pooled_recall_b:.3f} "
-          f"consensus={report.pooled_consensus_recall:.3f} union={report.pooled_union_recall:.3f} "
+    print(f"\npooled (n={report.total_facts} facts, scored={report.scored_fact_count}): "
+          f"recall_a={report.pooled_recall_a:.3f} recall_b={report.pooled_recall_b:.3f} "
+          f"consensus={report.pooled_consensus_recall:.3f} ({report.consensus_count}/{report.scored_fact_count}) "
+          f"union={report.pooled_union_recall:.3f} macro={report.macro_consensus_recall:.3f} "
           f"contested={report.contested_count}")
     print(f"GATE: {'PASS' if report.gate else 'FAIL'} (consensus recall "
           f"{report.pooled_consensus_recall:.3f} vs {GATE_THRESHOLD:.2f})")
+    if report.invalid_cluster_ids:
+        print(f"\nMEASUREMENT INVALID (gate forced FAIL): {', '.join(report.invalid_cluster_ids)}")
+    if report.pipeline_failure_cluster_ids:
+        print(f"pipeline failures (facts counted as misses): "
+              f"{', '.join(report.pipeline_failure_cluster_ids)}")
     if report.contested_count:
         print("\ncontested facts (manual adjudication required):")
         for c in report.clusters:

@@ -33,7 +33,8 @@ from typing import Any, Sequence
 from alexandria.cli import _build_search_engine
 from alexandria.config import load_config
 from alexandria.eval.synthesis_golden import SynthesisClusterEntry, load_synthesis_golden
-from alexandria.llm import LLMClient
+from alexandria.llm import LLMClient, LLMError
+from alexandria.synthesis.judge import ChunkAccountingError
 from alexandria.synthesis.pipeline import run_pipeline
 
 DEFAULT_GOLDEN = Path.home() / "alexandria-corpus" / ".alexandria" / "golden" / "synthesis-clusters-v1.jsonl"
@@ -63,11 +64,13 @@ def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: P
             "native_passed": False,
             "error": None,
             "gathered_doc_ids": [],
+            "gathered_chunk_ids": [],
             "gathered_chunk_count": 0,
             "round_one_count": 0,
             "round_two_count": 0,
             "follow_up_queries": [],
             "repair_iterations": None,
+            "page_sha256": None,
             "duration_seconds": None,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -91,15 +94,27 @@ def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: P
                 "emitted": result.emitted,
                 "native_passed": bool(result.repair.passed),
                 "gathered_doc_ids": sorted({chunk.doc_id for chunk in result.gathered.chunks}),
+                "gathered_chunk_ids": sorted({chunk.chunk_id for chunk in result.gathered.chunks}),
                 "gathered_chunk_count": len(result.gathered.chunks),
                 "round_one_count": len(result.gathered.round_one),
                 "round_two_count": len(result.gathered.round_two),
                 "follow_up_queries": list(result.gathered.follow_up_queries),
                 "repair_iterations": result.repair.iterations,
             })
-        except Exception as exc:  # noqa: BLE001 -- a failed page is data, not an abort
+        except (LLMError, ChunkAccountingError, ValueError) as exc:
+            # Expected pipeline failure modes -- a failed page is data, not an
+            # abort. Anything else (a bug in the driver itself, I/O, assertion
+            # failures) must propagate: recording programmer errors as pipeline
+            # misses conflates "system failed" with "measurement invalid" (Red
+            # review, 2026-08-05; the Path.copy bug was exactly this trap).
             row["error"] = f"{type(exc).__name__}: {exc}"
         row["duration_seconds"] = round(time.monotonic() - started, 2)
+        if row["emitted"] and (pages_dir / f"{entry.id}.md").exists():
+            import hashlib
+            row["page_sha256"] = hashlib.sha256(
+                (pages_dir / f"{entry.id}.md").read_bytes()).hexdigest()
+        else:
+            row["page_sha256"] = None
         (gather_dir / f"{entry.id}.gather.json").write_text(
             json.dumps(row, indent=2, sort_keys=True) + "\n", encoding="utf-8",
         )

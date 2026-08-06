@@ -88,6 +88,7 @@ class FactRecallResult:
     verdicts: tuple[FactVerdict, ...]
     recall: float
     errors: tuple[str, ...]
+    raw: str = ""   # the grader's raw response, retained for audit
 
     @property
     def passed(self) -> bool:
@@ -121,11 +122,32 @@ def build_fact_recall_prompt(page_text: str,
     return GRADER_SYSTEM, user
 
 
-def parse_fact_recall_response(raw: str, expected_ids: tuple[str, ...]) -> tuple[FactVerdict, ...]:
+def _no_duplicate_keys(pairs):
+    """json.loads hook: a grader response with duplicate JSON keys is malformed
+    and must fail loudly -- the decoder otherwise silently keeps the last one."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise LLMError(f"duplicate JSON key {key!r} in grader response")
+        result[key] = value
+    return result
+
+
+def _normalized(text: str) -> str:
+    """Collapse all whitespace runs to single spaces for evidence-span matching."""
+    return " ".join(text.split())
+
+
+def parse_fact_recall_response(raw: str, expected_ids: tuple[str, ...],
+                               page_body: str = "") -> tuple[FactVerdict, ...]:
     """Strictly parse one grader response. ANY violation raises LLMError -- an
-    eval that cannot fail correctly is worse than no eval (never partial accept)."""
+    eval that cannot fail correctly is worse than no eval (never partial accept).
+
+    When page_body is given, every covered verdict's evidence span must be a
+    substring of the rendered page body (whitespace-normalized) -- a grader
+    quoting evidence that is not in the page is lying and must fail."""
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw, object_pairs_hook=_no_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise LLMError(f"fact-recall grader returned invalid JSON: {exc}") from exc
     facts = payload.get("facts") if isinstance(payload, dict) else None
@@ -163,6 +185,14 @@ def parse_fact_recall_response(raw: str, expected_ids: tuple[str, ...]) -> tuple
     if missing_ids:
         raise LLMError(f"fact-recall grader omitted fact id(s): {missing_ids}")
 
+    if page_body:
+        page_norm = _normalized(page_body)
+        for verdict in verdicts:
+            if verdict.covered and _normalized(verdict.evidence) not in page_norm:
+                raise LLMError(
+                    f"fact-recall grader evidence for {verdict.fact_id!r} is not a "
+                    f"substring of the rendered page body")
+
     by_id = {v.fact_id: v for v in verdicts}
     return tuple(by_id[fid] for fid in expected_ids)
 
@@ -170,14 +200,14 @@ def parse_fact_recall_response(raw: str, expected_ids: tuple[str, ...]) -> tuple
 def grade_fact_recall(llm, page_text: str, facts: Sequence[LoadBearingFact],
                       model: str | None = None) -> FactRecallResult:
     """One grader pass. Malformed responses propagate as LLMError -- never a
-    silent pass."""
+    silent pass. The raw response is retained on the result for audit."""
     grader_model = model or str(getattr(llm, "model", "scripted"))
     system, user = build_fact_recall_prompt(page_text, facts)
     raw = llm.complete(system, user)
-    verdicts = parse_fact_recall_response(raw, tuple(f.id for f in facts))
+    verdicts = parse_fact_recall_response(raw, tuple(f.id for f in facts), page_body=page_text)
     n = len(verdicts)
     recall = sum(v.covered for v in verdicts) / n if n else 0.0
-    return FactRecallResult(grader_model, verdicts, recall, ())
+    return FactRecallResult(grader_model, verdicts, recall, (), raw=raw)
 
 
 def grade_fact_recall_twice(llm_a, llm_b, page_text: str,
@@ -221,11 +251,17 @@ def classify_miss(fact: LoadBearingFact, gathered_doc_ids: set[str]) -> str:
     return "evidence_not_gathered"
 
 
+STATUS_GRADED = "graded"
+STATUS_PIPELINE_FAILURE = "pipeline_failure"
+STATUS_MEASUREMENT_INVALID = "measurement_invalid"
+
+
 @dataclass(frozen=True)
 class ClusterFactRecall:
     cluster_id: str
     topic: str
     agreement: FactRecallAgreement | None
+    status: str                      # graded | pipeline_failure | measurement_invalid
     contested_ids: tuple[str, ...]
     consensus_recall: float
     union_recall: float
@@ -238,13 +274,18 @@ class ClusterFactRecall:
 @dataclass(frozen=True)
 class FactRecallReport:
     clusters: tuple[ClusterFactRecall, ...]
-    total_facts: int
-    pooled_consensus_recall: float
+    total_facts: int                 # every fact across all clusters
+    scored_fact_count: int           # facts in graded + pipeline_failure clusters
+    consensus_count: int             # both-graders-covered facts in graded clusters
+    pooled_consensus_recall: float   # consensus_count / scored_fact_count
     pooled_union_recall: float
     pooled_recall_a: float
     pooled_recall_b: float
+    macro_consensus_recall: float    # unweighted mean of per-cluster consensus recall
     contested_count: int
-    gate: bool
+    pipeline_failure_cluster_ids: tuple[str, ...]
+    invalid_cluster_ids: tuple[str, ...]
+    gate: bool                       # consensus gate AND zero invalid clusters
     timestamp: str
     git_sha: str
     config: dict[str, object]
@@ -254,30 +295,57 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
                          page_dir: str | Path, gather_dir: str | Path,
                          llm_a, llm_b, *, model_a: str | None = None,
                          model_b: str | None = None) -> FactRecallReport:
-    """Grade every entry's frozen page against its golden facts. A missing page
-    or unreadable gather sidecar is an error row, never silently skipped -- and
-    its facts stay in the pooled denominator as misses (an eval that cannot
-    fail correctly is worse than no eval)."""
+    """Grade every entry's frozen page against its golden facts, with explicit
+    run-status separation (per Red review, 2026-08-05):
+
+    - graded: page + readable gather sidecar + both graders returned verdicts.
+    - pipeline_failure: the gather sidecar records emitted=false (a real
+      synthesis failure). Its facts stay in the denominator as misses -- fail
+      closed, attributable.
+    - measurement_invalid: missing page, missing/unreadable sidecar, or a
+      grader error. The run cannot produce a trustworthy score; the facts are
+      excluded from the denominator and the gate is forced FAIL until the
+      invalid cluster is fixed."""
     pages, gathers = Path(page_dir), Path(gather_dir)
     clusters: list[ClusterFactRecall] = []
     for entry in entries:
-        page_path = pages / f"{entry.id}.md"
-        if not page_path.exists():
-            clusters.append(_error_cluster(entry, ("page missing",)))
-            continue
-        _, body = split_frontmatter(page_path.read_text(encoding="utf-8"))
-
-        gathered: set[str] = set()
-        errors: list[str] = []
         gather_path = gathers / f"{entry.id}.gather.json"
+        gathered: set[str] = set()
+        sidecar_emitted: bool | None = None
+        sidecar_error: str | None = None
         if gather_path.exists():
             try:
-                raw = json.loads(gather_path.read_text(encoding="utf-8"))
-                gathered = set(raw.get("gathered_doc_ids", []))
+                raw_sidecar = json.loads(gather_path.read_text(encoding="utf-8"))
+                gathered = set(raw_sidecar.get("gathered_doc_ids", []))
+                sidecar_emitted = bool(raw_sidecar.get("emitted", False))
             except (json.JSONDecodeError, OSError, TypeError) as exc:
-                errors.append(f"gather sidecar unreadable: {exc}")
+                sidecar_error = f"gather sidecar unreadable: {exc}"
         else:
-            errors.append("gather sidecar missing")
+            sidecar_error = "gather sidecar missing"
+
+        page_path = pages / f"{entry.id}.md"
+        if not page_path.exists():
+            if sidecar_emitted is False:
+                # attributable pipeline failure: the page was never produced.
+                clusters.append(_failure_cluster(entry, ("page not emitted by pipeline",)))
+            else:
+                clusters.append(_invalid_cluster(
+                    entry, (sidecar_error or "page missing",)))
+            continue
+        if sidecar_emitted is False:
+            # page exists but the pipeline recorded no emission: stale/mismatched
+            # artifacts -- a measurement-integrity problem, not a graded page.
+            clusters.append(_invalid_cluster(entry, ("page present but sidecar records emitted=false",)))
+            continue
+
+        _, body = split_frontmatter(page_path.read_text(encoding="utf-8"))
+        if sidecar_error is not None:
+            # An unreadable/missing sidecar makes the run invalid (Red review):
+            # without it, attribution and integrity cannot be established, and
+            # folding the cluster's facts in as misses would produce a
+            # conservative but false quality estimate.
+            clusters.append(_invalid_cluster(entry, (sidecar_error,)))
+            continue
 
         try:
             agreement = grade_fact_recall_twice(
@@ -285,7 +353,7 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
                 model_a=model_a, model_b=model_b,
             )
         except LLMError as exc:
-            clusters.append(_error_cluster(entry, tuple(errors) + (f"grader failed: {exc}",)))
+            clusters.append(_invalid_cluster(entry, (f"grader failed: {exc}",)))
             continue
 
         a_by_id = {v.fact_id: v for v in agreement.result_a.verdicts}
@@ -297,42 +365,56 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
                     "fact_id": fact.id,
                     "fact_text": fact.text,
                     "classification": classify_miss(fact, gathered),
+                    # Golden facts reference whole documents; a doc being gathered
+                    # does not prove its supporting passage was. Provisional only.
+                    "provisional": True,
                 })
 
         clusters.append(ClusterFactRecall(
             cluster_id=entry.id,
             topic=entry.topic,
             agreement=agreement,
+            status=STATUS_GRADED,
             contested_ids=agreement.contested_ids,
             consensus_recall=agreement.consensus_recall,
             union_recall=agreement.union_recall,
             recall_a=agreement.result_a.recall,
             recall_b=agreement.result_b.recall,
-            errors=tuple(errors),
+            errors=tuple(),
             miss_taxonomy=tuple(miss_taxonomy),
         ))
 
-    total_facts = sum(len(e.load_bearing_facts) for e in entries)
-    denom = total_facts or 1
-    consensus_count = sum(len(c.agreement.consensus_covered) for c in clusters if c.agreement)
-    union_count = sum(len(c.agreement.consensus_covered) + len(c.agreement.contested_ids)
-                      for c in clusters if c.agreement)
-    # pooled recalls: weight per-cluster recall by its fact count (error clusters
-    # contribute zero covered).
     per_cluster_facts = {e.id: len(e.load_bearing_facts) for e in entries}
-    recall_a = sum(c.recall_a * per_cluster_facts.get(c.cluster_id, 0) for c in clusters) / denom
-    recall_b = sum(c.recall_b * per_cluster_facts.get(c.cluster_id, 0) for c in clusters) / denom
-    contested_count = sum(len(c.contested_ids) for c in clusters if c.agreement)
+    graded = [c for c in clusters if c.status == STATUS_GRADED]
+    failures = [c for c in clusters if c.status == STATUS_PIPELINE_FAILURE]
+    invalid = [c for c in clusters if c.status == STATUS_MEASUREMENT_INVALID]
+    scored = graded + failures
+
+    scored_facts = sum(per_cluster_facts[c.cluster_id] for c in scored)
+    denom = scored_facts or 1
+    consensus_count = sum(len(c.agreement.consensus_covered) for c in graded)
+    union_count = sum(len(c.agreement.consensus_covered) + len(c.agreement.contested_ids)
+                      for c in graded)
+    recall_a = sum(c.recall_a * per_cluster_facts[c.cluster_id] for c in graded) / denom
+    recall_b = sum(c.recall_b * per_cluster_facts[c.cluster_id] for c in graded) / denom
+    macro = (sum(c.consensus_recall for c in scored) / len(scored)
+             if scored else 0.0)
+    contested_count = sum(len(c.contested_ids) for c in graded)
 
     return FactRecallReport(
         clusters=tuple(clusters),
-        total_facts=total_facts,
+        total_facts=sum(per_cluster_facts.values()),
+        scored_fact_count=scored_facts,
+        consensus_count=consensus_count,
         pooled_consensus_recall=consensus_count / denom,
         pooled_union_recall=union_count / denom,
         pooled_recall_a=recall_a,
         pooled_recall_b=recall_b,
+        macro_consensus_recall=macro,
         contested_count=contested_count,
-        gate=passes_gate(consensus_count / denom),
+        pipeline_failure_cluster_ids=tuple(c.cluster_id for c in failures),
+        invalid_cluster_ids=tuple(c.cluster_id for c in invalid),
+        gate=passes_gate(consensus_count / denom) and not invalid,
         timestamp=datetime.now(timezone.utc).isoformat(),
         git_sha=_git_sha(),
         config={
@@ -345,18 +427,23 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
     )
 
 
-def _error_cluster(entry: SynthesisClusterEntry, errors: tuple[str, ...]) -> ClusterFactRecall:
+def _invalid_cluster(entry: SynthesisClusterEntry,
+                     errors: tuple[str, ...]) -> ClusterFactRecall:
     return ClusterFactRecall(
-        cluster_id=entry.id,
-        topic=entry.topic,
-        agreement=None,
-        contested_ids=(),
-        consensus_recall=0.0,
-        union_recall=0.0,
-        recall_a=0.0,
-        recall_b=0.0,
-        errors=errors,
-        miss_taxonomy=(),
+        cluster_id=entry.id, topic=entry.topic, agreement=None,
+        status=STATUS_MEASUREMENT_INVALID, contested_ids=(),
+        consensus_recall=0.0, union_recall=0.0, recall_a=0.0, recall_b=0.0,
+        errors=errors, miss_taxonomy=(),
+    )
+
+
+def _failure_cluster(entry: SynthesisClusterEntry,
+                     errors: tuple[str, ...]) -> ClusterFactRecall:
+    return ClusterFactRecall(
+        cluster_id=entry.id, topic=entry.topic, agreement=None,
+        status=STATUS_PIPELINE_FAILURE, contested_ids=(),
+        consensus_recall=0.0, union_recall=0.0, recall_a=0.0, recall_b=0.0,
+        errors=errors, miss_taxonomy=(),
     )
 
 
