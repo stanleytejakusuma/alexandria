@@ -178,7 +178,8 @@ def test_answer_failure_exits_one_with_failed_claims(tmp_path, monkeypatch, caps
 
     claim = type("C", (), {"id": "c1", "text": "a claim that could not be cited"})()
     page = type("P", (), {"claims": [claim]})()
-    repair_obj = type("R", (), {"page": page, "failed_claim_ids": {"c1"}})()
+    verdict = type("V", (), {"failed_claim_ids": {"c1"}})()
+    repair_obj = type("R", (), {"page": page, "verdict": verdict})()
 
     class FakeResult:
         emitted = False

@@ -285,7 +285,7 @@ def cmd_answer(args) -> int:
         print("answer: synthesis failed its native checks; no page emitted.",
               file=sys.stderr)
         for claim in result.repair.page.claims:
-            if claim.id in result.repair.failed_claim_ids:
+            if claim.id in result.repair.verdict.failed_claim_ids:
                 print(f"  failed claim {claim.id}: {claim.text[:200]}", file=sys.stderr)
         return 1
     page_text = result.page_path.read_text(encoding="utf-8")
@@ -528,7 +528,8 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("--k", type=int, default=8, help="gather seed depth")
     answer.add_argument("--base-url", default="http://127.0.0.1:20128/v1")
     answer.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY")
-    answer.add_argument("--llm-model", default="deepseek-v4-pro")
+    answer.add_argument("--llm-model", default="openrouter/anthropic/claude-sonnet-5",
+                        help="gather/write/repair model (the measurement-proven config)")
     answer.add_argument("--grader-a-model", default="openrouter/anthropic/claude-sonnet-5")
     answer.add_argument("--grader-b-model", default="deepseek-v4-pro")
     answer.add_argument("--prompt-version", default="v1")
