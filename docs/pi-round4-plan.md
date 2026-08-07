@@ -47,13 +47,25 @@ Two writer-layer changes close both sub-classes:
 
 ## Verification plan
 
-- New golden-fact unit tests: compound fact with 3 sub-clauses where page
+- [x] New golden-fact unit tests: compound fact with 3 sub-clauses where page
   states 2 → repair must produce a page stating all 3 (ScriptedClient).
-- Temporal-layering test: ship-time limitation + later fix in source → page
+- [x] Temporal-layering test: ship-time limitation + later fix in source → page
   must state both layers (assert both strings).
-- Regression: all 421 existing tests + eval-gate net stay green.
-- Then a v4 full measurement (8 clusters) — opencode included — to confirm the
+- [x] Regression: full suite green (427 tests) + eval-gate net green.
+- [ ] A v4 full measurement (8 clusters) — opencode included — to confirm the
   class closes; gate re-certified on the representative set regardless.
+
+## Status (2026-08-07, after contest run 1)
+
+IMPLEMENTED and committed: (1) compound-claim splitting — CLAUSE_GRADER_SYSTEM
+in audit.py (per-clause verdicts, Verdict.clauses), judge.py passes clauses=True
+and surfaces failed_clause_ids, repair.py gains clause-targeted compliance
+(keep supported clauses verbatim, fix only the failed clause) + <failed_clauses>
+in the repair prompt; (2) temporal-layering directive in WRITER_SYSTEM. Contest
+run 1 (INVALID-as-contest, disposed FAIL on floor) added a third target:
+(3) operational-stratum corpus coverage — 3 of 4 ops queries had zero relevant
+results in the union; ops how-to knowledge is thin in both stores; corpus-side
+work (add operational docs to the corpus), not a writer fix.
 
 ## Out of scope
 

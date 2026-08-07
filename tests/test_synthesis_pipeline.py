@@ -253,3 +253,62 @@ def test_repair_prompt_demands_support_or_removal_not_regeneration():
     assert "remove" in text
     assert "support" in text
     assert "regenerat" in text
+
+
+def test_judge_reports_failed_clauses_for_compound_claims():
+    """Round-4 compound-claim splitting: a multi-clause claim failing on ONE
+    clause yields a clause-level target, not an all-or-nothing claim failure."""
+    from alexandria.audit import ClauseVerdict, Verdict
+    gathered = _gathered(SourceChunk("sources/c#1", "sources/c", "Evidence.", 0.9))
+    page = SynthesisPage(
+        topic_query="topic", text="Page.", author="pi-overnight",
+        claims=(Claim("c1", "Decided then reversed because Y",
+                       (Citation("sources/c", "sources/c#1"),)),),
+    )
+    llm = ScriptedClient([json.dumps({"verdict": "unsupported", "reason": "clause",
+        "clauses": [
+            {"clause": "Decided", "verdict": "supported", "reason": "stated"},
+            {"clause": "reversed because Y", "verdict": "unsupported", "reason": "missing"},
+        ]})])
+    verdict = judge_page(gathered, page, audit_llm=llm,
+                         coverage_llm_a=ScriptedClient([_coverage_response("SS", "SS")]),
+                         coverage_llm_b=ScriptedClient([_coverage_response("SS", "SS")]))
+    assert not verdict.passes
+    assert verdict.failed_claim_ids == ("c1",)
+    assert verdict.failed_clause_ids == (("c1", "reversed because Y"),)
+
+
+def test_repair_prompt_carries_clause_targets_and_system_keeps_supported_clauses():
+    """Round-4: the repair prompt must hand the writer the failing CLAUSE text
+    (claim_id :: clause), and REPAIR_SYSTEM must forbid touching supported
+    clauses -- the measured opencode failure was all-or-nothing repair."""
+    from alexandria.audit import ClauseVerdict, Verdict
+    from alexandria.synthesis.judge import JudgeVerdict
+    from alexandria.synthesis.repair import REPAIR_SYSTEM, _repair_prompt
+    gathered = _gathered(SourceChunk("sources/c#1", "sources/c", "Evidence.", 0.9))
+    page = SynthesisPage(
+        topic_query="topic", text="Page.", author="pi-overnight",
+        claims=(Claim("c1", "Decided then reversed because Y",
+                       (Citation("sources/c", "sources/c#1"),)),),
+    )
+    verdict = JudgeVerdict(
+        page=page, chunk_accounted=True, entailment_passed=False,
+        coverage_passed=True, audit=None, coverage=(),
+        failed_claim_ids=("c1",),
+        failed_clause_ids=(("c1", "reversed because Y"),),
+        failing_skip_ids=(), borderline_skip_ids=(), errors=(),
+    )
+    prompt = _repair_prompt(gathered, page, verdict)
+    assert "c1 :: reversed because Y" in prompt
+    assert "<failed_clauses>" in prompt
+    text = REPAIR_SYSTEM.lower()
+    assert "clause" in text and "verbatim" in text
+
+
+def test_writer_prompt_demands_temporal_layering():
+    """Round-4 temporal-layering directive: pages must state ship-state,
+    defect, and fix as separate layers, not just the final state."""
+    from alexandria.synthesis.write import WRITER_SYSTEM
+    text = WRITER_SYSTEM.lower()
+    assert "temporal layering" in text
+    assert "ship state" in text

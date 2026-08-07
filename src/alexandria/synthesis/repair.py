@@ -32,6 +32,14 @@ claim as written, or (b) remove it from the claims list entirely. Never regenera
 a failed claim with new wording unless you also add a citation to gathered support
 for that new wording. If the support is not literally in the pool, removal is the
 correct action.
+
+Clause-targeted repair (round-4 directive, measured 2026-08-07): when a failed
+claim appears in <failed_clauses> as "claim_id :: clause text", only THAT clause
+failed -- the other clauses of the claim are supported and MUST be kept verbatim.
+Fix exactly the failed clause: either (a) state it as written with a citation to
+gathered text that literally supports it, or (b) remove that clause from the claim
+text (the claim may shrink, but the remaining clauses stay unchanged). Do not
+rewrite, reword, or drop the supported clauses.
 """
 
 
@@ -124,6 +132,8 @@ def _repair_prompt(gathered: GatherResult, page: SynthesisPage, verdict: JudgeVe
     lines.extend((
         "</current_claims>",
         f"<failed_claim_ids>{', '.join(verdict.failed_claim_ids)}</failed_claim_ids>",
+        f"<failed_clauses>{' | '.join(f'{cid} :: {clause}' for cid, clause in verdict.failed_clause_ids)}"
+        "</failed_clauses>",
         f"<failing_skip_ids>{', '.join(verdict.failing_skip_ids + verdict.borderline_skip_ids)}"
         "</failing_skip_ids>",
         "<gathered_pool>",

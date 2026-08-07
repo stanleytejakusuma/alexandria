@@ -30,6 +30,7 @@ class JudgeVerdict:
     failing_skip_ids: tuple[str, ...]
     borderline_skip_ids: tuple[str, ...]
     errors: tuple[str, ...]
+    failed_clause_ids: tuple[tuple[str, str], ...] = ()
 
     @property
     def passes(self) -> bool:
@@ -48,6 +49,7 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
     errors: list[str] = []
     audit = AuditResult()
     failed_claim_ids: list[str] = []
+    failed_clause_ids: list[tuple[str, str]] = []
 
     chunks_by_id = {chunk.chunk_id: chunk for chunk in gathered.chunks}
     chunks_by_doc = {chunk.doc_id: chunk for chunk in gathered.chunks}
@@ -64,6 +66,7 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
                 claim.id,
                 claim.text,
                 claim.id,
+                clauses=True,
             )
         except LLMError as exc:
             errors.append(str(exc))
@@ -72,6 +75,14 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
         audit.verdicts.append(verdict)
         if verdict.verdict != "supported":
             failed_claim_ids.append(claim.id)
+            if verdict.clauses:
+                # compound-claim splitting (round-4): repair targets only the
+                # failing clauses, not the whole claim
+                for clause in verdict.clauses:
+                    if clause.verdict != "supported":
+                        failed_clause_ids.append((claim.id, clause.clause))
+            else:
+                failed_clause_ids.append((claim.id, claim.text))
 
     agreements: list[AgreementResult] = []
     failing_skip_ids: list[str] = []
@@ -114,6 +125,7 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
         failing_skip_ids=tuple(failing_skip_ids),
         borderline_skip_ids=tuple(borderline_skip_ids),
         errors=tuple(errors),
+        failed_clause_ids=tuple(failed_clause_ids),
     )
 
 

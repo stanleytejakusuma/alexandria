@@ -41,6 +41,13 @@ created"), completion events ("was replaced", "was confirmed", "was removed"),
 and the names of every involved actor/system. A statement that drops a
 qualifier (e.g. saying a limitation exists without its contrast, or that a
 plan was prescribed without whether it was executed) is a failure.
+
+Temporal layering (round-4 directive, measured 2026-08-07): when a component's
+documented state changed over time (ship state → defect → fix), state EACH
+layer as of its time, then the transition ("at ship time the breaker only
+checked at the deploy gate; this was fixed the same day to run every 5-minute
+cycle"). Stating only the final state omits the earlier load-bearing facts
+and is a failure.
 """
 
 

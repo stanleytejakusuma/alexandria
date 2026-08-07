@@ -133,3 +133,41 @@ def test_v2_strict_quote_prompt_is_the_shipped_version():
     lowered = GRADER_SYSTEM.lower()
     assert "quote" in lowered and "relationship" in lowered
     assert "compositional" not in lowered      # v3's vocabulary, reverted
+
+
+def test_grade_note_clause_mode_returns_clause_verdicts():
+    """Round-4 compound-claim splitting: clause mode asks the grader for a
+    per-assertion breakdown and Verdict.clauses carries it."""
+    from alexandria.audit import CLAUSE_GRADER_SYSTEM, ClauseVerdict
+    llm = ScriptedClient([json.dumps({
+        "verdict": "unsupported", "reason": "one clause missing",
+        "clauses": [
+            {"clause": "X was decided", "verdict": "supported", "reason": "stated"},
+            {"clause": "then reversed because Y", "verdict": "unsupported", "reason": "not stated"},
+        ],
+    })])
+    v = grade_note(llm, "transcript", "T", "body", "n1", clauses=True)
+    assert v.verdict == "unsupported"
+    assert v.clauses == (
+        ClauseVerdict("X was decided", "supported", "stated"),
+        ClauseVerdict("then reversed because Y", "unsupported", "not stated"),
+    )
+    system, user = llm.calls[0]
+    assert "Split the claim" in system
+
+
+def test_grade_note_clause_mode_tolerates_missing_clauses_breakdown():
+    """A grader that omits the clauses array in clause mode still yields a
+    valid top-level verdict; clause granularity is a best-effort bonus."""
+    llm = ScriptedClient([json.dumps({"verdict": "supported", "reason": "stated"})])
+    v = grade_note(llm, "transcript", "T", "body", "n1", clauses=True)
+    assert v.verdict == "supported"
+    assert v.clauses == ()
+
+
+def test_grade_note_default_mode_does_not_ask_for_clauses():
+    """The distiller audit path must keep the single-verdict contract."""
+    llm = ScriptedClient([json.dumps({"verdict": "supported", "reason": "ok"})])
+    grade_note(llm, "t", "T", "b", "n1")
+    system, _ = llm.calls[0]
+    assert "clauses" not in system

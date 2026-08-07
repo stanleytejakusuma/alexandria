@@ -68,6 +68,25 @@ Return ONLY JSON: {"supporting_quote": "<shortest transcript span backing the sp
 relationship claimed, or empty string if none found>", "verdict":
 "supported|unsupported|fabricated", "reason": "<12 words"}"""
 
+CLAUSE_GRADER_SYSTEM = """You are judging whether a CLAIM is supported by a
+TRANSCRIPT. The claim may contain several distinct assertions joined together
+(e.g. "X was decided, then reversed, because Y"). Split the claim into its
+minimal distinct assertions (clauses) and judge EACH ONE against the transcript.
+
+Verdict meanings per clause:
+- "supported"   : the transcript states or directly implies this assertion.
+- "unsupported" : the transcript does not establish this, but does not contradict it.
+- "fabricated"  : the transcript contradicts this, or it invents specifics (names,
+                  numbers, outcomes) that do not appear in the text.
+
+The whole-claim "verdict" is "supported" only if EVERY clause is supported;
+otherwise "unsupported"; "fabricated" only if any clause is fabricated.
+
+Return ONLY JSON: {"supporting_quote": "<shortest span backing the claim, or empty>",
+"verdict": "supported|unsupported|fabricated", "reason": "<12 words",
+"clauses": [{"clause": "<the assertion as written>", "verdict": "supported|unsupported|fabricated",
+"reason": "<12 words"}]}"""
+
 USER_TEMPLATE = """<transcript>
 {transcript}
 </transcript>
@@ -81,11 +100,19 @@ Judge the note against the transcript. Return ONLY the JSON object."""
 
 
 @dataclass
+class ClauseVerdict:
+    clause: str
+    verdict: str
+    reason: str
+
+
+@dataclass
 class Verdict:
     note_id: str
     verdict: str
     reason: str
     title: str = ""
+    clauses: tuple[ClauseVerdict, ...] = ()
 
 
 @dataclass
@@ -143,8 +170,13 @@ def _unfence(text: str) -> str:
 
 
 def grade_note(llm, transcript: str, title: str, body: str, note_id: str,
-               max_transcript: int = 200_000) -> Verdict:
+               max_transcript: int = 200_000, clauses: bool = False) -> Verdict:
     """Grade one note. A grader failure is recorded, never silently counted as pass.
+
+    `clauses=True` asks the grader for a per-assertion breakdown (round-4
+    compound-claim splitting): a multi-clause claim that fails on one clause is
+    repaired clause-wise instead of all-or-nothing. Verdict.clauses is populated
+    when the grader supplies it; the top-level verdict remains authoritative.
 
     `max_transcript` must exceed the largest transcript you grade. Truncating the
     evidence while asking "is this supported by the evidence?" manufactures
@@ -161,12 +193,23 @@ def grade_note(llm, transcript: str, title: str, body: str, note_id: str,
     prompt = USER_TEMPLATE.format(transcript=transcript[:max_transcript],
                                   title=title, body=body[:4000])
     try:
-        raw = llm.complete(GRADER_SYSTEM, prompt)
+        raw = llm.complete(CLAUSE_GRADER_SYSTEM if clauses else GRADER_SYSTEM, prompt)
         data = json.loads(_unfence(raw))
         verdict = str(data["verdict"]).strip().lower()
         if verdict not in {"supported", "unsupported", "fabricated"}:
             raise ValueError(f"bad verdict {verdict!r}")
-        return Verdict(note_id, verdict, str(data.get("reason", ""))[:120], title)
+        clause_verdicts: tuple[ClauseVerdict, ...] = ()
+        if clauses and isinstance(data.get("clauses"), list):
+            parsed = []
+            for item in data["clauses"]:
+                c = str(item["clause"]).strip()
+                v = str(item["verdict"]).strip().lower()
+                if v not in {"supported", "unsupported", "fabricated"}:
+                    raise ValueError(f"bad clause verdict {v!r}")
+                parsed.append(ClauseVerdict(c, v, str(item.get("reason", ""))[:120]))
+            clause_verdicts = tuple(parsed)
+        return Verdict(note_id, verdict, str(data.get("reason", ""))[:120], title,
+                       clause_verdicts)
     except (LLMError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise LLMError(f"grader failed on {note_id}: {type(exc).__name__}: {exc}") from exc
 
