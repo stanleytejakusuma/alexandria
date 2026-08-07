@@ -47,3 +47,17 @@ silence timer (~20 min elapsed of a 60 min budget) had not expired.
 Driver should print an explicit timezone marker (`%H:%M:%S UTC`) or local
 time in its attempt heartbeats so log timestamps cannot be misread again.
 (Pending — lands after v4b completes to keep the measured HEAD pinned.)
+
+## Follow-up fix (same night, committed)
+
+The v4b relaunch hit a SECOND, real bug: the watchdog SIGTERM'd cluster-1
+attempt 2 at the 30-min silence mark, and the driver's crash guard recorded
+the cluster as `driver_crash` and MOVED ON -- attempt 3 never ran (the guard
+wraps the whole cluster; a signal unwinds all attempts). Fixed in
+scripts/synthesize-golden-pages.py: the per-attempt loop now catches
+`SystemExit` with a "terminated by" message (the signal handler's raise) and
+burns only that attempt; genuine `sys.exit()` calls still propagate.
+Regression test `test_driver_burns_attempt_on_signal_and_retries` (428
+passed). The 30-min watchdog budget itself was also wrong for round-4
+clause-graded attempts (longest observed attempt is now >30 min); the leg
+relaunch uses the v3-proven 3600s budget.

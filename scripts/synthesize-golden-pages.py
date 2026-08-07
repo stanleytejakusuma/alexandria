@@ -174,6 +174,18 @@ def _synthesize_one(engine, entry: SynthesisClusterEntry, clients: dict[str, Any
             # pipeline's own bounded failures; crashes are measurement-invalid.
             row["error"] = f"{type(exc).__name__}: {exc}"
             attempt_error = row["error"]
+        except SystemExit as exc:
+            # Watchdog/operator SIGTERM: the signal handler raises
+            # SystemExit('terminated by <NAME>') wherever the main thread is
+            # -- usually inside an LLM call. Burn THIS attempt and let the
+            # retry loop continue; the old behavior let one signal kill the
+            # whole cluster with a crash sidecar instead of retrying
+            # (measured 2026-08-07: cluster-1 attempt 2 SIGTERM'd at the 30-min
+            # watchdog, cluster ended 0/1 emitted, attempt 3 never ran).
+            if "terminated by" not in str(exc):
+                raise  # a genuine sys.exit() is not a signal abort
+            row["error"] = f"SystemExit: {exc}"
+            attempt_error = row["error"]
         row["attempts"].append({
             "attempt": attempt + 1,
             "emitted": bool(row["emitted"]),

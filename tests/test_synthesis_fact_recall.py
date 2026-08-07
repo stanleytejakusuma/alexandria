@@ -629,6 +629,45 @@ def test_driver_retries_failed_attempt_and_records_attempts(tmp_path):
     assert (out / "pages" / "cluster-a.md").exists()
 
 
+def test_driver_burns_attempt_on_signal_and_retries(tmp_path):
+    """A watchdog/operator SIGTERM lands inside an attempt (the handler raises
+    SystemExit('terminated by ...')). It must burn only THAT attempt and let
+    the retry loop continue -- the old behavior let one signal kill the whole
+    cluster with a crash sidecar (measured 2026-08-07: cluster-1 attempt 2
+    SIGTERM'd at the 30-min watchdog, cluster ended 0/1 emitted, attempt 3
+    never ran)."""
+    driver = _load_script("synthesize_golden_pages")
+    engine = FakeEngine({"topic": [Result("sources/f1#1", "sources/f1", "The fix shipped on Tuesday.")]})
+    out = tmp_path / "out"
+    clients = _retry_clients()
+
+    class SignalWriter:
+        """Raises the signal-handler exception on first use, then succeeds
+        (ScriptedClient would RETURN the exception object -- canned responses
+        replay, they don't raise)."""
+        def __init__(self, good):
+            self.good = good
+            self.calls = 0
+        def complete(self, system, user, temperature=0.0):
+            self.calls += 1
+            if self.calls == 1:
+                raise SystemExit("terminated by SIGTERM")
+            return self.good
+
+    clients["writer"] = SignalWriter(_page("Good page.", [{"id": "c1",
+        "text": "The fix shipped on Tuesday.",
+        "citations": [{"doc_id": "sources/f1", "chunk_id": "sources/f1#1"}]}]))
+    results = driver.synthesize_golden_pages(
+        [_entry("cluster-a", "topic", ("f1",))], out, engine, clients, seed_k=8, retries=1)
+    assert results[0]["emitted"] is True
+    assert results[0]["attempt_count"] == 2
+    assert "terminated by SIGTERM" in results[0]["attempts"][0]["error"]
+    assert results[0]["attempts"][1]["emitted"] is True
+    sidecar = json.loads((out / "gather" / "cluster-a.gather.json").read_text())
+    assert sidecar["error"] is None  # no crash sidecar: the signal was an attempt, not a crash
+    assert (out / "pages" / "cluster-a.md").exists()
+
+
 def test_driver_exhausts_retries_and_records_failure(tmp_path):
     driver = _load_script("synthesize_golden_pages")
     engine = FakeEngine({"topic": [Result("sources/f1#1", "sources/f1", "The fix shipped on Tuesday.")]})
