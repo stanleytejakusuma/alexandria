@@ -51,11 +51,13 @@ __all__ = [
 #     duplicate merge collapses distinct facts into one canonical (data loss),
 #     while a missed duplicate is caught by the sweep's cross-page redundancy
 #     layer and the dedup action space's `skip` is never destructive.
-#   topic 0.75 -- mean best-match Jaccard 0.53 against the 8 hand-built
-#     golden clusters on first-chunk probes (full-chunk sweeps are expected to
-#     recover more: multi-topic docs share only their opening chunk here).
+#   topic 0.88 -- full-corpus calibration (66,770 chunks, index-model
+#     embeddings): mean best-match Jaccard 0.27 vs the 8 hand-built golden
+#     clusters. First-chunk-only probes were rejected as a calibration
+#     artifact (0.53 at 0.75 on 600 docs collapsed to 0.03 at scale); the
+#     all-chunks sweep moves the optimum up to 0.88.
 DEDUP_THRESHOLD = 0.75
-TOPIC_THRESHOLD = 0.75
+TOPIC_THRESHOLD = 0.88
 
 
 class ChunkLike(Protocol):
