@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,13 +27,17 @@ class PipelineResult:
 def run_pipeline(engine, topic_query: str, *, gather_llm, writer_llm, repair_llm, audit_llm,
                  coverage_llm_a, coverage_llm_b, corpus_root: str | Path = "~/alexandria-corpus",
                  seed_k: int = 8, writer_model: str | None = None,
-                 prompt_version: str = "v1") -> PipelineResult:
-    """Run a single page without any full-corpus scheduling or persistent gather state."""
+                 prompt_version: str = "v1", seed_chunks: Sequence = ()) -> PipelineResult:
+    """Run a single page without any full-corpus scheduling or persistent gather state.
+
+    seed_chunks: known-relevant chunks for the gather pool (a topic cluster's
+    member docs in the sweep / golden driver). Passed through to gather()."""
     if writer_llm is audit_llm:
         raise ValueError("writer and entailment grader must be different clients")
     if coverage_llm_a is coverage_llm_b:
         raise ValueError("coverage grading requires two independent clients")
-    gathered = gather(engine, topic_query, llm=gather_llm, seed_k=seed_k)
+    gathered = gather(engine, topic_query, llm=gather_llm, seed_k=seed_k,
+                      seed_chunks=seed_chunks)
     page = write_page(
         gathered,
         topic_query,

@@ -41,6 +41,29 @@ DEFAULT_GOLDEN = Path.home() / "alexandria-corpus" / ".alexandria" / "golden" / 
 CORPUS = Path.home() / "alexandria-corpus"
 
 
+def _seed_chunks(entry: SynthesisClusterEntry) -> list:
+    """The cluster's own member docs as seed chunks for the gather pool.
+
+    The golden clusters were hand-built from real corpus docs; the sweep's
+    real-world equivalent seeds the gather from the topic cluster's members.
+    This is corpus structure, not golden-fact leakage (the facts themselves
+    are never passed to the pipeline). Round-2 fix for the
+    evidence_not_gathered miss class (measured 2026-08-07)."""
+    from alexandria.index.chunker import chunk_document
+    from alexandria.synthesis.gather import SourceChunk
+
+    seeds: list[SourceChunk] = []
+    for doc_id in entry.source_docs:
+        path = CORPUS / f"{doc_id}.md"
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for chunk in chunk_document(doc_id, text):
+            seeds.append(SourceChunk(chunk_id=chunk.chunk_id, doc_id=doc_id,
+                                     text=chunk.text))
+    return seeds
+
+
 def _pipeline_page_failure(*args, **kwargs):
     """run_pipeline raises ValueError when an LLM emits structurally-wrong page
     JSON (write.py parse_page_response) -- an expected pipeline failure, not a
@@ -111,6 +134,7 @@ def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: P
                     seed_k=seed_k,
                     writer_model=str(getattr(clients["writer"], "model", "scripted")),
                     prompt_version="v1",
+                    seed_chunks=_seed_chunks(entry),
                 )
                 if result.emitted and result.page_path is not None:
                     _copy_outputs(result.page_path, result.skip_log_path, pages_dir, entry.id)

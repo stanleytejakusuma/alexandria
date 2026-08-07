@@ -58,3 +58,28 @@ def test_gather_does_not_retrieve_a_third_round_when_no_follow_up_is_needed():
     assert engine.calls == [("topic", 8)]
     assert result.round_two == ()
     assert [chunk.doc_id for chunk in result.chunks] == ["sources/a"]
+
+
+def test_gather_includes_seed_chunks_in_pool():
+    """Round-2 fix: cluster member docs seed the gather pool (real corpus
+    structure, not golden leakage). Seed chunks must be in the merged pool,
+    deduped by doc_id against retrieval results."""
+    from alexandria.synthesis.gather import SourceChunk, gather
+
+    class Engine:
+        def search(self, query, k=8):
+            return [type("R", (), {"doc_id": "sources/retrieved", "chunk_id": "sources/retrieved#1",
+                                   "text": "retrieved text", "score": 1.0})()]
+
+    class GapLLM:
+        def complete(self, system, user):
+            return '{"queries": []}'
+
+    seeds = [SourceChunk("sources/seed#0", "sources/seed", "seed text"),
+             SourceChunk("sources/seed#1", "sources/seed", "seed text 2")]
+    result = gather(Engine(), "topic", llm=GapLLM(), seed_k=8, seed_chunks=seeds)
+    doc_ids = [c.doc_id for c in result.chunks]
+    assert "sources/seed" in doc_ids
+    assert "sources/retrieved" in doc_ids
+    assert doc_ids.count("sources/seed") == 1  # deduped against retrieval
+    assert len(result.chunks) == 2

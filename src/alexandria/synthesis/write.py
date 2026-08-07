@@ -33,6 +33,14 @@ Coverage is mandatory: every load-bearing proposition in the sources you cite
 the page. Omitting a load-bearing fact from a source you cite is a failure;
 prefer more claims over fewer. You may omit only immaterial or duplicated
 material.
+
+Qualifier completeness (round-2 directive, measured 2026-08-07): preserve
+EVERY load-bearing qualifier of each proposition -- including negative and
+contrast statements ("only blocks X, does not Y", "stayed active", "was never
+created"), completion events ("was replaced", "was confirmed", "was removed"),
+and the names of every involved actor/system. A statement that drops a
+qualifier (e.g. saying a limitation exists without its contrast, or that a
+plan was prescribed without whether it was executed) is a failure.
 """
 
 

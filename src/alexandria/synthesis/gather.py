@@ -55,12 +55,19 @@ class GatherResult:
     gap_response: str
 
 
-def gather(engine, topic_query: str, *, llm, seed_k: int = 8) -> GatherResult:
+def gather(engine, topic_query: str, *, llm, seed_k: int = 8,
+           seed_chunks: Sequence[SourceChunk] = ()) -> GatherResult:
     """Retrieve a seed pool, make one gap pass, then retrieve one follow-up pool.
 
     ``llm`` is explicit rather than constructed here so every caller can inject a
     ``ScriptedClient`` in CI and ``LLMClient`` retains its bounded retry policy in
     production. This function stores no state between calls.
+
+    ``seed_chunks``: known-relevant chunks to include in the pool (e.g. a topic
+    cluster's member docs in the sweep). They are real corpus structure, not
+    golden leakage -- the sweep enumerates clusters precisely so the gather
+    starts from the cluster's own documents. The gap pass sees them, and the
+    judge's chunk accounting covers them like any gathered chunk.
     """
     round_one = tuple(
         SourceChunk.from_search_result(result)
@@ -78,7 +85,7 @@ def gather(engine, topic_query: str, *, llm, seed_k: int = 8) -> GatherResult:
 
     merged: list[SourceChunk] = []
     seen_doc_ids: set[str] = set()
-    for chunk in (*round_one, *round_two):
+    for chunk in (*seed_chunks, *round_one, *round_two):
         if chunk.doc_id not in seen_doc_ids:
             seen_doc_ids.add(chunk.doc_id)
             merged.append(chunk)
