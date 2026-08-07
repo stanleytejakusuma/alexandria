@@ -105,18 +105,15 @@ def incumbent_retrieve(query: str, k: int) -> list[dict[str, Any]]:
 
 # ---------------------------------------------------------------- grading
 
-GRADER_PROMPT = """You are grading retrieval relevance. For the query below, judge
-each result: is it RELEVANT to the query (does it contain the answer/fact the
-query demands)? Partial support counts when it answers the query's operative
-verb; agnostic/opinion answers are NOT relevant.
+GRADER_SYSTEM = ("You are a retrieval relevance grader. Judge each result: "
+                "is it RELEVANT to the query (does it contain the answer/fact "
+                "the query demands)? Partial support counts when it answers the "
+                "query's operative verb; agnostic/opinion answers are NOT "
+                "relevant. Reply with ONLY a JSON object mapping each result "
+                "number to yes or no, e.g. {\"1\": \"yes\", \"2\": \"no\"}.")
 
-QUERY: {query}
-
-RESULTS:
-{results}
-
-Reply with ONLY a JSON object mapping each result number to "yes" or "no":
-{{"1": "yes", "2": "no", ...}}"""
+GRADER_PROMPT = ("QUERY: {query}\n\n"
+                 "RESULTS:\n{results}")
 
 
 def _parse_verdicts(text: str) -> dict[str, bool]:
@@ -134,7 +131,9 @@ def grade_query(client, query: str, results: list[dict[str, Any]], *, retries=2)
     last = None
     for _ in range(retries + 1):
         try:
-            text = client.complete(prompt)
+            # temperature=0.1: the gateway's llm.py guard refuses fast-tier
+            # models (sol/terra) at temperature=0 (cross-contamination class).
+            text = client.complete(GRADER_SYSTEM, prompt, temperature=0.1)
             verdicts = _parse_verdicts(text)
             if set(verdicts) == {str(i + 1) for i in range(len(results))}:
                 return verdicts
@@ -188,7 +187,12 @@ def score_run(graded: list[dict[str, Any]]) -> dict[str, Any]:
     tie = abs(diff) <= (1 / max(a_rel, i_rel, 1))
     floor_ok = a_recall >= FLOOR
     cap_ok = disagreement <= DISAGREEMENT_CAP
-    verdict = "PASS" if (a_recall > i_recall and not tie and floor_ok and cap_ok) else "FAIL"
+    # spec §3: disagreement over the cap is INVALID (run discarded, no
+    # verdict), taking precedence over PASS/FAIL.
+    if not cap_ok:
+        verdict = "INVALID"
+    else:
+        verdict = "PASS" if (a_recall > i_recall and not tie and floor_ok) else "FAIL"
 
     strata: dict[str, dict[str, float]] = {}
     for row in rows:
@@ -315,14 +319,14 @@ def main() -> int:
 
     # stage 3: grading
     graded_path = out / "03-graded.jsonl"
-    if not (args.resume and graded_path.exists()):
+    if not (args.resume and graded_path.exists() and graded_path.stat().st_size > 0):
         from alexandria.llm import LLMClient
         if args.dry_run:
             class Scripted:
-                def complete(self, prompt):  # relevant iff query's first word appears in the result text
-                    q = prompt.split("QUERY: ", 1)[1].split("\n", 1)[0].lower()
+                def complete(self, system, user, temperature=0.0):  # relevant iff query's first word appears in the result text
+                    q = user.split("QUERY: ", 1)[1].split("\n", 1)[0].lower()
                     keyword = q.split()[0]
-                    body = prompt.split("RESULTS:\n", 1)[1]
+                    body = user.split("RESULTS:\n", 1)[1]
                     import re
                     hits = []
                     for line in body.splitlines():
