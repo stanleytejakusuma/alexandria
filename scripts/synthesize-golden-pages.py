@@ -100,6 +100,8 @@ def _synthesize_one(engine, entry: SynthesisClusterEntry, clients: dict[str, Any
         "repair_iterations": None,
         "failed_claim_details": [],
         "page_sha256": None,
+        "last_page_text": None,
+        "last_page_claims": None,
         "attempt_count": 0,
         "attempts": [],
         "duration_seconds": None,
@@ -128,6 +130,13 @@ def _synthesize_one(engine, entry: SynthesisClusterEntry, clients: dict[str, Any
             )
             if result.emitted and result.page_path is not None:
                 _copy_outputs(result.page_path, result.skip_log_path, pages_dir, entry.id)
+            if not result.emitted and result.repair.page is not None:
+                # Diagnostic for failed clusters (measured 2026-08-07: opencode
+                # 3/3 attempts dead with no page -- the LAST repair page shows
+                # exactly which specifics the entailment grader rejected).
+                row["last_page_text"] = result.repair.page.text
+                row["last_page_claims"] = [
+                    {"id": c.id, "text": c.text} for c in result.repair.page.claims]
             failed_ids = set(result.repair.verdict.failed_claim_ids)
             row["failed_claim_details"] = [
                 {"id": c.id, "text": c.text,
