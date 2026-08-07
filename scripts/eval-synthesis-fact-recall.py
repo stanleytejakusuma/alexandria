@@ -162,6 +162,8 @@ def replay_report(report: dict, adjudications: dict[str, bool]) -> dict:
                 adjudicated_here += 1
                 if both:
                     consensus_delta -= 1
+                if va[fid]["covered"] != vb[fid]["covered"]:
+                    contested_delta -= 1  # resolved as a miss, no longer contested
             elif both:
                 consensus.append(fid)
             elif va[fid]["covered"] != vb[fid]["covered"]:

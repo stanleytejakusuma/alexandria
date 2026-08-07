@@ -951,3 +951,41 @@ def test_cluster_outcome_flags_evidence_failure_as_contested():
     assert consensus == ()
     assert contested == ("f1",)
     assert misses == ()
+
+
+def test_replay_adjudicated_false_resolves_contested():
+    """Replay bug found 2026-08-07: adjudicated-FALSE facts that were
+    contested (A-false/B-true) stayed in the pooled contested count -- the
+    verdict-level path never decremented contested_delta on adj False. A
+    resolved miss must stop being contested."""
+    cli = _load_script("eval_synthesis_fact_recall")
+    base = {
+        "scored_fact_count": 4, "consensus_count": 2, "contested_count": 2,
+        "adjudicated_count": 0, "invalid_cluster_ids": [],
+        "pooled_consensus_recall": 0.5, "pooled_union_recall": 1.0,
+        "pooled_recall_a": 0.5, "pooled_recall_b": 1.0,
+        "macro_consensus_recall": 0.5, "verdict": "PROVISIONAL_FAIL",
+        "clusters": [
+            {"cluster_id": "c1", "status": "graded", "consensus_recall": 0.5,
+             "consensus_covered": ["f1"], "contested_ids": ["f2", "f3"],
+             "adjudicated_fact_count": 0,
+             "agreement": {"result_a": {"verdicts": [
+                 {"fact_id": "f1", "covered": True}, {"fact_id": "f2", "covered": False},
+                 {"fact_id": "f3", "covered": False}]},
+                 "result_b": {"verdicts": [
+                 {"fact_id": "f1", "covered": True}, {"fact_id": "f2", "covered": True},
+                 {"fact_id": "f3", "covered": True}]}}},
+            {"cluster_id": "c2", "status": "graded", "consensus_recall": 0.0,
+             "consensus_covered": [], "contested_ids": [],
+             "adjudicated_fact_count": 0,
+             "agreement": {"result_a": {"verdicts": [
+                 {"fact_id": "f4", "covered": False}]},
+                 "result_b": {"verdicts": [
+                 {"fact_id": "f4", "covered": False}]}}},
+        ],
+    }
+    # f2 adjudicated false (was contested A-false/B-true): resolved miss.
+    replayed = cli.replay_report(base, {"c1::f2": False})
+    assert replayed["contested_count"] == 1  # only f3 remains contested
+    assert replayed["consensus_count"] == 2
+    assert replayed["clusters"][0]["contested_ids"] == ["f3"]
