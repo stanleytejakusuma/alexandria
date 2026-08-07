@@ -894,3 +894,25 @@ def test_driver_rejects_ambiguous_flag_abbreviations():
         cli.build_parser().parse_args([
             "--golden", "g.jsonl", "--out", "/tmp/o", "--gather", "/tmp/gather",
         ])
+
+
+def test_grade_fact_recall_retries_paraphrased_evidence_with_hint():
+    """Stochastic evidence-substring failures (measured 2026-08-07: the same
+    page/model/prompt passed on re-run while three clusters were invalidated
+    in one batch) must retry with a verbatim hint instead of nuking the
+    cluster -- strictness preserved: a response only counts when its evidence
+    is verbatim in the page."""
+    bad = _resp(_covered("f1", evidence="a paraphrase that is not in the page"))
+    good = _resp(_covered("f1", evidence=EVIDENCE))
+    llm = ScriptedClient([bad, good])
+    result = grade_fact_recall(llm, PAGE, _facts("f1"))
+    assert result.recall == 1.0
+    assert result.errors == ("evidence retried 1x",)
+    assert result.raw == good
+
+
+def test_grade_fact_recall_gives_up_after_bounded_retries():
+    bad = _resp(_covered("f1", evidence="never verbatim"))
+    llm = ScriptedClient([bad, bad, bad])
+    with pytest.raises(LLMError, match="substring"):
+        grade_fact_recall(llm, PAGE, _facts("f1"), evidence_retries=2)

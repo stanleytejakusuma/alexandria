@@ -245,16 +245,39 @@ def parse_fact_recall_response(raw: str, expected_ids: tuple[str, ...],
 
 
 def grade_fact_recall(llm, page_text: str, facts: Sequence[LoadBearingFact],
-                      model: str | None = None) -> FactRecallResult:
+                      model: str | None = None,
+                      evidence_retries: int = 2) -> FactRecallResult:
     """One grader pass. Malformed responses propagate as LLMError -- never a
-    silent pass. The raw response is retained on the result for audit."""
+    silent pass. The raw response is retained on the result for audit.
+
+    evidence_retries: the evidence-substring check fails STOCHASTICALLY --
+    graders occasionally quote a paraphrase instead of a verbatim span
+    (measured 2026-08-07: the same page/model/prompt passed on re-run while
+    three clusters were invalidated in one batch). Strictness is preserved
+    (a response only counts when its evidence is verbatim in the page); a
+    bounded retry with a verbatim hint recovers the measurement from a
+    stochastic quote, mirroring the driver's emission-retry doctrine."""
     grader_model = model or str(getattr(llm, "model", "scripted"))
     system, user = build_fact_recall_prompt(page_text, facts)
     raw = llm.complete(system, user)
-    verdicts = parse_fact_recall_response(raw, tuple(f.id for f in facts), page_body=page_text)
+    retries = 0
+    while True:
+        try:
+            verdicts = parse_fact_recall_response(
+                raw, tuple(f.id for f in facts), page_body=page_text)
+            break
+        except LLMError as exc:
+            if retries >= evidence_retries:
+                raise
+            retries += 1
+            hint = (f"Your previous response was rejected: {exc}. "
+                    f"Quote evidence spans VERBATIM from the page text -- "
+                    f"no paraphrasing, no added punctuation.")
+            raw = llm.complete(system, f"{user}\n\n{hint}")
     n = len(verdicts)
     recall = sum(v.covered for v in verdicts) / n if n else 0.0
-    return FactRecallResult(grader_model, verdicts, recall, (), raw=raw)
+    errors = (f"evidence retried {retries}x",) if retries else ()
+    return FactRecallResult(grader_model, verdicts, recall, errors, raw=raw)
 
 
 def grade_fact_recall_twice(llm_a, llm_b, page_text: str,
