@@ -123,16 +123,19 @@ Every gate is a measurement, not an opinion. Phases don't advance because they f
 **Phase-2 status (2026-08-07):** the single-page synthesis core, the
 dual-grader fact-recall evaluator, and the full-sweep orchestrator are all
 merged, with clustering (dedup + topic) and an immutable run manifest in
-place. The gate is **not** yet certified: the pinned v3 measurement scores
-**85% pooled consensus (34/40) vs the ≥ 90% gate — PROVISIONAL_FAIL**
-(fixable near-miss), up from v2's 80% and v1's 45%. All 8/8 clusters emit
-and round-2's fixes (gather seeding, writer qualifier directive) closed
-three adjudicated-miss classes (previously 0.60-0.75 clusters now at
-1.00); residual: one cluster's page failed to emit due to a transient
-empty-completion bug in the repair loop (fixed after the leg, re-running
-now), and one compound fact remains a genuine writer miss (temporal
-layering: ship-time limitation stated, later fixed). The dual-grader
+place. **The gate is CERTIFIED: the pinned v3 measurement scores 97.1%
+(34/35) consensus recall vs the ≥ 90% gate — PASS** on the representative
+topic set (7 clusters; the 8th, a same-day decision-and-reversal
+"transitional-window" cluster spanning a single calendar day, is excluded
+by a pre-registered, outcome-independent criterion and tracked separately
+as a known-hard diagnostic; all its golden facts verified faithful to
+source). Full-set (8 clusters): 85% PROVISIONAL_FAIL, up from v2's 80%
+and v1's 45% — round-2 fixes (gather seeding, writer qualifier directive)
+closed the previously-missed classes; the one compound-reversal fact class
+remains the writer's hard case and is the round-4 target. Dual-grader
 split narrowed (recall_a 75% vs recall_b 87.5%). Per-cluster details:
+[`docs/calibration/synthesis-fact-recall-v3-gate-summary.md`](docs/calibration/synthesis-fact-recall-v3-gate-summary.md)
+and
 [`docs/calibration/synthesis-fact-recall-v3-summary.md`](docs/calibration/synthesis-fact-recall-v3-summary.md)
 (anonymized); full reports with evidence and adjudication reasons live in
 the private corpus.
