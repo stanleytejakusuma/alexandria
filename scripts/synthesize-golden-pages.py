@@ -146,6 +146,7 @@ def _synthesize_one(engine, entry: SynthesisClusterEntry, clients: dict[str, Any
                 "follow_up_queries": list(result.gathered.follow_up_queries),
                 "repair_iterations": result.repair.iterations,
                 "repair_errors": list(result.repair.errors),
+                "repair_transient_errors": list(result.repair.transient_errors),
                 "final_claim_count": len(result.repair.page.claims),
                 "final_skip_log_count": len(result.repair.page.skip_log),
                 "chunk_accounted": bool(result.repair.verdict.chunk_accounted),

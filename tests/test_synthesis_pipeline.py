@@ -186,6 +186,54 @@ def test_repair_deletion_is_logged_then_coverage_rejects_gutting_and_pipeline_em
     assert not list((tmp_path / "wiki").glob("*.skip-log.json"))
 
 
+def test_repair_survives_transient_empty_writer_json(tmp_path):
+    """Regression for the 2026-08-07 measurement kill: opencode went 3/3
+    attempts dead because repair iteration 2 got an EMPTY writer response
+    (JSONDecodeError char 0) and the loop `break`ed -- silent emit failure.
+    A transient empty completion must be retried, not treated as terminal."""
+    engine = FakeEngine({"topic": [
+        Result("sources/bad#1", "sources/bad", "Bad-claim evidence."),
+        Result("sources/keep#1", "sources/keep", "Supported claim evidence."),
+    ]})
+    initial = _page("Initial page.", [
+        {"id": "bad", "text": "Fabricated claim.", "citations": [{"doc_id": "sources/bad"}]},
+        {"id": "keep", "text": "Remaining claim.", "citations": [{"doc_id": "sources/keep"}]},
+    ])
+    repaired = _page("Repaired page.", [
+        {"id": "keep", "text": "Remaining claim.", "citations": [{"doc_id": "sources/keep"}]},
+    ])
+
+    # repair_llm: first completion is EMPTY (the transient), the retry succeeds.
+    # audit: fail on the fabricated claim, then pass the repaired page (2 passes:
+    # iteration 1 repair + final judge after the repaired page is accepted).
+    result = run_pipeline(
+        engine,
+        "topic",
+        gather_llm=ScriptedClient([json.dumps({"queries": []})]),
+        writer_llm=ScriptedClient([initial]),
+        repair_llm=ScriptedClient(["", repaired]),
+        audit_llm=ScriptedClient([
+            _audit_response("fabricated"), _audit_response("supported"),
+            _audit_response("supported"),
+        ]),
+        coverage_llm_a=ScriptedClient([_coverage_response("SS", "SS:tangential"),
+                                       _coverage_response("SS", "SS:tangential")]),
+        coverage_llm_b=ScriptedClient([_coverage_response("SS", "SS:tangential"),
+                                       _coverage_response("SS", "SS:tangential")]),
+        corpus_root=tmp_path,
+    )
+
+    assert result.emitted is True
+    assert result.repair.iterations == 1
+    assert result.repair.errors == ()
+    assert result.repair.transient_errors == (
+        "repair iteration 1 attempt 1 failed: synthesis writer returned "
+        "invalid page JSON: JSONDecodeError: Expecting value: "
+        "line 1 column 1 (char 0)",
+    )
+    assert (tmp_path / "wiki" / "topic.md").exists()
+
+
 def test_writer_prompt_demands_load_bearing_coverage():
     """Regression for the measured writer layer (~72% consensus on emitted
     pages): WRITER_SYSTEM must direct the writer to state load-bearing

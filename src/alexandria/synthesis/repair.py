@@ -41,6 +41,7 @@ class RepairResult:
     verdict: JudgeVerdict
     iterations: int
     errors: tuple[str, ...]
+    transient_errors: tuple[str, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -60,19 +61,36 @@ def repair_until_done(gathered: GatherResult, page: SynthesisPage, *, repair_llm
     )
     current = verdict.page
     errors: list[str] = []
+    transient_errors: list[str] = []
     iterations = 0
     while not verdict.passes and iterations < MAX_REPAIR_ITERATIONS:
         iterations += 1
-        try:
-            raw = repair_llm.complete(REPAIR_SYSTEM, _repair_prompt(gathered, current, verdict))
-            repaired = parse_page_response(
-                raw,
-                topic_query=current.topic_query,
-                author=current.author,
-                visibility=current.visibility,
-            )
-        except LLMError as exc:
-            errors.append(f"repair iteration {iterations} failed: {exc}")
+        # A transient empty/garbled completion must not terminate the repair
+        # loop (measured 2026-08-07: opencode 3/3 attempts dead -- each got an
+        # empty writer JSON in iteration 2, `break`ed, and silently failed
+        # emit). Retry the repair call up to 3x; only genuine exhaustion breaks.
+        # Per-attempt hiccups are recorded as transient_errors (diagnostic, do
+        # NOT poison `passed` when a later attempt succeeds).
+        repaired = None
+        last_error: LLMError | None = None
+        for attempt in range(1, 4):
+            try:
+                raw = repair_llm.complete(
+                    REPAIR_SYSTEM, _repair_prompt(gathered, current, verdict))
+                repaired = parse_page_response(
+                    raw,
+                    topic_query=current.topic_query,
+                    author=current.author,
+                    visibility=current.visibility,
+                )
+                break
+            except LLMError as exc:
+                last_error = exc
+                transient_errors.append(
+                    f"repair iteration {iterations} attempt {attempt} failed: {exc}")
+        if repaired is None:
+            errors.append(
+                f"repair iteration {iterations} failed after 3 attempts: {last_error}")
             break
         # Keep the prior deterministic accounting. If a claim was removed, its
         # formerly cited chunk becomes an uncited entry and judge_page logs it before
@@ -86,7 +104,8 @@ def repair_until_done(gathered: GatherResult, page: SynthesisPage, *, repair_llm
             coverage_llm_b=coverage_llm_b,
         )
         current = verdict.page
-    return RepairResult(current, verdict, iterations, tuple(errors))
+    return RepairResult(current, verdict, iterations, tuple(errors),
+                         tuple(transient_errors))
 
 
 def _repair_prompt(gathered: GatherResult, page: SynthesisPage, verdict: JudgeVerdict) -> str:
