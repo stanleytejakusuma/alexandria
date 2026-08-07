@@ -120,19 +120,19 @@ Everything is markdown with YAML frontmatter — readable in Obsidian, greppable
 
 Every gate is a measurement, not an opinion. Phases don't advance because they feel done.
 
-**Phase-2 status (2026-08-06):** the single-page synthesis core
-(gather → write → judge → repair → emit) is merged as a verified *component* —
-its native checks pass (deterministic chunk accounting, entailment audit,
-sampled skip-log coverage, anti-gutting repair). The golden-synthesis
-dual-grader fact-recall evaluator exists, is adversarially reviewed, and
-carries an immutable run manifest; a full 8-cluster / 40-fact measurement is
-the gate evidence. The gate is **not** yet certified: the first measurement
-(`fact-recall-v1`) scored **45% pooled consensus vs the ≥ 90% gate**, with the
-failures decomposed into writer-layer omissions (gathered-but-not-stated),
-pipeline emission misses, and two verdict-contested facts. Fix round 1
-(per-claim repair compliance + writer coverage directives) shipped; the v2
-re-measurement is the current evidence cycle. Per-cluster details are
-[`docs/calibration/synthesis-fact-recall-summary.md`](docs/calibration/synthesis-fact-recall-summary.md) (anonymized).
+**Phase-2 status (2026-08-07):** the single-page synthesis core, the
+dual-grader fact-recall evaluator, and the full-sweep orchestrator are all
+merged, with clustering (dedup + topic) and an immutable run manifest in
+place. The gate is **not** yet certified: the pinned v2 measurement scores
+**80% pooled consensus (32/40) vs the ≥ 90% gate — FINAL_FAIL**, up from
+v1's 45%. All 8/8 clusters now emit (v1: 3/8); the residual gap is the
+writer layer's qualifier omissions on 8 facts (gathered-but-not-stated,
+now adjudicated with recorded reasons) and a systematic dual-grader split
+(recall_a 60% vs recall_b 90% — sonnet-5 is the strict grader). The v3
+measurement targets the adjudicated-miss classes. Per-cluster details:
+[`docs/calibration/synthesis-fact-recall-v2-summary.md`](docs/calibration/synthesis-fact-recall-v2-summary.md)
+(anonymized); full reports with evidence and adjudication reasons live in
+the private corpus.
 
 The phase 3 → 4 boundary also carries a standing checkpoint: whether
 Alexandria adopts graph-structured retrieval, formally re-examined against

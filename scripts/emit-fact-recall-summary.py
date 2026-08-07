@@ -128,7 +128,8 @@ def main(argv: list[str] | None = None) -> int:
     summary = build_summary(report, golden_entries)
     title = args.title or (f"Synthesis fact-recall measurement "
                            f"({(report.get('timestamp') or '')[:10]})")
-    markdown = render_markdown(summary, title=title, source_report=str(args.report))
+    markdown = render_markdown(summary, title=title,
+                               source_report=Path(args.report).name)
     output = args.output or (Path("docs") / "calibration" / "synthesis-fact-recall-summary.md")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(markdown, encoding="utf-8")
