@@ -536,10 +536,19 @@ def run_fact_recall_eval(entries: Sequence[SynthesisClusterEntry],
                 raw_sidecar = json.loads(gather_path.read_text(encoding="utf-8"))
                 gathered = set(raw_sidecar.get("gathered_doc_ids", []))
                 sidecar_emitted = bool(raw_sidecar.get("emitted", False))
+                sidecar_error = raw_sidecar.get("error")
             except (json.JSONDecodeError, OSError, TypeError) as exc:
                 sidecar_error = f"gather sidecar unreadable: {exc}"
         else:
             sidecar_error = "gather sidecar missing"
+
+        if sidecar_error and str(sidecar_error).startswith("driver_crash"):
+            # A driver crash is a MEASUREMENT problem (the pipeline never got a
+            # fair attempt), never a pipeline failure -- facts are excluded from
+            # the denominator, verdict INVALID (recorded 2026-08-07: crashes used
+            # to vanish entirely, dropping the cluster silently).
+            clusters.append(_invalid_cluster(entry, (str(sidecar_error),)))
+            continue
 
         page_path = pages / f"{entry.id}.md"
         if not page_path.exists():

@@ -544,9 +544,13 @@ def test_driver_records_failing_pipeline_as_data_without_aborting_batch(tmp_path
     assert "final_claim_count" in sidecar_b and "failed_claim_ids" in sidecar_b
 
 
-def test_driver_propagates_unexpected_exception(tmp_path):
-    """RuntimeError from the engine is NOT an expected pipeline failure: it must
-    abort the batch, not be recorded as a page miss."""
+def test_driver_records_unexpected_exception_as_crash_sidecar(tmp_path):
+    """A driver crash mid-cluster is recorded as a crash sidecar (emitted=false,
+    error=driver_crash with traceback) and the batch CONTINUES -- the old
+    propagate-and-die contract silently lost clusters (measured 2026-08-07:
+    a cluster in v3 vanished with no sidecar while the bash loop carried on). The
+    evaluator maps driver_crash sidecars to measurement_invalid, so Red's
+    conflation concern (programmer errors as page misses) still holds."""
     driver = _load_script("synthesize_golden_pages")
     engine = FakeEngine({
         "topic a": [Result("sources/f1#1", "sources/f1", "The fix shipped on Tuesday.")],
@@ -555,8 +559,15 @@ def test_driver_propagates_unexpected_exception(tmp_path):
     entries = [_entry("cluster-a", "topic a", ("f1",)), _entry("cluster-b", "topic b", ("f2",))]
     out = tmp_path / "out"
 
-    with pytest.raises(RuntimeError, match="gather exploded"):
-        driver.synthesize_golden_pages(entries, out, engine, _clients(), seed_k=8)
+    results = driver.synthesize_golden_pages(entries, out, engine, _clients(), seed_k=8)
+    assert len(results) == 2
+    assert results[0]["emitted"] is True
+    crash = results[1]
+    assert crash["emitted"] is False
+    assert crash["error"].startswith("driver_crash: RuntimeError: gather exploded")
+    assert "traceback" in crash
+    crash_sidecar = json.loads((out / "gather" / "cluster-b.gather.json").read_text())
+    assert crash_sidecar["error"].startswith("driver_crash")
 
 
 def test_report_serialization_retains_agreement_and_raw_responses(tmp_path):
@@ -989,3 +1000,31 @@ def test_replay_adjudicated_false_resolves_contested():
     assert replayed["contested_count"] == 1  # only f3 remains contested
     assert replayed["consensus_count"] == 2
     assert replayed["clusters"][0]["contested_ids"] == ["f3"]
+
+
+def test_driver_crash_sidecar_is_measurement_invalid_not_pipeline_failure(tmp_path):
+    """A driver_crash sidecar must exclude the cluster's facts from the
+    denominator (INVALID), never count them as pipeline misses -- the crash is
+    a measurement problem, not a synthesis failure."""
+    from alexandria.eval.synthesis_fact_recall import run_fact_recall_eval
+
+    class NoopLLM:
+        def complete(self, system, user):
+            raise AssertionError("no grading should happen for an invalid cluster")
+
+    page_dir = tmp_path / "pages"
+    gather_dir = tmp_path / "gather"
+    page_dir.mkdir()
+    gather_dir.mkdir()
+    (gather_dir / "c1.gather.json").write_text(
+        json.dumps({"emitted": False, "error": "driver_crash: RuntimeError: boom"})
+        + "\n", encoding="utf-8")
+    from alexandria.eval.synthesis_golden import LoadBearingFact, SynthesisClusterEntry
+    entry = SynthesisClusterEntry("c1", "topic", ("d1",),
+                                  (LoadBearingFact("f1", "fact", ("d1",)),), "hand")
+    report = run_fact_recall_eval([entry], page_dir, gather_dir,
+                                  NoopLLM(), NoopLLM(), golden_path=None)
+    assert report.clusters[0].status == "measurement_invalid"
+    assert "driver_crash" in report.clusters[0].errors[0]
+    assert report.scored_fact_count == 0
+    assert report.verdict == "INVALID"

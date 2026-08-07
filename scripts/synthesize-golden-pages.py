@@ -76,6 +76,119 @@ def _pipeline_page_failure(*args, **kwargs):
         raise LLMError(f"pipeline page-validation failure: {exc}") from exc
 
 
+def _synthesize_one(engine, entry: SynthesisClusterEntry, clients: dict[str, Any],
+                     pages_dir: Path, gather_dir: Path, out_dir: Path, *,
+                     seed_k: int, retries: int) -> dict:
+    """One cluster's full attempt loop. Returns the sidecar dict. Any exception
+    escapes -- the caller records it as a crash sidecar (a vanished cluster is
+    worse than a failed one; measured 2026-08-07, twice)."""
+    import hashlib
+
+    started = time.monotonic()
+    row: dict[str, object] = {
+        "cluster_id": entry.id,
+        "topic": entry.topic,
+        "emitted": False,
+        "native_passed": False,
+        "error": None,
+        "gathered_doc_ids": [],
+        "gathered_chunk_ids": [],
+        "gathered_chunk_count": 0,
+        "round_one_count": 0,
+        "round_two_count": 0,
+        "follow_up_queries": [],
+        "repair_iterations": None,
+        "failed_claim_details": [],
+        "page_sha256": None,
+        "attempt_count": 0,
+        "attempts": [],
+        "duration_seconds": None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    for attempt in range(1 + max(0, int(retries))):
+        attempt_started = time.monotonic()
+        row["error"] = None
+        print(f"{entry.id} attempt {attempt + 1}/{1 + max(0, int(retries))} "
+              f"starting {datetime.now(timezone.utc).strftime('%H:%M:%S')}",
+              flush=True)
+        try:
+            result = _pipeline_page_failure(
+                engine, entry.topic,
+                gather_llm=clients["gather"],
+                writer_llm=clients["writer"],
+                repair_llm=clients["repair"],
+                audit_llm=clients["audit"],
+                coverage_llm_a=clients["coverage_a"],
+                coverage_llm_b=clients["coverage_b"],
+                corpus_root=out_dir,
+                seed_k=seed_k,
+                writer_model=str(getattr(clients["writer"], "model", "scripted")),
+                prompt_version="v1",
+                seed_chunks=_seed_chunks(entry),
+            )
+            if result.emitted and result.page_path is not None:
+                _copy_outputs(result.page_path, result.skip_log_path, pages_dir, entry.id)
+            failed_ids = set(result.repair.verdict.failed_claim_ids)
+            row["failed_claim_details"] = [
+                {"id": c.id, "text": c.text,
+                 "citations": [{"doc_id": ct.doc_id, "chunk_id": ct.chunk_id}
+                                for ct in c.citations]}
+                for c in result.repair.page.claims if c.id in failed_ids
+            ]
+            row.update({
+                "emitted": result.emitted,
+                "native_passed": bool(result.repair.passed),
+                "gathered_doc_ids": sorted({chunk.doc_id for chunk in result.gathered.chunks}),
+                "gathered_chunk_ids": sorted({chunk.chunk_id for chunk in result.gathered.chunks}),
+                "gathered_chunk_count": len(result.gathered.chunks),
+                "round_one_count": len(result.gathered.round_one),
+                "round_two_count": len(result.gathered.round_two),
+                "follow_up_queries": list(result.gathered.follow_up_queries),
+                "repair_iterations": result.repair.iterations,
+                "repair_errors": list(result.repair.errors),
+                "final_claim_count": len(result.repair.page.claims),
+                "final_skip_log_count": len(result.repair.page.skip_log),
+                "chunk_accounted": bool(result.repair.verdict.chunk_accounted),
+                "entailment_passed": bool(result.repair.verdict.entailment_passed),
+                "coverage_passed": bool(result.repair.verdict.coverage_passed),
+                "failed_claim_ids": list(result.repair.verdict.failed_claim_ids),
+                "failing_skip_ids": list(result.repair.verdict.failing_skip_ids),
+                "borderline_skip_ids": list(result.repair.verdict.borderline_skip_ids),
+                "judge_errors": list(result.repair.verdict.errors),
+            })
+            attempt_error = None
+        except (LLMError, ChunkAccountingError) as exc:
+            # Expected pipeline failure modes -- a failed page is data, not an
+            # abort. Anything else propagates and is recorded as a crash by the
+            # caller, which keeps the taxonomy honest: pipeline failures are the
+            # pipeline's own bounded failures; crashes are measurement-invalid.
+            row["error"] = f"{type(exc).__name__}: {exc}"
+            attempt_error = row["error"]
+        row["attempts"].append({
+            "attempt": attempt + 1,
+            "emitted": bool(row["emitted"]),
+            "error": attempt_error,
+            "duration_seconds": round(time.monotonic() - attempt_started, 2),
+        })
+        if row["emitted"]:
+            break
+    row["attempt_count"] = len(row["attempts"])
+    row["duration_seconds"] = round(time.monotonic() - started, 2)
+    if row["emitted"] and (pages_dir / f"{entry.id}.md").exists():
+        row["page_sha256"] = hashlib.sha256(
+            (pages_dir / f"{entry.id}.md").read_bytes()).hexdigest()
+    else:
+        row["page_sha256"] = None
+    (gather_dir / f"{entry.id}.gather.json").write_text(
+        json.dumps(row, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    print(f"  {entry.id}: emitted={row['emitted']} native_passed={row['native_passed']} "
+          f"chunks={row['gathered_chunk_count']} "
+          f"repairs={row['repair_iterations']} {row['duration_seconds']}s"
+          + (f"  ERROR: {row['error']}" if row["error"] else ""), flush=True)
+    return row
+
+
 def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: Path,
                             engine, clients: dict[str, Any], *, seed_k: int = 8,
                             retries: int = 0) -> list[dict]:
@@ -89,6 +202,13 @@ def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: P
     failures emitted cleanly on re-run), so each cluster gets up to 1+retries
     attempts; per-attempt outcomes are recorded in the sidecar so the emission
     RATE is measurable rather than a single draw.
+
+    Crash guard: a driver crash mid-cluster records a crash sidecar
+    (emitted=false, error="driver_crash: ..." with traceback) instead of
+    vanishing -- measured 2026-08-07 twice (a cluster in v3 died silently with
+    no sidecar; the evaluator would have dropped its facts entirely). The
+    evaluator maps driver_crash sidecars to measurement_invalid, never to
+    pipeline_failure.
     """
     pages_dir = out_dir / "pages"
     gather_dir = out_dir / "gather"
@@ -96,110 +216,31 @@ def synthesize_golden_pages(entries: Sequence[SynthesisClusterEntry], out_dir: P
     gather_dir.mkdir(parents=True, exist_ok=True)
 
     results: list[dict] = []
+    results_started = time.monotonic()
     for entry in entries:
-        started = time.monotonic()
-        row: dict[str, object] = {
-            "cluster_id": entry.id,
-            "topic": entry.topic,
-            "emitted": False,
-            "native_passed": False,
-            "error": None,
-            "gathered_doc_ids": [],
-            "gathered_chunk_ids": [],
-            "gathered_chunk_count": 0,
-            "round_one_count": 0,
-            "round_two_count": 0,
-            "follow_up_queries": [],
-            "repair_iterations": None,
-            "failed_claim_details": [],
-            "page_sha256": None,
-            "attempt_count": 0,
-            "attempts": [],
-            "duration_seconds": None,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        for attempt in range(1 + max(0, int(retries))):
-            attempt_started = time.monotonic()
-            row["error"] = None
-            try:
-                result = _pipeline_page_failure(
-                    engine, entry.topic,
-                    gather_llm=clients["gather"],
-                    writer_llm=clients["writer"],
-                    repair_llm=clients["repair"],
-                    audit_llm=clients["audit"],
-                    coverage_llm_a=clients["coverage_a"],
-                    coverage_llm_b=clients["coverage_b"],
-                    corpus_root=out_dir,
-                    seed_k=seed_k,
-                    writer_model=str(getattr(clients["writer"], "model", "scripted")),
-                    prompt_version="v1",
-                    seed_chunks=_seed_chunks(entry),
-                )
-                if result.emitted and result.page_path is not None:
-                    _copy_outputs(result.page_path, result.skip_log_path, pages_dir, entry.id)
-                failed_ids = set(result.repair.verdict.failed_claim_ids)
-                row["failed_claim_details"] = [
-                    {"id": c.id, "text": c.text,
-                     "citations": [{"doc_id": ct.doc_id, "chunk_id": ct.chunk_id}
-                                    for ct in c.citations]}
-                    for c in result.repair.page.claims if c.id in failed_ids
-                ]
-                row.update({
-                    "emitted": result.emitted,
-                    "native_passed": bool(result.repair.passed),
-                    "gathered_doc_ids": sorted({chunk.doc_id for chunk in result.gathered.chunks}),
-                    "gathered_chunk_ids": sorted({chunk.chunk_id for chunk in result.gathered.chunks}),
-                    "gathered_chunk_count": len(result.gathered.chunks),
-                    "round_one_count": len(result.gathered.round_one),
-                    "round_two_count": len(result.gathered.round_two),
-                    "follow_up_queries": list(result.gathered.follow_up_queries),
-                    "repair_iterations": result.repair.iterations,
-                    # final-state verdict details: why the loop stopped (diagnostic).
-                    "repair_errors": list(result.repair.errors),
-                    "final_claim_count": len(result.repair.page.claims),
-                    "final_skip_log_count": len(result.repair.page.skip_log),
-                    "chunk_accounted": bool(result.repair.verdict.chunk_accounted),
-                    "entailment_passed": bool(result.repair.verdict.entailment_passed),
-                    "coverage_passed": bool(result.repair.verdict.coverage_passed),
-                    "failed_claim_ids": list(result.repair.verdict.failed_claim_ids),
-                    "failing_skip_ids": list(result.repair.verdict.failing_skip_ids),
-                    "borderline_skip_ids": list(result.repair.verdict.borderline_skip_ids),
-                    "judge_errors": list(result.repair.verdict.errors),
-                })
-                attempt_error = None
-            except (LLMError, ChunkAccountingError) as exc:
-                # Expected pipeline failure modes -- a failed page is data, not an
-                # abort. Anything else (a bug in the driver itself, I/O, assertion
-                # failures) must propagate: recording programmer errors as pipeline
-                # misses conflates "system failed" with "measurement invalid" (Red
-                # review, 2026-08-05; the Path.copy bug was exactly this trap).
-                row["error"] = f"{type(exc).__name__}: {exc}"
-                attempt_error = row["error"]
-            row["attempts"].append({
-                "attempt": attempt + 1,
-                "emitted": bool(row["emitted"]),
-                "error": attempt_error,
-                "duration_seconds": round(time.monotonic() - attempt_started, 2),
-            })
-            if row["emitted"]:
-                break
-        row["attempt_count"] = len(row["attempts"])
-        row["duration_seconds"] = round(time.monotonic() - started, 2)
-        if row["emitted"] and (pages_dir / f"{entry.id}.md").exists():
-            import hashlib
-            row["page_sha256"] = hashlib.sha256(
-                (pages_dir / f"{entry.id}.md").read_bytes()).hexdigest()
-        else:
-            row["page_sha256"] = None
-        (gather_dir / f"{entry.id}.gather.json").write_text(
-            json.dumps(row, indent=2, sort_keys=True) + "\n", encoding="utf-8",
-        )
-        print(f"  {entry.id}: emitted={row['emitted']} native_passed={row['native_passed']} "
-              f"chunks={row['gathered_chunk_count']} "
-              f"repairs={row['repair_iterations']} {row['duration_seconds']}s"
-              + (f"  ERROR: {row['error']}" if row["error"] else ""), flush=True)
-        results.append(row)
+        try:
+            results.append(_synthesize_one(
+                engine, entry, clients, pages_dir, gather_dir, out_dir,
+                seed_k=seed_k, retries=retries))
+        except BaseException as exc:  # noqa: BLE001 -- the crash guard must never miss
+            import traceback
+            row = {
+                "cluster_id": entry.id,
+                "topic": entry.topic,
+                "emitted": False,
+                "native_passed": False,
+                "error": f"driver_crash: {type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+                "attempt_count": 0,
+                "attempts": [],
+                "duration_seconds": round(time.monotonic() - results_started, 2),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            (gather_dir / f"{entry.id}.gather.json").write_text(
+                json.dumps(row, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(f"  {entry.id}: DRIVER CRASH recorded -- {row['error'][:120]}",
+                  flush=True)
+            results.append(row)
     return results
 
 
