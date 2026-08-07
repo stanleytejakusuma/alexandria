@@ -123,21 +123,24 @@ Every gate is a measurement, not an opinion. Phases don't advance because they f
 **Phase-2 status (2026-08-07):** the single-page synthesis core, the
 dual-grader fact-recall evaluator, and the full-sweep orchestrator are all
 merged, with clustering (dedup + topic) and an immutable run manifest in
-place. **Phase-3 status (2026-08-07): the contest gate FAILED — Alexandria stays
-read-only.** Contest run 1 (blinded recall@5, 40 frozen queries, 3 strata,
-dual graders) was INVALID as a contest (grader disagreement 20/40 > 0.20
-pre-registered cap) and disposed as a FAIL on the absolute floor:
-recall@5 0.509 < 0.60, statistical dead heat with the incumbent (0.491;
-Wilson CIs overlap). Per-stratum the gaps are the reversal class (0.38 vs
-0.62 — the phase-2 compound/reversal class confirmed against real queries)
-and operational coverage (3 of 4 ops queries with zero relevant results in
-the union — a corpus-coverage gap). Per the standing honesty rules the
-gate is not re-litigated: no threshold re-tuning, no query-set tuning.
-The path forward is round-4 system fixes (`docs/pi-round4-plan.md`:
-compound-claim splitting, temporal-layering directive, ops coverage), then
-a new pre-registered contest cycle. Full run1 record lives in the private
-corpus; the harness (`scripts/contest-recall.py`) is committed and
-re-runnable. Per-cluster phase-2 details:
+place. **Phase-2 status (2026-08-08): a documented gate waiver stands; the v4
+measurement CONVERGED and the loop is declared stopped per the signed
+loop-termination contract.** v3 remains the certified evidence (frozen full
+set **34/40 = 85%**, prospective stable-topic stratum **34/35 = 97.1%**, Red
+ratified, waiver recorded in `docs/pi-red-verdict-2026-08-07.md`). v4
+(round-4 fixes: clause-targeted repair + temporal-layering directive)
+measured **28/40 = 70% FINAL_FAIL**: it closed the flagged classes where it
+touched them (the temporal-layering cluster went 0.80 → 1.00 with all three
+ship-time limitation clauses stated; the 7-fact cluster reached clean 7/7
+consensus) but did not emit two historically hard clusters (magpie,
+opencode — a single-claim entailment each: `wrong-repo-searched`,
+`initial-stay-leaning`) and the writer omitted two gathered facts. Per the
+convergence stop-rule (<5-point improvement over v3 → declare and stop)
+and Stanley's explicit "no retry-until-success", there is no v5: the
+compound/reversal class is declared a documented product-scope limitation
+(`docs/pi-loop-termination.md` Backlog), the gate stays as-waived, and the
+failure evidence (sidecars, last-page text, adjudications) is preserved in
+the private corpus for any future signed cycle. Per-cluster details:
 [`docs/calibration/synthesis-fact-recall-v3-gate-summary.md`](docs/calibration/synthesis-fact-recall-v3-gate-summary.md)
 and
 [`docs/calibration/synthesis-fact-recall-v3-summary.md`](docs/calibration/synthesis-fact-recall-v3-summary.md)

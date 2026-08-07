@@ -108,6 +108,24 @@ this contract. Enforcement is the written rule, not self-restraint.
 _Empty at signing. Any new failure class discovered after this contract is
 signed gets a dated entry here, signed "no leg"._
 
+### 2026-08-08 — compound/reversal class declared product-scope limitation (signed "no leg")
+
+v4 (round-4 fixes) measured 28/40 = 70% FINAL_FAIL vs v3's 85%: the
+compound blocker moved (opencode's 10-clause `0822-rationale-request` is
+resolved by clause-splitting; the remaining blocker is the single-claim
+`initial-stay-leaning`), and the temporal-layering class closed where the
+directive touched it (the monorepo-git cluster f2, 0.80 → 1.00; the
+7-fact cluster 7/7 consensus). But two clusters failed to emit (the
+fee-attribution saga's `wrong-repo-searched`, the migration-decision saga's
+`initial-stay-leaning`) and the writer omitted two gathered facts
+(vault-bundle f2, key-lifecycle f3). Per the convergence stop-rule (<5-pt
+improvement) and Stanley's "no retry-until-success": **no leg, no v5**.
+The reversal/decision-saga class (single-day decision-and-reversal source
+docs) remains a documented product-scope limitation; evidence (sidecars,
+last-page text, adjudications) is preserved in the private corpus. A
+future cycle requires a new frozen taxonomy + budget + Stanley's sign-off
+on a diff against this file.
+
 ## Signed
 
 Stanley — SIGNED 2026-08-07 ("signed. agree at all of it.") · Pi (kimi k3), 2026-08-07
