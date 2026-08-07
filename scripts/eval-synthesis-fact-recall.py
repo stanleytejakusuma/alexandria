@@ -112,6 +112,8 @@ def replay_report(report: dict, adjudications: dict[str, bool]) -> dict:
             # lists instead of raw verdicts. miss_taxonomy is not mutated
             # (miss fact ids aren't recoverable here) -- pooled counts still
             # recompute exactly, since totals are fixed.
+            total = (len(c.get("consensus_covered") or []) + len(c.get("contested_ids") or [])
+                     + len(c.get("miss_taxonomy") or [])) or 1
             consensus = list(c.get("consensus_covered") or [])
             contested = list(c.get("contested_ids") or [])
             adjudicated_here = 0
@@ -133,7 +135,7 @@ def replay_report(report: dict, adjudications: dict[str, bool]) -> dict:
                     if fid in contested:
                         contested.remove(fid)
                         contested_delta -= 1
-            n = (len(consensus) + len(contested) + len(c.get("miss_taxonomy") or [])) or 1
+            n = total  # fixed before adjudication: the denominator never shrinks
             c = dict(c)
             c["consensus_fact_count"] = len(consensus)
             c["consensus_covered"] = consensus
