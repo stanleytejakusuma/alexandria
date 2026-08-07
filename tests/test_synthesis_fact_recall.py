@@ -125,10 +125,15 @@ def test_parse_rejects_duplicate_json_keys():
         parse_fact_recall_response(raw, ("f1",))
 
 
-def test_parse_rejects_evidence_not_in_page():
-    with pytest.raises(LLMError, match="substring"):
-        parse_fact_recall_response(_resp(_covered("f1", evidence="not in the page")),
-                                   ("f1",), page_body=PAGE)
+def test_parse_flags_evidence_not_in_page_instead_of_raising():
+    """fact-recall-v2 semantics: a covered verdict whose evidence is not a
+    verbatim page span is FLAGGED per-fact (joins adjudication), never a
+    cluster-wide invalidation -- diffuse page statements make verbatim
+    quoting impossible for some genuinely-covered facts."""
+    verdicts = parse_fact_recall_response(_resp(_covered("f1", evidence="not in the page")),
+                                          ("f1",), page_body=PAGE)
+    assert verdicts[0].covered is True
+    assert verdicts[0].error == "evidence_not_verbatim"
 
 
 def test_parse_accepts_whitespace_normalized_evidence():
@@ -911,8 +916,38 @@ def test_grade_fact_recall_retries_paraphrased_evidence_with_hint():
     assert result.raw == good
 
 
-def test_grade_fact_recall_gives_up_after_bounded_retries():
+def test_grade_fact_recall_accepts_flag_after_bounded_retries():
+    """After bounded retries the flagged verdict stands (contested, not
+    invalid): the measurement records it for adjudication instead of
+    excluding the cluster's facts."""
     bad = _resp(_covered("f1", evidence="never verbatim"))
     llm = ScriptedClient([bad, bad, bad])
-    with pytest.raises(LLMError, match="substring"):
-        grade_fact_recall(llm, PAGE, _facts("f1"), evidence_retries=2)
+    result = grade_fact_recall(llm, PAGE, _facts("f1"), evidence_retries=2)
+    assert result.verdicts[0].covered is True
+    assert result.verdicts[0].error == "evidence_not_verbatim"
+
+
+def test_cluster_outcome_flags_evidence_failure_as_contested():
+    """A fact with an evidence-not-verbatim flag from either grader joins the
+    contested list (adjudication required) -- consensus needs BOTH graders'
+    covered verdicts AND verified evidence."""
+    from alexandria.eval.synthesis_fact_recall import FactVerdict, FactRecallAgreement, _cluster_outcome
+    from alexandria.eval.synthesis_golden import LoadBearingFact, SynthesisClusterEntry
+
+    entry = SynthesisClusterEntry("c1", "topic", ("d1",),
+                                  (LoadBearingFact("f1", "the fact", ("d1",)),),
+                                  "hand")
+    flagged = FactVerdict("f1", True, "not in page", error="evidence_not_verbatim")
+    clean = FactVerdict("f1", True, EVIDENCE)
+    agreement = FactRecallAgreement(
+        result_a=type("A", (), {"verdicts": (flagged,), "recall": 1.0,
+                                "model": "x", "errors": (), "raw": ""})(),
+        result_b=type("B", (), {"verdicts": (clean,), "recall": 1.0,
+                                "model": "y", "errors": (), "raw": ""})(),
+        consensus_covered=(), contested_ids=("f1",),
+        consensus_recall=0.0, union_recall=1.0,
+    )
+    consensus, contested, misses = _cluster_outcome(entry, agreement, None, {"d1"})
+    assert consensus == ()
+    assert contested == ("f1",)
+    assert misses == ()

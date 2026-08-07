@@ -102,7 +102,11 @@ VERDICT_INVALID = "INVALID"
 
 # Aggregation semantics version: bump when scoring/verdict rules change so
 # reports from different aggregation versions are never silently compared.
-MANIFEST_VERSION = "fact-recall-v1"
+# v2 (2026-08-07): evidence-not-verbatim facts are flagged per-fact and join
+# the contested/adjudication list instead of invalidating the whole cluster
+# (measured: diffuse page statements make verbatim quoting impossible for some
+# facts, and one such fact was nuking 5 facts out of the denominator).
+MANIFEST_VERSION = "fact-recall-v2"
 
 GRADER_SYSTEM = """You are grading whether a generated knowledge page covers a fixed set of
 hand-curated facts. Grade only what a reader sees in the page text: the prose
@@ -235,10 +239,19 @@ def parse_fact_recall_response(raw: str, expected_ids: tuple[str, ...],
     if page_body:
         page_norm = _normalized(page_body)
         for verdict in verdicts:
-            if verdict.covered and _normalized(verdict.evidence) not in page_norm:
-                raise LLMError(
-                    f"fact-recall grader evidence for {verdict.fact_id!r} is not a "
-                    f"substring of the rendered page body")
+            if (verdict.covered and verdict.error is None
+                    and _normalized(verdict.evidence) not in page_norm):
+                # Per-fact flag, NOT a cluster killer: a diffuse page statement
+                # can make verbatim quoting impossible for a genuinely-covered
+                # fact (measured 2026-08-07). The fact joins the adjudication
+                # list with its evidence retained; strictness holds for every
+                # fact whose evidence DOES verify.
+                verdicts = [
+                    v if v is not verdict else FactVerdict(
+                        v.fact_id, v.covered, v.evidence,
+                        error="evidence_not_verbatim")
+                    for v in verdicts
+                ]
 
     by_id = {v.fact_id: v for v in verdicts}
     return tuple(by_id[fid] for fid in expected_ids)
@@ -265,7 +278,6 @@ def grade_fact_recall(llm, page_text: str, facts: Sequence[LoadBearingFact],
         try:
             verdicts = parse_fact_recall_response(
                 raw, tuple(f.id for f in facts), page_body=page_text)
-            break
         except LLMError as exc:
             if retries >= evidence_retries:
                 raise
@@ -274,9 +286,22 @@ def grade_fact_recall(llm, page_text: str, facts: Sequence[LoadBearingFact],
                     f"Quote evidence spans VERBATIM from the page text -- "
                     f"no paraphrasing, no added punctuation.")
             raw = llm.complete(system, f"{user}\n\n{hint}")
+            continue
+        flagged = [v.fact_id for v in verdicts if v.error == "evidence_not_verbatim"]
+        if flagged and retries < evidence_retries:
+            # A diffuse page statement can make verbatim quoting impossible;
+            # one retry with a hint before accepting the flag (the flagged
+            # fact joins the adjudication list either way).
+            retries += 1
+            hint = (f"Your evidence for {flagged} is not a verbatim page span. "
+                    f"Quote the EXACT page text that states the fact, or mark "
+                    f"it not covered.")
+            raw = llm.complete(system, f"{user}\n\n{hint}")
+            continue
+        break
     n = len(verdicts)
     recall = sum(v.covered for v in verdicts) / n if n else 0.0
-    errors = (f"evidence retried {retries}x",) if retries else ()
+    errors = tuple(f"evidence retried {retries}x" for _ in range(1)) if retries else ()
     return FactRecallResult(grader_model, verdicts, recall, errors, raw=raw)
 
 
@@ -346,10 +371,14 @@ def _cluster_outcome(entry: SynthesisClusterEntry, agreement: FactRecallAgreemen
                 "provisional": False,
             })
             continue
-        a_cov, b_cov = a_by_id[fact.id].covered, b_by_id[fact.id].covered
-        if a_cov and b_cov:
+        a_v, b_v = a_by_id[fact.id], b_by_id[fact.id]
+        a_cov, b_cov = a_v.covered, b_v.covered
+        a_flag = a_v.error == "evidence_not_verbatim"
+        b_flag = b_v.error == "evidence_not_verbatim"
+        if (a_cov and b_cov) and not (a_flag or b_flag):
             consensus.append(fact.id)
-        elif a_cov != b_cov:
+        elif a_cov != b_cov or a_flag or b_flag:
+            # disagreement OR unverifiable evidence: adjudication required
             contested.append(fact.id)
         else:
             misses.append({
