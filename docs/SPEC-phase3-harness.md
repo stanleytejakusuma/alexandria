@@ -141,7 +141,10 @@ per this spec).
 ## 5. Out of scope
 
 - Switching any live harness default off Alexandria (Stanley's call, only
-  after a PASS).
+  after a PASS). Contest run 1 (2026-08-07): INVALID as a contest
+  (disagreement 20/40 > 0.20 cap), disposed as FAIL on the absolute floor
+  (recall@5 0.509 < 0.60). No re-tuning, no re-litigation; the round-4
+  system fixes (`docs/pi-round4-plan.md`) precede any new contest cycle.
 - Graph-structured retrieval — formally re-examined at the phase 3 → 4
   boundary per `docs/DECISIONS-graph-vs-vector.md`, not here.
 - The enterprise/multi-tenant deployment layer (post-phase-4 discussion).

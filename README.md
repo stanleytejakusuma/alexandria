@@ -123,21 +123,26 @@ Every gate is a measurement, not an opinion. Phases don't advance because they f
 **Phase-2 status (2026-08-07):** the single-page synthesis core, the
 dual-grader fact-recall evaluator, and the full-sweep orchestrator are all
 merged, with clustering (dedup + topic) and an immutable run manifest in
-place. **Phase-2 status (2026-08-07):** the single-page synthesis core, the
-dual-grader fact-recall evaluator, and the full-sweep orchestrator are all
-merged, with clustering (dedup + topic) and an immutable run manifest in
-place. **Phase-2 advancement is a DOCUMENTED GATE WAIVER, not a clean
-PASS** (Red review, gpt-5.6-sol, 2026-08-07 — `docs/pi-red-verdict-2026-08-07.md`):
-three numbers published together — frozen full set **34/40 = 85% (FAIL
-vs the ≥90% gate)**, prospective stable-topic stratum **34/35 = 97.1%**, and
-the short-lived decision/reversal stratum reported separately (its
-cluster spans a single calendar day; the exclusion criterion is
-outcome-independent in form but was adopted post hoc; all its golden
-facts verified faithful to source). Round-2 fixes (gather seeding, writer
-qualifier directive) closed the previously-missed classes; the dual-grader
-split narrowed (recall_a 75% vs recall_b 87.5%). The compound-fact
-failure class is the round-4 capability target
-(`docs/pi-round4-plan.md`). Per-cluster details:
+place. **Phase-3 status (2026-08-07): the contest gate FAILED — Alexandria stays
+read-only.** Contest run 1 (blinded recall@5, 40 frozen queries, 3 strata,
+dual graders) was INVALID as a contest (grader disagreement 20/40 > 0.20
+pre-registered cap) and disposed as a FAIL on the absolute floor:
+recall@5 0.509 < 0.60, statistical dead heat with the incumbent (0.491;
+Wilson CIs overlap). Per-stratum the gaps are the reversal class (0.38 vs
+0.62 — the phase-2 compound/reversal class confirmed against real queries)
+and operational coverage (3 of 4 ops queries with zero relevant results in
+the union — a corpus-coverage gap). Per the standing honesty rules the
+gate is not re-litigated: no threshold re-tuning, no query-set tuning.
+The path forward is round-4 system fixes (`docs/pi-round4-plan.md`:
+compound-claim splitting, temporal-layering directive, ops coverage), then
+a new pre-registered contest cycle. Full run1 record lives in the private
+corpus; the harness (`scripts/contest-recall.py`) is committed and
+re-runnable. Per-cluster phase-2 details:
+[`docs/calibration/synthesis-fact-recall-v3-gate-summary.md`](docs/calibration/synthesis-fact-recall-v3-gate-summary.md)
+and
+[`docs/calibration/synthesis-fact-recall-v3-summary.md`](docs/calibration/synthesis-fact-recall-v3-summary.md)
+(anonymized); full reports with evidence and adjudication reasons live in
+the private corpus.
 [`docs/calibration/synthesis-fact-recall-v3-gate-summary.md`](docs/calibration/synthesis-fact-recall-v3-gate-summary.md)
 and
 [`docs/calibration/synthesis-fact-recall-v3-summary.md`](docs/calibration/synthesis-fact-recall-v3-summary.md)
