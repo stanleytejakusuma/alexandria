@@ -123,20 +123,21 @@ Every gate is a measurement, not an opinion. Phases don't advance because they f
 **Phase-2 status (2026-08-07):** the single-page synthesis core, the
 dual-grader fact-recall evaluator, and the full-sweep orchestrator are all
 merged, with clustering (dedup + topic) and an immutable run manifest in
-place. **The gate is certified as a QUALIFIED PASS: 97.1% (34/35) consensus
-recall on the retained topic class (7 clusters)** — the 8th cluster, a
-same-day decision-and-reversal "transitional-window" topic spanning a
-single calendar day, is excluded and reported separately. Honesty note
-(Red review, 2026-08-07): the exclusion criterion is outcome-independent
-in form but was adopted post hoc during v3 analysis — this is a qualified
-pass for the retained class, NOT an unqualified pass of the original
-8-cluster gate (full-set: 85% PROVISIONAL_FAIL). Temporal
-decision/reversal synthesis is explicitly declared OUT OF SCOPE for
-phase-2 certification and tracked as the round-4 capability target
-(`docs/pi-round4-plan.md`); the phase-3 contest will measure that class
-against real queries. Round-2 fixes (gather seeding, writer qualifier
-directive) closed the previously-missed classes; the dual-grader split
-narrowed (recall_a 75% vs recall_b 87.5%). Per-cluster details:
+place. **Phase-2 status (2026-08-07):** the single-page synthesis core, the
+dual-grader fact-recall evaluator, and the full-sweep orchestrator are all
+merged, with clustering (dedup + topic) and an immutable run manifest in
+place. **Phase-2 advancement is a DOCUMENTED GATE WAIVER, not a clean
+PASS** (Red review, gpt-5.6-sol, 2026-08-07 — `docs/pi-red-verdict-2026-08-07.md`):
+three numbers published together — frozen full set **34/40 = 85% (FAIL
+vs the ≥90% gate)**, prospective stable-topic stratum **34/35 = 97.1%**, and
+the short-lived decision/reversal stratum reported separately (its
+cluster spans a single calendar day; the exclusion criterion is
+outcome-independent in form but was adopted post hoc; all its golden
+facts verified faithful to source). Round-2 fixes (gather seeding, writer
+qualifier directive) closed the previously-missed classes; the dual-grader
+split narrowed (recall_a 75% vs recall_b 87.5%). The compound-fact
+failure class is the round-4 capability target
+(`docs/pi-round4-plan.md`). Per-cluster details:
 [`docs/calibration/synthesis-fact-recall-v3-gate-summary.md`](docs/calibration/synthesis-fact-recall-v3-gate-summary.md)
 and
 [`docs/calibration/synthesis-fact-recall-v3-summary.md`](docs/calibration/synthesis-fact-recall-v3-summary.md)
