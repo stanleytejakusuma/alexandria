@@ -19,28 +19,34 @@ from dataclasses import dataclass, field
 __all__ = ["LLMClient", "ScriptedClient", "LLMError"]
 
 
-def _read_with_deadline(r, timeout: int) -> bytes:
-    """Read the full response body under a hard deadline.
+def _open_with_deadline(req, timeout: int) -> bytes:
+    """Perform urlopen + full body read under ONE hard deadline.
 
-    urllib's socket timeout does not bound a stalled STREAM: a proxy that
-    keeps the connection alive while sending nothing (observed live
-    2026-08-07: an unattended synthesis run sat silent ~40min on an idle
-    ESTABLISHED pair) lets r.read() block past any timeout. Run the read
-    on a daemon thread and abandon it at the deadline."""
-    result: list[bytes] = []
+    The socket timeout bounds each syscall, but a gateway that stalls
+    repeatedly (observed live 2026-08-07: v4 leg, 120s-poll cycles for
+    hours with zero output) turns bounded reads into an unbounded retry
+    cycle. Wrapping the entire call means one stall costs exactly one
+    deadline, then raises retryable -- an attempt ends in minutes, not
+    hours. The read runs on a daemon thread and is abandoned at the
+    deadline; the underlying socket is never closed (abandoned threads
+    are harmless, they die with the process)."""
+    result: dict = {}
 
-    def _read() -> None:
+    def work() -> None:
         try:
-            result.append(r.read())
-        except Exception:
-            pass  # the deadline path abandons us anyway
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                result["body"] = r.read()
+        except BaseException as exc:  # propagate urlopen's own error types
+            result["error"] = exc
 
-    worker = threading.Thread(target=_read, daemon=True)
+    worker = threading.Thread(target=work, daemon=True)
     worker.start()
     worker.join(timeout=timeout)
-    if not result:
-        raise TimeoutError(f"response body read exceeded {timeout}s deadline")
-    return result[0]
+    if "error" in result:
+        raise result["error"]
+    if "body" not in result:
+        raise TimeoutError(f"urlopen+read exceeded {timeout}s deadline")
+    return result["body"]
 
 
 class LLMError(RuntimeError):
@@ -140,8 +146,7 @@ class LLMClient:
                      "Authorization": f"Bearer {os.environ.get(self.api_key_env, 'none')}"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                body = json.loads(_read_with_deadline(r, self.timeout))
+            body = json.loads(_open_with_deadline(req, self.timeout))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
             err = LLMError(f"HTTP {exc.code}: {detail}")

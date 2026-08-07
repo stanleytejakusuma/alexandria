@@ -145,28 +145,47 @@ def test_the_nonce_is_actually_unique_per_call():
     assert a != b
 
 
-def test_read_with_deadline_fires_on_silent_stream():
+def test_open_with_deadline_fires_on_silent_stream(monkeypatch):
     """The stall class found 2026-08-07: a connection that stays alive but
-    sends nothing must still hit a hard deadline (urllib's socket timeout
-    does not bound a blocked stream read)."""
+    sends nothing must still hit ONE hard deadline for urlopen+read (socket
+    timeouts turn it into an unbounded retry cycle instead)."""
     import time
-    from alexandria.llm import _read_with_deadline
+    import urllib.request
+    from alexandria import llm as llm_mod
+    from alexandria.llm import _open_with_deadline
 
-    class SilentStream:
+    class SilentResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
         def read(self):
             time.sleep(30)  # never returns data
 
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", lambda req, timeout: SilentResponse())
     started = time.monotonic()
     with pytest.raises(TimeoutError):
-        _read_with_deadline(SilentStream(), timeout=1)
+        _open_with_deadline(urllib.request.Request("http://x"), timeout=1)
     assert time.monotonic() - started < 5
 
 
-def test_read_with_deadline_returns_body():
-    from alexandria.llm import _read_with_deadline
+def test_open_with_deadline_returns_body(monkeypatch):
+    import urllib.request
+    from alexandria import llm as llm_mod
+    from alexandria.llm import _open_with_deadline
 
-    class FastStream:
+    class FastResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
         def read(self):
             return b'{"ok": true}'
 
-    assert _read_with_deadline(FastStream(), timeout=5) == b'{"ok": true}'
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", lambda req, timeout: FastResponse())
+    body = _open_with_deadline(urllib.request.Request("http://x"), timeout=5)
+    assert body == b'{"ok": true}'
