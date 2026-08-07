@@ -286,6 +286,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Diagnostic instrumentation for the recurring silent-vanish (measured
+    # 2026-08-07, three times): the python exits gracefully (~30min into a
+    # cluster) with no traceback, no crash-guard hit, no crash report. Signal
+    # handlers dump the full stack to stderr before dying, converting the next
+    # occurrence into a diagnosable artifact.
+    import faulthandler
+    import signal
+    faulthandler.enable()
+
+    def _dump(signum, _frame):
+        print(f"\nSIGNAL {signum} ({signal.Signals(signum).name}) received -- "
+              f"stack:", flush=True)
+        faulthandler.dump_traceback()
+        raise SystemExit(f"terminated by {signal.Signals(signum).name}")
+
+    signal.signal(signal.SIGTERM, _dump)
+    signal.signal(signal.SIGHUP, _dump)
+    signal.signal(signal.SIGINT, _dump)
     args = build_parser().parse_args(argv)
     if not args.golden.exists():
         print(f"synthesize-golden-pages: golden file not found: {args.golden}", file=sys.stderr)
