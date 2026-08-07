@@ -272,7 +272,9 @@ def grade_fact_recall(llm, page_text: str, facts: Sequence[LoadBearingFact],
     stochastic quote, mirroring the driver's emission-retry doctrine."""
     grader_model = model or str(getattr(llm, "model", "scripted"))
     system, user = build_fact_recall_prompt(page_text, facts)
-    raw = llm.complete(system, user)
+    # temperature=0.1: the llm.py guard refuses fast-tier models (sol/terra)
+    # at temperature=0 (cross-contamination class); nonzero is verified clean.
+    raw = llm.complete(system, user, temperature=0.1)
     retries = 0
     while True:
         try:
@@ -285,7 +287,7 @@ def grade_fact_recall(llm, page_text: str, facts: Sequence[LoadBearingFact],
             hint = (f"Your previous response was rejected: {exc}. "
                     f"Quote evidence spans VERBATIM from the page text -- "
                     f"no paraphrasing, no added punctuation.")
-            raw = llm.complete(system, f"{user}\n\n{hint}")
+            raw = llm.complete(system, f"{user}\n\n{hint}", temperature=0.1)
             continue
         flagged = [v.fact_id for v in verdicts if v.error == "evidence_not_verbatim"]
         if flagged and retries < evidence_retries:
@@ -296,7 +298,7 @@ def grade_fact_recall(llm, page_text: str, facts: Sequence[LoadBearingFact],
             hint = (f"Your evidence for {flagged} is not a verbatim page span. "
                     f"Quote the EXACT page text that states the fact, or mark "
                     f"it not covered.")
-            raw = llm.complete(system, f"{user}\n\n{hint}")
+            raw = llm.complete(system, f"{user}\n\n{hint}", temperature=0.1)
             continue
         break
     n = len(verdicts)

@@ -255,6 +255,45 @@ def test_repair_prompt_demands_support_or_removal_not_regeneration():
     assert "regenerat" in text
 
 
+def test_judge_grades_coverage_at_nonzero_temperature_for_fast_tier_models():
+    """Regression for the 2026-08-07 v4 leg killer: coverage-b was gpt-5.6-terra,
+    and llm.py refuses fast-tier models at temperature=0 -- every cluster failed
+    coverage (judge_errors: 'refusing to call ... at temperature=0'), so nothing
+    could ever emit. The judge's coverage path must forward a nonzero
+    temperature to BOTH graders."""
+    calls = []
+
+    class RecordingClient(ScriptedClient):
+        def complete(self, system, user, temperature=0.0):
+            calls.append(temperature)
+            return super().complete(system, user, temperature)
+
+    gathered = _gathered(
+        SourceChunk("sources/a#1", "sources/a", "Supported evidence.", 0.9),
+        SourceChunk("sources/b#1", "sources/b", "Skipped evidence.", 0.8),
+    )
+    page = SynthesisPage(
+        topic_query="topic",
+        text="Page",
+        claims=(Claim("claim-1", "Supported claim.", (Citation("sources/a", "sources/a#1"),)),),
+        author="synthesis-sweep@writer@v1",
+        skip_log=(
+            {"chunk_id": "sources/b#1", "doc_id": "sources/b", "reason": "out_of_scope:not_cited"},
+        ),
+    )
+    verdict = judge_page(
+        gathered,
+        page,
+        audit_llm=ScriptedClient([_audit_response("supported")]),
+        coverage_llm_a=RecordingClient([json.dumps({"label": "SS", "label_code": "SS:tangential",
+                                                     "claim": "c", "fact": "f", "relation": "r"})]),
+        coverage_llm_b=RecordingClient([json.dumps({"label": "SS", "label_code": "SS:tangential",
+                                                     "claim": "c", "fact": "f", "relation": "r"})]),
+    )
+    assert calls == [0.1, 0.1]
+    assert verdict.coverage_passed is True
+
+
 def test_judge_reports_failed_clauses_for_compound_claims():
     """Round-4 compound-claim splitting: a multi-clause claim failing on ONE
     clause yields a clause-level target, not an all-or-nothing claim failure."""

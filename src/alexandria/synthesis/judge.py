@@ -97,6 +97,12 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
                 page_claims,
                 chunks_by_id[chunk_id].text,
                 f"skip:{chunk_id}",
+                # fast-tier models (sol/terra) are refused at temperature=0 by
+                # llm.py -- measured 2026-08-07: coverage-b terra at default
+                # temp made EVERY cluster fail coverage (can never emit);
+                # nonzero temp is verified clean by the llm.py guard.
+                temperature_a=0.1,
+                temperature_b=0.1,
             )
         except LLMError as exc:
             errors.append(str(exc))
