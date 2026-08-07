@@ -1,0 +1,5 @@
+[
+  {"stratum": "stable", "query": "What command rebuilds the index after adding documents?", "note": "example — replace with your own frozen query set"},
+  {"stratum": "stable", "query": "How does the retrieval layer combine lexical and dense scores?", "note": "example"},
+  {"stratum": "reversal", "query": "What decision was reversed the same day it was made, and why?", "note": "example — reversal stratum must be represented (spec §1.2)"}
+]
