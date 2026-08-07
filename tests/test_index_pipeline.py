@@ -56,17 +56,23 @@ def _records(n):
 
 
 def test_pipeline_overlaps_embed_and_write():
-    """5 batches sequential would take ~5*(embed+write). Overlapped should be close
-    to (5+1)*max(embed, write). Assert the overlapped number, not just 'is fast'."""
+    """The pipeline must run embed (GPU-bound) concurrently with store writes
+    (I/O-bound): some embed interval must overlap some write interval. Asserted
+    via recorded intervals, not wall time -- the old budget (elapsed < 0.75x
+    sequential) failed on GitHub's shared macOS runner where sleeps oversleep
+    (parallel 0.659s vs sequential 0.500s) despite correct concurrency."""
     embedder, store, lexical = SlowEmbedder(0.05), SlowStore(0.05), SlowLexical()
-    started = time.monotonic()
     _run_index_pipeline(_records(20), embedder, store, lexical, batch_size=4,
                         progress_every=1_000_000, progress_stream=None)
-    elapsed = time.monotonic() - started
 
-    sequential_estimate = 5 * (0.05 + 0.05)
-    assert elapsed < sequential_estimate * 0.75, (
-        f"no measurable overlap: {elapsed:.3f}s vs sequential {sequential_estimate:.3f}s")
+    overlap = any(
+        e_start < w_end and w_start < e_end
+        for e_start, e_end in embedder.calls
+        for w_start, w_end, _ in store.calls
+    )
+    assert overlap, (
+        "no embed interval overlapped a store write: the pipeline ran sequentially"
+    )
 
 
 def test_pipeline_writes_every_record_exactly_once():
