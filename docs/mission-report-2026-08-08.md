@@ -1,6 +1,6 @@
 # Alexandria mission report — 2026-08-08 (overnight autonomous run)
 
-Status: IN PROGRESS — v4 leg complete (FINAL_FAIL 28/40, stop-rule declared); contest run 2 in flight.
+Status: COMPLETE — v4 measured and declared (FINAL_FAIL 28/40, stop-rule fired, no v5); contest cycle closed with no verdict; all docs committed.
 
 ## Mission (from Stanley, 2026-08-07 ~23:50 WIB)
 
@@ -47,10 +47,24 @@ compare vs v3-pinned −0.150.
 
 ## Contest run 2 state
 
-RUNNING (job `alx-contest-run2`, launched ~05:1x WIB 2026-08-08). Frozen
-queries (40), seed 20260807, k=5, graders sonnet-5 + gpt-5.6-terra at
-temperature 0.1, corpus = sources + ops docs + v4 wiki (7 pages).
+COMPLETE — **INVALID** (disagreement 0.25 > 0.20 pre-registered cap; SPEC
+§3: run discarded, no verdict recorded). recall@5: Alexandria 0.532 vs
+incumbent 0.468 (+0.065 — margin widened from run 1's +0.018; disagreement
+halved 0.50 → 0.25; floor still unmet 0.53 < 0.60). Cycle closed with no
+contest verdict; Alexandria stays read-only; extension inert; contest
+becomes standing monthly telemetry. Records:
+/tmp/alx/contest-run2/ + private corpus
+`contest-run2-DISPOSITION.md`.
 
+## Mission outcome
+
+DONE within the signed contract's bounds: v4 measured and declared
+(FINAL_FAIL 28/40, convergence stop-rule fired, no v5, backlog entry),
+contest cycle closed (no verdict, stays read-only), all documentation
+committed (public: 422e6cd, 33c5496 + earlier; private corpus: pinned
+reports, adjudications, dispositions). The loop-termination contract was
+honored at every fork — including the two places it cost us progress
+(killed healthy leg, no retry-until-success).
 
 ## Contract checklist (loop-termination, signed 2a5eb09)
 
