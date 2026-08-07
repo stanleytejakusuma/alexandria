@@ -61,3 +61,17 @@ Regression test `test_driver_burns_attempt_on_signal_and_retries` (428
 passed). The 30-min watchdog budget itself was also wrong for round-4
 clause-graded attempts (longest observed attempt is now >30 min); the leg
 relaunch uses the v3-proven 3600s budget.
+
+## Follow-up fix (second root cause, same night, committed d7e4cfa)
+
+The REAL reason clusters 1-2 failed on the relaunch (the 503/entailment
+narrative was a symptom): the judge's coverage grading called
+`llm.complete()` at the default temperature=0, and llm.py REFUSES
+fast-tier models (gpt-5.6-terra) at temperature=0 — so coverage-b could
+never produce a verdict, coverage_passed=False, and no cluster could ever
+emit. Fix: judge.py's grade_skip_twice call and all three fact-recall
+evaluator complete() calls now forward temperature=0.1 (the llm.py guard's
+own documented escape hatch). Regression test
+`test_judge_grades_coverage_at_nonzero_temperature_for_fast_tier_models`
+asserts the coverage path records temperatures [0.1, 0.1]. 429 passed.
+Leg relaunched (job alx-v4-leg-1786125, HEAD d7e4cfa, 00:24 WIB).

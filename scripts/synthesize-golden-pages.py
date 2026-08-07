@@ -111,7 +111,7 @@ def _synthesize_one(engine, entry: SynthesisClusterEntry, clients: dict[str, Any
         attempt_started = time.monotonic()
         row["error"] = None
         print(f"{entry.id} attempt {attempt + 1}/{1 + max(0, int(retries))} "
-              f"starting {datetime.now(timezone.utc).strftime('%H:%M:%S')}",
+              f"starting {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC",
               flush=True)
         try:
             result = _pipeline_page_failure(
