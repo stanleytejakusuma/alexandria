@@ -7,7 +7,9 @@ fewer dependency for a tool whose whole pitch is that your data outlives the eng
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
+import os
 import sys
 import shutil
 import tempfile
@@ -19,6 +21,9 @@ from pathlib import Path
 
 from .config import AppConfig, load_config
 from .corpus import Doc
+from .connectors.inbox import INBOX_META_RE, InboxConnector, parse_inbox_file
+from .connectors.journal import JournalConnector
+from .connectors.md_memory import SEPARATOR, MarkdownMemoryConnector
 from .connectors.pi_sessions import PiSessionsConnector
 from .eval.golden import load_golden, verify_targets
 from .eval.history import append_run, compare, load_runs, regressions
@@ -49,7 +54,7 @@ def cmd_lint(args) -> int:
     errors = checked = 0
     for path in sorted(corpus.rglob("*.md")):
         rel = path.relative_to(corpus)
-        if "_unparsed" in rel.parts or ".alexandria" in rel.parts:
+        if "_unparsed" in rel.parts or ".alexandria" in rel.parts or "inbox" == rel.parts[0]:
             continue
         try:
             doc = Doc.read(path, root=corpus)
@@ -66,29 +71,47 @@ def cmd_lint(args) -> int:
     return 1 if errors else 0
 
 
+def _sync_connector(args):
+    """Build the requested connector (no-LLM connectors skip the gateway)."""
+    corpus = _config_for(args).corpus_path
+    state_dir = corpus / ".alexandria" / "state"
+    if args.connector == "pi-sessions":
+        return PiSessionsConnector(
+            sessions_dir=args.sessions_dir,
+            state_dir=state_dir,
+            llm=LLMClient(base_url=args.base_url, model=args.model),
+        )
+    if args.connector == "markdown-memory":
+        return MarkdownMemoryConnector(
+            memory_dir=args.memory_dir or str(Path.home() / ".pi/agent/memory"),
+            projects_dir=args.projects_dir or None,
+        )
+    if args.connector == "inbox":
+        return InboxConnector(inbox_dir=corpus / "inbox")
+    if args.connector == "journal":
+        return JournalConnector(journal_path=args.journal_path)
+    print(f"unknown connector: {args.connector}", file=sys.stderr)
+    return None
+
+
 def cmd_sync(args) -> int:
 
-    if args.connector != "pi-sessions":
-        print(f"unknown connector: {args.connector}", file=sys.stderr)
+    conn = _sync_connector(args)
+    if conn is None:
         return 2
-
     corpus = _config_for(args).corpus_path
-    conn = PiSessionsConnector(
-        sessions_dir=args.sessions_dir,
-        state_dir=corpus / ".alexandria" / "state",
-        llm=LLMClient(base_url=args.base_url, model=args.model),
-    )
     items = conn.discover()
     if args.limit:
         items = items[: args.limit]
-    print(f"discovered {len(items)} burst(s); {len(conn.skip_log())} skipped")
+    skipped = getattr(conn, "skip_log", lambda: [])()
+    print(f"discovered {len(items)} burst(s); {len(skipped)} skipped")
     if args.dry_run:
         for item in items[:20]:
-            print(f"  {item.source_id}  {len(item.content):>7,}ch  "
-                  f"part {item.meta['part']}/{item.meta['parts']}")
+            print(f"  {item.source_id}  {len(item.content):>7,}ch")
         return 0
 
-    # Distillation is network-bound, so a small pool turns hours into minutes.
+    # Distillation is network-bound (pi-sessions), so a small pool turns hours
+    # into minutes; no-LLM connectors are trivially fast under the same loop.
     # normalize() is pure (call + parse); writes and state stay on the main thread
     # because StateStore is not thread-safe and correctness beats a few more workers.
     written = done = failed = 0
@@ -122,6 +145,40 @@ def cmd_sync(args) -> int:
         print(f"  error: {err}", file=sys.stderr)
     if len(conn.errors) > 10:
         print(f"  ... and {len(conn.errors)-10} more", file=sys.stderr)
+    return 0
+
+
+def cmd_remember(args) -> int:
+    """Append a user-confirmed memory to the inbox (the only explicit write
+    surface; promoted into sources/ by `sync inbox`)."""
+    corpus = _config_for(args).corpus_path
+    inbox_dir = corpus / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    today = _dt.date.today().isoformat()
+    path = inbox_dir / f"{today}.md"
+
+    text = args.text.strip()
+    if not text:
+        print("remember: empty text", file=sys.stderr)
+        return 2
+    existing = parse_inbox_file(path) if path.exists() else []
+    if any(e.text == text for e in existing):
+        print("already in inbox; nothing appended")
+        return 0
+
+    meta = f"created={today}, last={today}"
+    if args.from_:
+        meta += f", from={args.from_}"
+    if args.session:
+        meta += f", session={args.session}"
+    if args.corrects:
+        meta += f", corrects={args.corrects}"
+    entry = f"{text}\n\n<!-- {meta} -->"
+    with path.open("a", encoding="utf-8") as fh:
+        if path.stat().st_size > 0:
+            fh.write(f"\n{SEPARATOR}\n")
+        fh.write(entry + "\n")
+    print(f"remembered -> inbox/{path.name}")
     return 0
 
 
@@ -489,12 +546,28 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("sync", help="pull + distil from a connector")
     s.add_argument("connector")
     s.add_argument("--sessions-dir", default=str(Path.home() / ".pi/agent/sessions"))
+    s.add_argument("--memory-dir", default=os.environ.get("ALEXANDRIA_MEMORY_DIR", ""),
+                  help="harness memory store dir (markdown-memory)")
+    s.add_argument("--projects-dir", default="")
+    s.add_argument("--journal-path",
+                   default=str(Path.home() / "citadel/personal-finance/accountability.md"))
     s.add_argument("--base-url", default="http://127.0.0.1:20128/v1")
     s.add_argument("--model", default="claude-haiku-4-5")
     s.add_argument("--limit", type=int, default=0)
     s.add_argument("--workers", type=int, default=6)
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_sync)
+
+    remember = sub.add_parser("remember",
+                              help="append a user-confirmed memory to the inbox")
+    remember.add_argument("text")
+    remember.add_argument("--from", dest="from_", default="pi",
+                          help="harness provenance (default pi)")
+    remember.add_argument("--session", default="",
+                          help="session id for provenance")
+    remember.add_argument("--corrects", default="",
+                          help="source_id this entry corrects/supersedes")
+    remember.set_defaults(func=cmd_remember)
 
     lint = sub.add_parser("lint", help="validate every document against the schema")
     lint.set_defaults(func=cmd_lint)

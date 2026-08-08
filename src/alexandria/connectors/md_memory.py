@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..corpus import Doc, slugify, source_filename
-from .base import RawItem
+from .base import NoStateMixin, RawItem
 
 __all__ = ["MarkdownMemoryConnector", "Entry", "parse_store", "STORE_KINDS"]
 
@@ -75,7 +75,7 @@ def parse_store(path: Path, project: str = "") -> list[Entry]:
     return out
 
 
-class MarkdownMemoryConnector:
+class MarkdownMemoryConnector(NoStateMixin):
     name = "markdown-memory"
 
     def __init__(self, memory_dir, projects_dir=None,

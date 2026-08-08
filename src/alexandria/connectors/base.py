@@ -30,6 +30,19 @@ class Connector(Protocol):
     def normalize(self, item: RawItem) -> list: ...
 
 
+class NoStateMixin:
+    """For connectors whose idempotency comes from content-derived ids:
+    re-discovery is a no-op, so there is no state to commit."""
+
+    errors: list = []
+
+    def skip_log(self) -> list:
+        return []
+
+    def commit(self, items) -> None:
+        pass
+
+
 class StateStore:
     """JSON-backed connector state. Corruption is survivable: a lost state file
     means re-discovery, and re-discovery is idempotent by design."""
