@@ -9,7 +9,8 @@ def test_logger_appends_and_summarizes(tmp_path):
     corpus = tmp_path / "corpus"
     logger = AuditLogger(corpus)
     logger.answer(query="what happened", total_ms=1200, emitted=True,
-                  model="m", n_claims=3)
+                  model="m", n_claims=3,
+                  stages={"retrieve": 100, "augment": 200, "generate": 300})
     logger.answer(query="bad one", total_ms=99, emitted=False, model="m",
                   failed_claims=["c1"], error="native checks")
     logger.sync(connector="journal", duration_ms=42, discovered=2,
@@ -18,6 +19,7 @@ def test_logger_appends_and_summarizes(tmp_path):
     assert "answers: 2 recent" in summary
     assert "sync: 1 recent" in summary
     assert "emitted=True claims=3" in summary
+    assert "retr=100ms aug=200ms gen=300ms" in summary
     assert "emitted=False" in summary and "err=native checks" in summary
     assert "commit=2" in summary
     # rows are JSONL, one per line

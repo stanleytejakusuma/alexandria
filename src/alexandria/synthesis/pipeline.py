@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..corpus import render, slugify
@@ -22,6 +23,20 @@ class PipelineResult:
     emitted: bool
     page_path: Path | None
     skip_log_path: Path | None
+    timings_ms: dict[str, int] = field(default_factory=dict)
+
+
+# Stage mapping for the audit trail: the user-visible names are
+# retrieve (gather: query + pool building over the index),
+# augment (write: prompt+page assembly),
+# generate (repair: judge + repair + coverage loops).
+_STAGES = ("retrieve", "augment", "generate")
+
+
+def _timed(fn, *args, **kwargs) -> tuple[object, int]:
+    t0 = time.perf_counter()
+    out = fn(*args, **kwargs)
+    return out, int((time.perf_counter() - t0) * 1000)
 
 
 def run_pipeline(engine, topic_query: str, *, gather_llm, writer_llm, repair_llm, audit_llm,
@@ -36,27 +51,21 @@ def run_pipeline(engine, topic_query: str, *, gather_llm, writer_llm, repair_llm
         raise ValueError("writer and entailment grader must be different clients")
     if coverage_llm_a is coverage_llm_b:
         raise ValueError("coverage grading requires two independent clients")
-    gathered = gather(engine, topic_query, llm=gather_llm, seed_k=seed_k,
-                      seed_chunks=seed_chunks)
-    page = write_page(
-        gathered,
-        topic_query,
-        llm=writer_llm,
-        model=writer_model,
-        prompt_version=prompt_version,
-    )
-    repair = repair_until_done(
-        gathered,
-        page,
-        repair_llm=repair_llm,
-        audit_llm=audit_llm,
-        coverage_llm_a=coverage_llm_a,
-        coverage_llm_b=coverage_llm_b,
-    )
+    timings: dict[str, int] = {}
+    gathered, timings["retrieve"] = _timed(
+        gather, engine, topic_query, llm=gather_llm, seed_k=seed_k,
+        seed_chunks=seed_chunks)
+    page, timings["augment"] = _timed(
+        write_page, gathered, topic_query, llm=writer_llm, model=writer_model,
+        prompt_version=prompt_version)
+    repair, timings["generate"] = _timed(
+        repair_until_done, gathered, page, repair_llm=repair_llm,
+        audit_llm=audit_llm, coverage_llm_a=coverage_llm_a,
+        coverage_llm_b=coverage_llm_b)
     if not repair.passed:
-        return PipelineResult(gathered, repair, False, None, None)
+        return PipelineResult(gathered, repair, False, None, None, timings)
     page_path, skip_log_path = _emit(repair.page, corpus_root)
-    return PipelineResult(gathered, repair, True, page_path, skip_log_path)
+    return PipelineResult(gathered, repair, True, page_path, skip_log_path, timings)
 
 
 def _emit(page: SynthesisPage, corpus_root: str | Path) -> tuple[Path, Path]:

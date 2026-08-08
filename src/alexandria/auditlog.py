@@ -40,12 +40,13 @@ class AuditLogger:
 
     def answer(self, *, query: str, total_ms: int, emitted: bool,
                model: str, n_claims: int = 0, failed_claims: list[str] | None = None,
-               error: str = "") -> None:
+               error: str = "", stages: dict[str, int] | None = None) -> None:
         self._append("answers", {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "kind": "answer", "query": query, "total_ms": total_ms,
             "emitted": emitted, "model": model, "n_claims": n_claims,
             "failed_claims": failed_claims or [], "error": error,
+            "stages": stages or {},
         })
 
     def sync(self, *, connector: str, duration_ms: int, discovered: int,
@@ -74,9 +75,13 @@ def audit_summary(corpus: Path, last: int = 200) -> str:
         lines.append(f"{name}: {len(rows)} recent of {path.stat().st_size} bytes")
         for r in rows[-8:]:
             if r["kind"] == "answer":
+                st = r.get("stages") or {}
+                stages = (f"  retr={st.get('retrieve')}ms aug={st.get('augment')}ms "
+                          f"gen={st.get('generate')}ms") if st else ""
                 lines.append(
                     f"  {r['ts']} answer {r['total_ms']}ms emitted={r['emitted']} "
                     f"claims={r['n_claims']} model={r['model']} q={r['query'][:50]!r}"
+                    + stages
                     + (f" err={r['error'][:60]}" if r["error"] else ""))
             else:
                 lines.append(

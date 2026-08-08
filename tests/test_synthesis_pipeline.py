@@ -121,6 +121,9 @@ def test_passing_pipeline_emits_page_and_skip_log_with_attribution_seams(tmp_pat
     assert result.repair.iterations == 0
     assert result.page_path == tmp_path / "wiki" / "topic.md"
     assert result.skip_log_path == tmp_path / "wiki" / "topic.skip-log.json"
+    # per-stage audit timings: all three stages measured
+    assert set(result.timings_ms) == {"retrieve", "augment", "generate"}
+    assert all(v >= 0 for v in result.timings_ms.values())
     assert "author: synthesis-sweep@writer-model@v2" in result.page_path.read_text()
     assert json.loads(result.skip_log_path.read_text()) == {
         "author": "synthesis-sweep@writer-model@v2",

@@ -355,7 +355,8 @@ def cmd_answer(args) -> int:
         logger.answer(query=args.question, total_ms=total_ms, emitted=False,
                       model=args.llm_model, n_claims=n_claims,
                       failed_claims=list(failed_ids),
-                      error="synthesis failed its native checks")
+                      error="synthesis failed its native checks",
+                      stages=getattr(result, "timings_ms", {}))
         print("answer: synthesis failed its native checks; no page emitted.",
               file=sys.stderr)
         for claim in (page.claims if page else []):
@@ -364,7 +365,8 @@ def cmd_answer(args) -> int:
         return 1
     page_text = result.page_path.read_text(encoding="utf-8")
     logger.answer(query=args.question, total_ms=total_ms, emitted=True,
-                  model=args.llm_model, n_claims=n_claims)
+                  model=args.llm_model, n_claims=n_claims,
+                  stages=getattr(result, "timings_ms", {}))
     print(page_text)
     if not save_dir:
         shutil.rmtree(emit_root, ignore_errors=True)
