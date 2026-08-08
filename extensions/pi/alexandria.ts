@@ -4,10 +4,12 @@ import { Type } from "typebox";
 /**
  * Alexandria memory tools for Pi (SPEC-phase3-harness.md deliverable 1.1).
  *
- * INERT BY DESIGN: per the phase-3 spec, nothing switches until the blinded
- * side-by-side gate passes. This file is the shipped source; install it at
- * ~/.pi/agent/extensions/alexandria.ts ONLY after a PASS verdict (Stanley's
- * call), or earlier for test-only sessions with the caveat recorded.
+ * ACTIVATED READ-ONLY 2026-08-08 per principal decision (docs/
+ * pi-activation-decision-2026-08-08.md; README phase-3 status). This file is
+ * the generic public source; the live install is a private copy at
+ * ~/.pi/agent/extensions/alexandria.ts with machine-local paths, a
+ * quoted-tilde fix (HOME expansion), a keychain lookup for the gateway key,
+ * and the measurement-proven answer config (sonnet-5 + gpt-5.6-terra).
  *
  * Config via environment:
  *   ALEXANDRIA_CORPUS  corpus path (default ~/alexandria-corpus)

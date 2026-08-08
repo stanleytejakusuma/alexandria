@@ -146,7 +146,14 @@ recording for telemetry: margin widened (+0.018 → +0.065), disagreement
 halved (0.50 → 0.25), floor still unmet (0.53). Per the signed
 loop-termination contract no run 3 exists this cycle; Alexandria stays
 opt-in/read-only, the Pi extension remains inert, and the contest becomes
-standing monthly telemetry under the same frozen mechanics. Full records
+standing monthly telemetry under the same frozen mechanics. **Activation
+decision 2026-08-08 (principal, recorded in
+`docs/pi-activation-decision-2026-08-08.md`): the Pi extension is LIVE in
+read-only mode** (`alexandria-search` + `alexandria-answer`, installed at
+`~/.pi/agent/extensions/alexandria.ts` as a private copy with machine-local
+config) while certification continues via the telemetry loop; any
+write-capable surface (ingestion connectors, sync, distil) stays gated on a
+valid PASS with no override without a new recorded decision. Full records
 in the private corpus. Per-cluster phase-2 details:
 [`docs/calibration/synthesis-fact-recall-v3-gate-summary.md`](docs/calibration/synthesis-fact-recall-v3-gate-summary.md)
 and
