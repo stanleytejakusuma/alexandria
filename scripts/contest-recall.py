@@ -328,9 +328,9 @@ def main() -> int:
     p.add_argument("--base-url", default=os.environ.get("ALEXANDRIA_BASE_URL", "http://127.0.0.1:20128/v1"),
                     help="gateway base URL (set ALEXANDRIA_BASE_URL to the remote gateway at run time)")
     p.add_argument("--api-key-env", default="ALEXANDRIA_AXIOM_KEY")
-    p.add_argument("--grader-a-model", default="openrouter/anthropic/claude-sonnet-5")
-    p.add_argument("--grader-b-model", default="deepseek-v4-pro")
-    p.add_argument("--adjudicator-model", default="openrouter/openai/gpt-5.6-sol")
+    p.add_argument("--grader-a-model", default="openrouter/openai/gpt-5.6-terra-pro-xhigh")
+    p.add_argument("--grader-b-model", default="openrouter/openai/gpt-5.6-terra")
+    p.add_argument("--adjudicator-model", default="openrouter/openai/gpt-5.6-sol-pro-xhigh")
     p.add_argument("--dry-run", action="store_true", help="scripted graders, no spend")
     p.add_argument("--resume", action="store_true", help="reuse completed stages in --out")
     args = p.parse_args()
