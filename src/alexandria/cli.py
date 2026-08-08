@@ -357,13 +357,14 @@ def cmd_answer(args) -> int:
     failed_ids = getattr(verdict, "failed_claim_ids", ()) or ()
     page = getattr(result.repair, "page", None)
     n_claims = len(page.claims) if page else 0
+    trace = _answer_trace(result)
     if not result.emitted:
         logger.answer(query=args.question, total_ms=total_ms, emitted=False,
                       model=args.llm_model, n_claims=n_claims,
                       failed_claims=list(failed_ids),
                       error="synthesis failed its native checks",
                       stages=getattr(result, "timings_ms", {}),
-                      caller=args.caller, user=args.user)
+                      caller=args.caller, user=args.user, trace=trace)
         print("answer: synthesis failed its native checks; no page emitted.",
               file=sys.stderr)
         for claim in (page.claims if page else []):
@@ -374,11 +375,39 @@ def cmd_answer(args) -> int:
     logger.answer(query=args.question, total_ms=total_ms, emitted=True,
                   model=args.llm_model, n_claims=n_claims,
                   stages=getattr(result, "timings_ms", {}),
-                  caller=args.caller, user=args.user)
+                  caller=args.caller, user=args.user, trace=trace)
     print(page_text)
     if not save_dir:
         shutil.rmtree(emit_root, ignore_errors=True)
     return 0
+
+
+def _answer_trace(result) -> dict:
+    """The route one answer took: retrieval rounds -> augmentation pool ->
+    synthesis outcome. Stored in the audit row so the route can be mapped."""
+    gathered = getattr(result, "gathered", None)
+    repair = getattr(result, "repair", None)
+    trace: dict = {"rounds": [], "pool": [], "cited": [], "claims": 0,
+                   "iterations": 0}
+    if gathered is not None:
+        for name in ("round_one", "round_two"):
+            chunks = getattr(gathered, name, ()) or ()
+            trace["rounds"].append(
+                [[c.chunk_id, round(c.score, 4)] for c in chunks[:8]])
+        trace["pool"] = [c.doc_id for c in (gathered.chunks or ())][:16]
+        trace["follow_ups"] = list(getattr(gathered, "follow_up_queries", ()) or ())[:4]
+    if repair is not None:
+        rpage = getattr(repair, "page", None)
+        if rpage is not None:
+            cited: list[str] = []
+            for claim in rpage.claims:
+                for citation in getattr(claim, "citations", ()) or ():
+                    if citation.doc_id not in cited:
+                        cited.append(citation.doc_id)
+            trace["cited"] = cited[:16]
+            trace["claims"] = len(rpage.claims)
+            trace["iterations"] = getattr(repair, "iterations", 0)
+    return trace
 
 
 def cmd_wiki_site(args) -> int:
@@ -391,7 +420,8 @@ def cmd_wiki_site(args) -> int:
     if not wiki.is_dir():
         print(f"wiki-site: no wiki dir at {wiki}", file=sys.stderr)
         return 2
-    slugs = render_site(wiki, args.out)
+    slugs = render_site(wiki, args.out,
+                        audit_dir=config.corpus_path / ".alexandria" / "audit")
     print(f"wiki-site: {len(slugs)} page(s) rendered to {args.out}")
     return 0
 

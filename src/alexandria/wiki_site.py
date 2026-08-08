@@ -9,6 +9,7 @@ fresh-clone test's requirement is that the site renders anywhere, forever.
 from __future__ import annotations
 
 import html
+import json
 import re
 from pathlib import Path
 
@@ -57,6 +58,14 @@ hr{border:none;border-top:1px solid var(--line);margin:2rem 0}
 .tags{display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.8rem}
 .tag{background:var(--code-bg);border:1px solid var(--line);color:var(--muted);
   border-radius:999px;padding:.1rem .6rem;font-size:.78rem}
+.route{margin-top:.5rem;padding:.5rem .6rem;border:1px solid var(--line);
+  border-radius:8px;font-size:13px;color:var(--muted)}
+.route b{color:var(--accent)}
+.stage{margin-top:.4rem}
+.hit{display:flex;align-items:center;gap:.4rem;margin-top:2px}
+.bar{display:inline-block;height:6px;background:var(--accent);opacity:.7;
+  border-radius:3px;flex:0 0 80px}
+.audit li{margin:.7rem 0}
 """
 
 
@@ -202,6 +211,8 @@ def render_site(wiki_dir: Path, out_dir: Path, audit_dir: Path | None = None) ->
         f"{cards}</div></body></html>"
     )
     (out / "index.html").write_text(index_html, encoding="utf-8")
+    if audit_dir is not None:
+        render_audit(audit_dir, out)
     return [slug for slug, _, _ in entries]
 
 
@@ -216,6 +227,7 @@ def _audit_card(audit_dir: Path) -> str:
 
 def render_audit(audit_dir: Path, out_dir: Path) -> None:
     """Render an audit.html page from the pipeline audit JSONL logs."""
+    out = Path(out_dir)
     rows: list[dict] = []
     for name in ("answers", "sync"):
         path = Path(audit_dir) / f"{name}.jsonl"
@@ -240,7 +252,9 @@ def render_audit(audit_dir: Path, out_dir: Path) -> None:
                 f"model={html.escape(r['model'])}"
                 + (f" <span class=\"tag\">{stages}</span>" if stages else "")
                 + (f"<br>err: {html.escape(r['error'])}" if r.get("error") else "")
-                + f"<br><em>{html.escape(r['query'])}</em></li>")
+                + f"<br><em>{html.escape(r['query'])}</em>"
+                + _route_map(r.get("trace") or {})
+                + "</li>")
         else:
             items.append(
                 f"<li><strong>sync</strong> {html.escape(r['ts'])} "
@@ -250,8 +264,38 @@ def render_audit(audit_dir: Path, out_dir: Path) -> None:
     body = (
         f"<p class=\"meta\">{len(rows)} row(s) &middot; "
         "<code>.alexandria/audit/</code></p>"
-        + (f"<ul>{''.join(items)}</ul>" if items else "<p>no rows yet</p>")
+        + (f"<ul class=\"audit\">{''.join(items)}</ul>" if items else "<p>no rows yet</p>")
     )
     (out / "audit.html").write_text(
         _page("Pipeline audit", body, "audit"), encoding="utf-8")
     return None
+
+
+def _route_map(trace: dict) -> str:
+    """Inline route map for one answer: retrieval rounds -> pool -> cited."""
+    if not trace:
+        return ""
+    parts: list[str] = []
+    rounds = trace.get("rounds") or []
+    if rounds:
+        for label, hits in zip(("round 1", "round 2"), rounds):
+            bars = "".join(
+                f"<div class=\"hit\"><span class=\"bar\" style=\"width:{max(score, 0) * 100:.0f}%\"></span>"
+                f"<code title={html.escape(cid)}>{html.escape(cid[:60])}</code></div>"
+                for cid, score in hits if score)
+            if bars:
+                parts.append(f"<div class=\"stage\">{label}{bars}</div>")
+    pool = trace.get("pool") or []
+    if pool:
+        chips = " ".join(
+            f"<code title={html.escape(d)}>{html.escape(d.rsplit('/', 1)[-1][:40])}</code>"
+            for d in pool[:12])
+        parts.append(f"<div class=\"stage\">pool ({len(pool)}) {chips}</div>")
+    cited = trace.get("cited") or []
+    if cited:
+        chips = " ".join(
+            f"<code title={html.escape(d)}>{html.escape(d.rsplit('/', 1)[-1][:40])}</code>"
+            for d in cited[:12])
+        parts.append(f"<div class=\"stage\">cited ({len(cited)}) {chips}</div>")
+    meta = f"claims={trace.get('claims')} iterations={trace.get('iterations')}"
+    return f"<div class=\"route\"><b>route</b> {meta}{''.join(parts)}</div>"
