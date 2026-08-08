@@ -30,6 +30,15 @@ echo "### sync pi-sessions" >> "$DIGEST"
   --base-url "$BASE_URL" --model deepseek-v4-flash --workers 6 \
   >> "$DIGEST" 2>&1 || echo "sync FAILED (see above)" >> "$DIGEST"
 
+echo "### sync journal (accountability digest)" >> "$DIGEST"
+"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" sync journal \
+  --journal-path "$HOME/citadel/personal-finance/accountability.md" \
+  >> "$DIGEST" 2>&1 || echo "journal sync FAILED" >> "$DIGEST"
+
+echo "### sync inbox (explicit memories)" >> "$DIGEST"
+"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" sync inbox \
+  >> "$DIGEST" 2>&1 || echo "inbox sync FAILED" >> "$DIGEST"
+
 echo "### query-log review (7d)" >> "$DIGEST"
 "$REPO/.venv/bin/python" "$REPO/scripts/query-log-review.py" --corpus "$CORPUS" --since 7 \
   >> "$DIGEST" 2>&1 || echo "review FAILED" >> "$DIGEST"
