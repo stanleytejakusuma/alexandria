@@ -2,18 +2,22 @@
 """Phase-3 contest harness: blinded recall@5, Alexandria vs incumbent.
 
 Pre-registered protocol: docs/SPEC-phase3-harness.md (revised 2026-08-07
-against the Red review conditions). Stages are checkpointed under --out:
+against the Red review conditions) + docs/pi-contest-cycle2-amendment.md
+(2026-08-08, signed): grader disagreements are ADJUDICATED (third grader)
+instead of discarded; runs still INVALID when >40% of queries disagree.
+Stages are checkpointed under --out:
   01-<sys>.jsonl   raw retrieval per query (system A: alexandria, B: incumbent)
   02-blind.jsonl   per-query union, shuffled (fixed seed), ids redacted
   03-graded.jsonl  two-grader relevance verdicts (batched per query)
+  03b-adjudicated.jsonl  cycle-2: disagreements resolved by the adjudicator
   04-report.json   recall@5 per system, Wilson CI, strata, verdict, manifest
 
 Verdict rules (spec §1.2/§3): PASS iff alexandria recall > incumbent recall
 (tie = |Δ| <= 1 relevant doc -> one pre-registered re-run, then FAIL), floor
->= 0.60, and grader disagreement <= 0.20 of queries. INVALID on manifest
-mismatch (--queries file changed), spend over budget, or any rerun not
-pre-registered. Any infra failure (gateway timeout, crash) aborts with
-INVALID unless --resume re-runs cleanly and the failure is logged.
+>= 0.60, and grader disagreement <= 0.40 of queries (cycle-2 cap). INVALID
+on manifest mismatch (--queries file changed), spend over budget, or any
+rerun not pre-registered. Any infra failure (gateway timeout, crash) aborts
+with INVALID unless --resume re-runs cleanly and the failure is logged.
 
 Cost guard: bounded runs; each grader call grades a whole query's union
 (2 LLM calls per query, ~N*2 calls per run).
@@ -26,6 +30,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -35,7 +40,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-DISAGREEMENT_CAP = 0.20
+DISAGREEMENT_CAP = 0.40  # cycle-2 amendment: <=40% adjudicated, >40% INVALID
 FLOOR = 0.60
 
 
@@ -115,6 +120,19 @@ GRADER_SYSTEM = ("You are a retrieval relevance grader. Judge each result: "
 GRADER_PROMPT = ("QUERY: {query}\n\n"
                  "RESULTS:\n{results}")
 
+ADJUDICATOR_SYSTEM = ("You are the final relevance adjudicator. Two graders "
+                      "disagreed on which results are relevant to the query. "
+                      "Decide relevance yourself: is each result RELEVANT to "
+                      "the query (does it contain the answer/fact the query "
+                      "demands)? Partial support counts when it answers the "
+                      "query's operative verb; agnostic/opinion answers are NOT "
+                      "relevant. Reply with ONLY a JSON object mapping each "
+                      "result number to yes or no.")
+ADJUDICATOR_PROMPT = ("QUERY: {query}\n\n"
+                      "RESULTS:\n{results}\n\n"
+                      "GRADER A says: {va}\n"
+                      "GRADER B says: {vb}")
+
 
 def _parse_verdicts(text: str) -> dict[str, bool]:
     start = text.find("{")
@@ -155,9 +173,28 @@ def wilson_ci(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return ((c - h) / d, (c + h) / d)
 
 
+def adjudicate_query(client, query, results, va, vb, *, retries=2):
+    body = "\n".join(f"{i + 1}. {r['text'][:1200]}" for i, r in enumerate(results))
+    va_s = ", ".join(f"{n}: {'yes' if va[n] else 'no'}" for n in sorted(va))
+    vb_s = ", ".join(f"{n}: {'yes' if vb[n] else 'no'}" for n in sorted(vb))
+    prompt = ADJUDICATOR_PROMPT.format(query=query, results=body, va=va_s, vb=vb_s)
+    last = None
+    for _ in range(retries + 1):
+        try:
+            text = client.complete(ADJUDICATOR_SYSTEM, prompt, temperature=0.1)
+            verdicts = _parse_verdicts(text)
+            if set(verdicts) == {str(i + 1) for i in range(len(results))}:
+                return verdicts
+            last = ValueError(f"missing verdicts: {sorted(verdicts)}")
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise RuntimeError(f"adjudication failed for query {query!r}: {last}")
+
+
 def score_run(graded: list[dict[str, Any]]) -> dict[str, Any]:
     a_hit = a_rel = i_hit = i_rel = 0
     disagree_queries = 0
+    adjudicated_queries = 0
     rows = []
     for g in graded:
         relevant = {r["num"] for r in g["results"] if r["relevant"]}
@@ -168,6 +205,8 @@ def score_run(graded: list[dict[str, Any]]) -> dict[str, Any]:
         vb = {r["num"]: r["grader_b"] for r in g["results"]}
         if any(va[n] != vb[n] for n in va if n in vb):
             disagree_queries += 1
+        if any(r.get("adjudicated") is not None for r in g["results"]):
+            adjudicated_queries += 1
         n_rel = len(relevant)
         if n_rel == 0:
             rows.append({"query": g["query"], "stratum": g["stratum"],
@@ -178,7 +217,9 @@ def score_run(graded: list[dict[str, Any]]) -> dict[str, Any]:
         a_hit += len(a_relevant); a_rel += n_rel
         i_hit += len(i_relevant); i_rel += n_rel
         rows.append({"query": g["query"], "stratum": g["stratum"], "relevant": n_rel,
-                     "alexandria": round(ar, 4), "incumbent": round(ir, 4)})
+                     "alexandria": round(ar, 4), "incumbent": round(ir, 4),
+                     "adjudicated": [r["num"] for r in g["results"]
+                                      if r.get("adjudicated") is not None]})
 
     a_recall = a_hit / a_rel if a_rel else 0.0
     i_recall = i_hit / i_rel if i_rel else 0.0
@@ -215,6 +256,7 @@ def score_run(graded: list[dict[str, Any]]) -> dict[str, Any]:
         "floor_ok": floor_ok,
         "disagreement": round(disagreement, 4),
         "disagreement_cap_ok": cap_ok,
+        "adjudicated_queries": adjudicated_queries,
         "wilson_ci_alexandria": [round(x, 4) for x in wilson_ci(a_hit, a_rel)],
         "wilson_ci_incumbent": [round(x, 4) for x in wilson_ci(i_hit, i_rel)],
         "relevant_total": a_rel,
@@ -245,8 +287,35 @@ def manifest(queries_path: Path, args) -> dict[str, Any]:
         "corpus_git_sha": corpus_sha,
         "grader_a": args.grader_a_model,
         "grader_b": args.grader_b_model,
-        "spec": "docs/SPEC-phase3-harness.md (revised 2026-08-07)",
+        "adjudicator_model": args.adjudicator_model,
+        "cycle": "contest-cycle2-20260808",
+        "spec": "docs/SPEC-phase3-harness.md (revised 2026-08-07) + docs/pi-contest-cycle2-amendment.md (signed 2026-08-08)",
     }
+
+
+class Scripted:
+    """Deterministic dry-run grader: relevant iff the query's first word
+    appears in the result text. flip=True reverses verdicts on ~20% of
+    queries (keyword length % 5 == 0) so the dry run exercises the
+    adjudication path; CONTEST_FORCE_DISAGREE=1 flips all queries to
+    exercise the INVALID path."""
+    def __init__(self, flip=False):
+        self.flip = flip
+    def complete(self, system, user, temperature=0.0):
+        q = user.split("QUERY: ", 1)[1].split("\n", 1)[0].lower()
+        keyword = q.split()[0]
+        flip = self.flip and (os.environ.get("CONTEST_FORCE_DISAGREE") == "1"
+                              or len(keyword) % 5 == 0)
+        body = user.split("RESULTS:\n", 1)[1]
+        hits = []
+        for line in body.splitlines():
+            m = re.match(r"^(\d+)\.\s+(.*)$", line)
+            if m:
+                v = "yes" if keyword in m.group(2).lower() else "no"
+                if flip:
+                    v = "no" if v == "yes" else "yes"
+                hits.append((m.group(1), v))
+        return "{" + ", ".join(f'"{n}": "{v}"' for n, v in hits) + "}"
 
 
 def main() -> int:
@@ -261,6 +330,7 @@ def main() -> int:
     p.add_argument("--api-key-env", default="ALEXANDRIA_AXIOM_KEY")
     p.add_argument("--grader-a-model", default="openrouter/anthropic/claude-sonnet-5")
     p.add_argument("--grader-b-model", default="deepseek-v4-pro")
+    p.add_argument("--adjudicator-model", default="openrouter/openai/gpt-5.6-sol")
     p.add_argument("--dry-run", action="store_true", help="scripted graders, no spend")
     p.add_argument("--resume", action="store_true", help="reuse completed stages in --out")
     args = p.parse_args()
@@ -322,19 +392,8 @@ def main() -> int:
     if not (args.resume and graded_path.exists() and graded_path.stat().st_size > 0):
         from alexandria.llm import LLMClient
         if args.dry_run:
-            class Scripted:
-                def complete(self, system, user, temperature=0.0):  # relevant iff query's first word appears in the result text
-                    q = user.split("QUERY: ", 1)[1].split("\n", 1)[0].lower()
-                    keyword = q.split()[0]
-                    body = user.split("RESULTS:\n", 1)[1]
-                    import re
-                    hits = []
-                    for line in body.splitlines():
-                        m = re.match(r"^(\d+)\.\s+(.*)$", line)
-                        if m:
-                            hits.append((m.group(1), "yes" if keyword in m.group(2).lower() else "no"))
-                    return "{" + ", ".join(f'"{n}": "{v}"' for n, v in hits) + "}"
-            grader_a = grader_b = Scripted()
+            grader_a = Scripted()
+            grader_b = Scripted(flip=True)
         else:
             grader_a = LLMClient(model=args.grader_a_model, base_url=args.base_url,
                                  api_key_env=args.api_key_env)
@@ -356,8 +415,55 @@ def main() -> int:
                 fg.flush()
         print("graded", flush=True)
 
+    # stage 3.5: adjudication (cycle-2 amendment) — disagreements resolved by
+    # a third grader instead of discarding the run. If >cap queries disagree,
+    # skip the adjudication spend; score_run marks the run INVALID on the
+    # same threshold. The adjudicator sees the SAME blinded union plus both
+    # graders' verdicts (numbers only — still no doc ids).
+    graded_path = out / "03-graded.jsonl"
+    adjud_path = out / "03b-adjudicated.jsonl"
+    graded_rows = [json.loads(l) for l in graded_path.read_text().splitlines() if l.strip()]
+    disagree_count = 0
+    for g in graded_rows:
+        va = {r["num"]: r["grader_a"] for r in g["results"]}
+        vb = {r["num"]: r["grader_b"] for r in g["results"]}
+        if any(va[n] != vb[n] for n in va if n in vb):
+            disagree_count += 1
+    disagreement = disagree_count / len(graded_rows) if graded_rows else 0.0
+    if not (args.resume and adjud_path.exists() and adjud_path.stat().st_size > 0):
+        if disagreement <= DISAGREEMENT_CAP and disagree_count:
+            if args.dry_run:
+                adjudicator = Scripted()
+            else:
+                adjudicator = LLMClient(model=args.adjudicator_model, base_url=args.base_url,
+                                        api_key_env=args.api_key_env)
+            with blind_path.open() as fb, adjud_path.open("w") as fad:
+                for line, g in zip(fb, graded_rows):
+                    row = json.loads(line)
+                    va = {r["num"]: r["grader_a"] for r in g["results"]}
+                    vb = {r["num"]: r["grader_b"] for r in g["results"]}
+                    disagreed = [n for n in va if n in vb and va[n] != vb[n]]
+                    if disagreed:
+                        verdicts = adjudicate_query(adjudicator, g["query"],
+                                                   row["results"], va, vb)
+                        for r in g["results"]:
+                            n = str(r["num"])
+                            if n in {str(d) for d in disagreed}:
+                                r["adjudicated"] = verdicts[n]
+                                r["relevant"] = verdicts[n]
+                    fad.write(json.dumps(g) + "\n")
+                    fad.flush()
+            print(f"adjudicated {disagree_count} query(ies)", flush=True)
+        else:
+            print(f"disagreement {disagreement:.2f} -> "
+                  + ("no adjudication needed" if not disagree_count
+                     else f"over cap {DISAGREEMENT_CAP}: INVALID by rule"), flush=True)
+
     # stage 4: score + report
-    graded = [json.loads(l) for l in graded_path.read_text().splitlines() if l.strip()]
+    adjud_rows = []
+    if adjud_path.exists() and adjud_path.stat().st_size > 0:
+        adjud_rows = [json.loads(l) for l in adjud_path.read_text().splitlines() if l.strip()]
+    graded = adjud_rows if adjud_rows else graded_rows
     report = score_run(graded)
     report["manifest"] = man
     report["cost_estimate_usd"] = round(2 * len(graded) * 0.10, 2)  # ~2 LLM calls/query

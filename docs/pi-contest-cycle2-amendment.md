@@ -50,6 +50,7 @@ read-only + ingestion; telemetry continues. No third option invented here.
 
 ## Signature
 
-- [ ] Stanley signs → manifest `contest-cycle2-20260808` is created, run 1
-      launches with the frozen mechanics above.
+- [x] Stanley signs → manifest `contest-cycle2-20260808` is created, run 1
+      launches with the frozen mechanics above. (Signed 2026-08-08, in
+      conversation; manifest + run records in the private corpus.)
 - [ ] Not signed → cycle 2 does not exist; cycle 1 records stand as final.
