@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from .auditlog import AuditLogger, audit_summary
 from .config import AppConfig, load_config
 from .corpus import Doc
 from .connectors.inbox import INBOX_META_RE, InboxConnector, parse_inbox_file
@@ -99,6 +100,8 @@ def cmd_sync(args) -> int:
     conn = _sync_connector(args)
     if conn is None:
         return 2
+
+    logger = AuditLogger(_config_for(args).corpus_path)
     corpus = _config_for(args).corpus_path
     items = conn.discover()
     if args.limit:
@@ -145,6 +148,9 @@ def cmd_sync(args) -> int:
         print(f"  error: {err}", file=sys.stderr)
     if len(conn.errors) > 10:
         print(f"  ... and {len(conn.errors)-10} more", file=sys.stderr)
+    logger.sync(connector=conn.name, duration_ms=int((time.time() - t0) * 1000),
+                discovered=total, normalized=total - failed,
+                committed=written, skipped=len(skipped), errors=conn.errors[:20])
     return 0
 
 
@@ -324,6 +330,7 @@ def cmd_answer(args) -> int:
     writer = LLMClient(model=args.llm_model, base_url=args.base_url, api_key_env=args.api_key_env)
     grader_a = LLMClient(model=args.grader_a_model, base_url=args.base_url, api_key_env=args.api_key_env)
     grader_b = LLMClient(model=args.grader_b_model, base_url=args.base_url, api_key_env=args.api_key_env)
+    _t_answer0 = time.time()
     result = run_pipeline(
         engine,
         args.question,
@@ -338,14 +345,26 @@ def cmd_answer(args) -> int:
         writer_model=args.llm_model,
         prompt_version=args.prompt_version,
     )
+    total_ms = int((time.time() - _t_answer0) * 1000)
+    logger = AuditLogger(config.corpus_path)
+    verdict = getattr(result.repair, "verdict", None)
+    failed_ids = getattr(verdict, "failed_claim_ids", ()) or ()
+    page = getattr(result.repair, "page", None)
+    n_claims = len(page.claims) if page else 0
     if not result.emitted:
+        logger.answer(query=args.question, total_ms=total_ms, emitted=False,
+                      model=args.llm_model, n_claims=n_claims,
+                      failed_claims=list(failed_ids),
+                      error="synthesis failed its native checks")
         print("answer: synthesis failed its native checks; no page emitted.",
               file=sys.stderr)
-        for claim in result.repair.page.claims:
-            if claim.id in result.repair.verdict.failed_claim_ids:
+        for claim in (page.claims if page else []):
+            if claim.id in failed_ids:
                 print(f"  failed claim {claim.id}: {claim.text[:200]}", file=sys.stderr)
         return 1
     page_text = result.page_path.read_text(encoding="utf-8")
+    logger.answer(query=args.question, total_ms=total_ms, emitted=True,
+                  model=args.llm_model, n_claims=n_claims)
     print(page_text)
     if not save_dir:
         shutil.rmtree(emit_root, ignore_errors=True)
@@ -614,6 +633,10 @@ def build_parser() -> argparse.ArgumentParser:
     ws.add_argument("--wiki", default=None, help="wiki dir (default: <corpus>/wiki)")
     ws.add_argument("--out", type=Path, required=True)
     ws.set_defaults(func=cmd_wiki_site)
+
+    au = sub.add_parser("audit", help="summarize the pipeline audit logs")
+    au.add_argument("--last", type=int, default=200)
+    au.set_defaults(func=lambda a: print(audit_summary(_config_for(a).corpus_path, a.last)) or 0)
 
     d = sub.add_parser("decay", help="propose eviction from a capped memory store")
     d.add_argument("stores", nargs="+")
