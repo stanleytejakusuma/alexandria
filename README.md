@@ -136,17 +136,24 @@ Per the convergence stop-rule and Stanley's "no retry-until-success", no
 v5: the compound/reversal class is declared a documented product-scope
 limitation (`docs/pi-loop-termination.md` Backlog), the gate stays
 as-waived, and the failure evidence is preserved in the private corpus.
-**Phase-3 status (2026-08-08): the contest cycle closed with NO verdict —
-Alexandria stays read-only.** Run 1 was INVALID as a contest (grader
-disagreement 0.50 > 0.20 cap) and disposed as a FAIL on the absolute floor
-(recall@5 0.509 < 0.60, statistical dead heat). Run 2 (the cycle's last,
-with the v4 wiki + ops docs in the corpus): INVALID again — disagreement
-0.25, still over the cap; no verdict recorded per SPEC §3. Trend worth
-recording for telemetry: margin widened (+0.018 → +0.065), disagreement
-halved (0.50 → 0.25), floor still unmet (0.53). Per the signed
-loop-termination contract no run 3 exists this cycle; Alexandria stays
-opt-in/read-only, the Pi extension remains inert, and the contest becomes
-standing monthly telemetry under the same frozen mechanics. **Activation
+**Phase-3 status (2026-08-08): one valid verdict, FAIL — Alexandria
+stays read-only; contest is now quarterly telemetry.** Cycle-2 run 1 (the
+first VALID verdict: disagreement 0.30 ≤ 0.40 cap, 12 queries adjudicated
+by gpt-5.6-sol) measured recall@5 **0.521 vs 0.479** — statistical dead
+heat (CIs overlap), floor unmet again (**0.52 < 0.60**; floor has never
+cleared across all three runs: 0.51/0.53/0.52). Per stratum: stable 0.44
+(n=27, the incumbent's surface advantage), reversal 0.54 (n=7, up from
+0.38), operational 0.25 (n=4, up from 0.00) — the v4 wiki + ops docs
+moved the bottom strata but the n's are noise-adjacent. Cycle-1 runs were
+INVALID (disagreement 0.50 / 0.25 > 0.20 cap, discarded per SPEC §3). Per
+the signed loop-termination contract no further runs this cycle; the
+contest becomes standing quarterly telemetry under frozen mechanics
+(docs/pi-contest-cycle2-amendment.md), and Alexandria's improvement loop
+is now usage-driven (docs/pi-self-learning-loop.md). Alexandria stays
+opt-in/read-only, the Pi extension remains read-only, and the contest becomes
+standing quarterly telemetry under the same frozen mechanics (cycle-2 run 1
+verdict FAIL is the telemetry baseline, private corpus
+`cycle2-run1-DISPOSITION.md`). **Activation
 decision 2026-08-08 (principal, recorded in
 `docs/pi-activation-decision-2026-08-08.md`): the Pi extension is LIVE in
 read-only mode** (`alexandria-search` + `alexandria-answer`, installed at
