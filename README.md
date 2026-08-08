@@ -1,6 +1,6 @@
 # Alexandria
 
-**A personal knowledge engine that synthesizes instead of transcribes — every claim carries a citation back to its source.**
+**A self-improving memory/RAG engine that synthesizes instead of transcribes — every claim carries a citation back to its source, and the engine learns from usage: your queries, corrections, and distilled sessions drive weekly memory generation and on-demand knowledge re-synthesis (docs/pi-self-learning-loop.md).**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
