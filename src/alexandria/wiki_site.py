@@ -161,9 +161,11 @@ def _page(title: str, body: str, slug: str, extra: str = "") -> str:
     )
 
 
-def render_site(wiki_dir: Path, out_dir: Path) -> list[str]:
+def render_site(wiki_dir: Path, out_dir: Path, audit_dir: Path | None = None) -> list[str]:
     """Render every *.md under wiki_dir into out_dir. Returns the rendered
-    page slugs. Deterministic: pages sorted by slug."""
+    page slugs. Deterministic: pages sorted by slug. When audit_dir is
+    given, an audit.html page summarizing the pipeline audit logs is
+    rendered and linked from the index."""
     wiki = Path(wiki_dir)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -187,6 +189,8 @@ def render_site(wiki_dir: Path, out_dir: Path) -> list[str]:
         f"<p class=\"excerpt\">{html.escape(_excerpt(body_html))}</p></a>"
         for slug, title, body_html in entries
     )
+    if audit_dir is not None:
+        cards += _audit_card(audit_dir)
     index_html = (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -199,3 +203,55 @@ def render_site(wiki_dir: Path, out_dir: Path) -> list[str]:
     )
     (out / "index.html").write_text(index_html, encoding="utf-8")
     return [slug for slug, _, _ in entries]
+
+
+def _audit_card(audit_dir: Path) -> str:
+    """One index card linking to the rendered audit page."""
+    return (
+        "<a class=\"card\" href=\"audit.html\"><h2>Pipeline audit</h2>"
+        "<p class=\"excerpt\">Answer and sync audit trail (per-stage timings, "
+        "emissions, errors).</p></a>"
+    )
+
+
+def render_audit(audit_dir: Path, out_dir: Path) -> None:
+    """Render an audit.html page from the pipeline audit JSONL logs."""
+    rows: list[dict] = []
+    for name in ("answers", "sync"):
+        path = Path(audit_dir) / f"{name}.jsonl"
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    rows.sort(key=lambda r: r.get("ts", ""))
+    items = []
+    for r in rows[-30:][::-1]:
+        if r.get("kind") == "answer":
+            st = r.get("stages") or {}
+            stages = " &middot; ".join(
+                f"{k} {st[k]}ms" for k in ("retrieve", "augment", "generate") if k in st)
+            items.append(
+                f"<li><strong>answer</strong> {html.escape(r['ts'])} "
+                f"({r['total_ms']}ms) emitted={r['emitted']} claims={r['n_claims']} "
+                f"model={html.escape(r['model'])}"
+                + (f" <span class=\"tag\">{stages}</span>" if stages else "")
+                + (f"<br>err: {html.escape(r['error'])}" if r.get("error") else "")
+                + f"<br><em>{html.escape(r['query'])}</em></li>")
+        else:
+            items.append(
+                f"<li><strong>sync</strong> {html.escape(r['ts'])} "
+                f"{r['connector']} ({r['duration_ms']}ms) "
+                f"disc={r['discovered']} commit={r['committed']} "
+                f"skip={r['skipped']} errs={len(r.get('errors') or [])}</li>")
+    body = (
+        f"<p class=\"meta\">{len(rows)} row(s) &middot; "
+        "<code>.alexandria/audit/</code></p>"
+        + (f"<ul>{''.join(items)}</ul>" if items else "<p>no rows yet</p>")
+    )
+    (out / "audit.html").write_text(
+        _page("Pipeline audit", body, "audit"), encoding="utf-8")
+    return None

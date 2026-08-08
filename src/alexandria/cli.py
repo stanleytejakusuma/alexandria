@@ -301,7 +301,13 @@ def cmd_search(args) -> int:
     filters = {field: value for field, value in {
         "type": args.type, "project": args.project, "layer": args.layer,
     }.items() if value is not None}
+    _t0 = time.time()
     results = engine.search(args.query, k=args.k, filters=filters)
+    from .auditlog import AuditLogger
+    logger = AuditLogger(corpus)
+    logger.search(query=args.query, k=args.k,
+                  latency_ms=int((time.time() - _t0) * 1000),
+                  hits=len(results), caller=args.caller, user=args.user)
     for result in results:
         print(f"{result.rank}. {result.chunk_id}  score={result.score:.6f}\n"
               f"   {result.heading_path}\n   {result.text[:400].replace(chr(10), ' ')}")
@@ -356,7 +362,8 @@ def cmd_answer(args) -> int:
                       model=args.llm_model, n_claims=n_claims,
                       failed_claims=list(failed_ids),
                       error="synthesis failed its native checks",
-                      stages=getattr(result, "timings_ms", {}))
+                      stages=getattr(result, "timings_ms", {}),
+                      caller=args.caller, user=args.user)
         print("answer: synthesis failed its native checks; no page emitted.",
               file=sys.stderr)
         for claim in (page.claims if page else []):
@@ -366,7 +373,8 @@ def cmd_answer(args) -> int:
     page_text = result.page_path.read_text(encoding="utf-8")
     logger.answer(query=args.question, total_ms=total_ms, emitted=True,
                   model=args.llm_model, n_claims=n_claims,
-                  stages=getattr(result, "timings_ms", {}))
+                  stages=getattr(result, "timings_ms", {}),
+                  caller=args.caller, user=args.user)
     print(page_text)
     if not save_dir:
         shutil.rmtree(emit_root, ignore_errors=True)
@@ -577,6 +585,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=0)
     s.add_argument("--workers", type=int, default=6)
     s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
+                   help="consumer identity recorded in the audit trail")
+    s.add_argument("--user", default=os.environ.get("ALEXANDRIA_USER", "local"))
     s.set_defaults(func=cmd_sync)
 
     remember = sub.add_parser("remember",
@@ -606,6 +617,9 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--project")
     search.add_argument("--layer", choices=["sources", "wiki"])
     search.add_argument("--trace", action="store_true")
+    search.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
+                       help="consumer identity recorded in the audit trail")
+    search.add_argument("--user", default=os.environ.get("ALEXANDRIA_USER", "local"))
     search.set_defaults(func=cmd_search)
 
     evaluate = sub.add_parser("eval", help="score retrieval against the private golden set")
@@ -627,6 +641,9 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("--grader-a-model", default="openrouter/anthropic/claude-sonnet-5")
     answer.add_argument("--grader-b-model", default="deepseek-v4-pro")
     answer.add_argument("--prompt-version", default="v1")
+    answer.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
+                       help="consumer identity recorded in the audit trail")
+    answer.add_argument("--user", default=os.environ.get("ALEXANDRIA_USER", "local"))
     answer.add_argument("--save-dir", default=None,
                         help="emit the page here (default: temp dir, page printed only)")
     answer.set_defaults(func=cmd_answer)
