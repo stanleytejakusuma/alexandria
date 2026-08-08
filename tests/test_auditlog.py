@@ -28,8 +28,9 @@ def test_logger_appends_and_summarizes(tmp_path):
 
 def test_logger_survives_unwritable_dir(tmp_path):
     # answers.jsonl is a directory -> append must fail, but not raise
-    (tmp_path / "audit").mkdir()
-    (tmp_path / "audit" / "answers.jsonl").mkdir()
+    d = tmp_path / ".alexandria" / "audit"
+    d.mkdir(parents=True)
+    (d / "answers.jsonl").mkdir()
     logger = AuditLogger(tmp_path)
     logger.answer(query="q", total_ms=1, emitted=True, model="m")
     assert logger.errors and "answers" in logger.errors[0]
