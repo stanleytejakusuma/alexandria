@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import dataclasses
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..cache import QueryCache
+from ..cache import QueryCache, normalize_query, read_index_generation
 from ..index.bm25 import BM25Index, searchable_text
 from ..index.embedder import Embedder
 from ..index.filtering import normalize_filters
@@ -63,7 +62,8 @@ class SearchResult:
 class SearchEngine:
     def __init__(self, embedder: Embedder, store: VectorStore, bm25: BM25Index, reranker: Reranker,
                  config: SearchConfig | None = None, logger: QueryLogger | None = None,
-                 client: str = "cli", query_cache: "QueryCache | None" = None) -> None:
+                 client: str = "cli", query_cache: "QueryCache | None" = None,
+                 corpus_root: str | Path | None = None) -> None:
         self.embedder = embedder
         self.store = store
         self.bm25 = bm25
@@ -73,11 +73,18 @@ class SearchEngine:
         self.client = client
         self.query_cache = query_cache
         self.last_trace: dict[str, Any] = {}
-        self.last_cache_hit = False
+        self.last_cache_hit = 0
+        # Corpus generation counter: cache keys are bound to it (Red
+        # release change 1) so any reindex invalidates cached results.
+        self._generation = (read_index_generation(corpus_root)
+                            if corpus_root is not None else 0)
 
     def search(self, query: str, *, k: int | None = None, filters: Mapping[str, Any] | None = None,
                tier: str = "map") -> list[SearchResult]:
         started = time.perf_counter()
+        # Execute the SAME normalized query that keys the cache (Red: the
+        # first spelling must not control later results).
+        query = normalize_query(query)
         limit = self.config.top_k if k is None else max(0, k)
         metadata_filter = normalize_filters(filters)
         trace: dict[str, Any] = {
@@ -99,9 +106,8 @@ class SearchEngine:
         cached: list[SearchResult] | None = None
         if self.query_cache is not None:
             ckey = self.query_cache.key(
-                query, limit,
-                repr(sorted(dataclasses.asdict(self.config).items())),
-                repr(sorted(metadata_filter.items())))
+                query, limit, self.config, metadata_filter,
+                generation=self._generation)
             payload = self.query_cache.get(ckey)
             if payload is not None:
                 cached = [
@@ -113,8 +119,9 @@ class SearchEngine:
                     for rank, c in enumerate(payload, start=1)
                 ]
         if cached is not None:
-            self.last_cache_hit = True
+            self.last_cache_hit = 1  # query-cache hit (embedding never consulted)
             trace["cache_hit"] = True
+            trace["cache_source"] = "query"
             trace["latency_ms"] = _elapsed_ms(started)
             self.last_trace = trace
             if self.logger is not None:
@@ -122,9 +129,9 @@ class SearchEngine:
                     query=query, filters=metadata_filter, tier=tier,
                     retrieved_ids=[r.chunk_id for r in cached],
                     scores=[r.score for r in cached], latency_ms=trace["latency_ms"],
-                    cache_hit=True, client=self.client)
+                    cache_hit=1, client=self.client)
             return cached
-        self.last_cache_hit = False
+        self.last_cache_hit = 0
 
         embed_started = time.perf_counter()
         query_vector = None
@@ -239,14 +246,22 @@ class SearchEngine:
         trace["latency_ms"] = _elapsed_ms(started)
         self.last_trace = trace
         if self.logger is not None:
+            # hit-source: 2 = embedding-cache only, 1 = query-cache (returned
+            # earlier), 0 = neither. Separate semantics (Red release change 7).
+            hit = 2 if cache_stats.get("hits") else self.last_cache_hit
             trace["logging"] = {"ok": self.logger.log(
                 query=query, filters=metadata_filter, tier=tier,
                 retrieved_ids=[result.chunk_id for result in results],
                 scores=[result.score for result in results], latency_ms=trace["latency_ms"],
-                cache_hit=bool(cache_stats.get("hits")) or self.last_cache_hit, client=self.client,
+                cache_hit=hit, client=self.client,
             )}
-        # QUERY CACHE write: only non-degraded, non-empty result sets.
-        if self.query_cache is not None and results and not trace.get("reranker", {}).get("degraded"):
+        # QUERY CACHE write: only cacheable (complete) result sets.
+        # Red release change 5: a partial failure (one retrieval leg down,
+        # reranker degraded) must not be cached as a snapshot of health.
+        cacheable = bool(results) and not trace.get("reranker", {}).get("degraded")
+        if lexical_error is not None or dense_error is not None:
+            cacheable = False
+        if self.query_cache is not None and cacheable:
             self.query_cache.put(ckey, [{
                 "chunk_id": r.chunk_id, "doc_id": r.doc_id, "text": r.text,
                 "heading_path": r.heading_path, "layer": r.layer, "score": r.score,

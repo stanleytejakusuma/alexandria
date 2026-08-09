@@ -20,7 +20,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .auditlog import AuditLogger, audit_summary
-from .cache import QueryCache, ResponseCache
+from .cache import (
+    QueryCache,
+    ResponseCache,
+    read_index_generation,
+    write_index_generation,
+)
 from .config import AppConfig, load_config
 from .corpus import Doc
 from .connectors.inbox import INBOX_META_RE, InboxConnector, parse_inbox_file
@@ -211,6 +216,10 @@ def cmd_index(args) -> int:
     print(f"index: {len(records)} chunks from {len({record['doc_id'] for record in records})} documents "
           f"in {elapsed:.2f}s (cache {stats.cache_hits} hit/"
           f"{stats.cache_misses} miss)")
+    # Red release change 1: bind every cache to this corpus generation so a
+    # reindex invalidates stale query/response cache entries.
+    gen = write_index_generation(corpus)
+    print(f"index: corpus generation {gen} (query/response caches invalidated)")
     return 0
 
 
@@ -331,10 +340,11 @@ def cmd_answer(args) -> int:
 
     config = _config_for(args)
     corpus = config.corpus_path
-    engine = _build_search_engine(config, corpus)
+    engine = _build_search_engine(config, corpus, corpus_root=corpus)
     response_cache = ResponseCache(corpus)
+    generation = read_index_generation(corpus)
     rkey = response_cache.key(args.question, args.llm_model, args.k,
-                              args.prompt_version)
+                              args.prompt_version, generation)
 
     # RESPONSE CACHE: a previously-emitted answer for the same question/model
     # config is replayed verbatim (TTL 7d); the pipeline is skipped entirely.
@@ -489,7 +499,7 @@ def cmd_eval(args) -> int:
 
 def cmd_cache(args) -> int:
     """Cache stats + maintenance (query cache, response cache, embedding cache)."""
-    from .cache import QueryCache, ResponseCache
+    from .cache import QueryCache, ResponseCache, read_index_generation
     config = _config_for(args)
     corpus = config.corpus_path
     embed_path = corpus / ".alexandria" / "cache" / "embeddings.sqlite"
@@ -518,7 +528,8 @@ def _config_for(args) -> AppConfig:
     return load_config(corpus_override=getattr(args, "corpus", None))
 
 
-def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True) -> SearchEngine:
+def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True,
+                         corpus_root: Path | None = None) -> SearchEngine:
     return SearchEngine(
         _cached_embedder(config, corpus),
         VectorStore(corpus / ".alexandria" / "index"),
@@ -528,6 +539,7 @@ def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = Tr
                      wiki_boost=config.wiki_boost, rrf_k=config.rrf_k),
         QueryLogger(corpus / ".alexandria" / "queries.sqlite"),
         query_cache=QueryCache(corpus) if query_cache else None,
+        corpus_root=corpus_root or corpus,
     )
 
 

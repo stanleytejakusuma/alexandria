@@ -19,11 +19,56 @@ QUERY_TTL = 24 * 3600          # 1 day: corpus changes slowly; long enough
                                # for the weekly loop's repeated queries
 RESPONSE_TTL = 7 * 24 * 3600   # 1 week: answers drift with the corpus
 
+# Red release-changes (2026-08-09): keys are versioned so a schema or
+# pipeline change invalidates old payloads instead of replaying them.
+QUERY_SCHEMA_VER = "q2"
+RESPONSE_SCHEMA_VER = "a2"
+GENERATION_FILE = ".alexandria/index/generation.json"
+
 _CACHE_DIR = ".alexandria/cache"
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS cache ("
     "key TEXT PRIMARY KEY, payload TEXT NOT NULL, ts REAL NOT NULL)"
 )
+
+
+def canonical(obj) -> str:
+    """Versioned canonical serialization for cache-key parts: recursively
+    normalized JSON with deterministic ordering and safe rendering of
+    arbitrary values (sets, datetimes, floats). NOT repr()."""
+    def _norm(v):
+        if isinstance(v, dict):
+            return {str(k): _norm(val) for k, val in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_norm(x) for x in v]
+        if isinstance(v, set):
+            return sorted(_norm(x) for x in v)
+        if isinstance(v, float):
+            return repr(v)  # deterministic, locale-independent
+        return str(v)
+    return json.dumps(_norm(obj), sort_keys=True, separators=(",", ":"))
+
+
+def read_index_generation(corpus: str | Path) -> int:
+    """Corpus generation counter written atomically after each successful
+    index build. Caches keyed with it are invalidated on any reindex."""
+    try:
+        data = json.loads((Path(corpus).expanduser() / GENERATION_FILE).read_text())
+        return int(data.get("generation", 0))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def write_index_generation(corpus: str | Path) -> int:
+    """Bump and persist the generation counter; returns the new value."""
+    gen = read_index_generation(corpus) + 1
+    path = Path(corpus).expanduser() / GENERATION_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "generation": gen,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }, sort_keys=True) + "\n", encoding="utf-8")
+    return gen
 
 
 def _db(corpus: str | Path, name: str) -> sqlite3.Connection:
@@ -113,14 +158,18 @@ class QueryCache(_Cache):
     def __init__(self, corpus: str | Path) -> None:
         super().__init__(corpus, "queries_cache.sqlite", QUERY_TTL)
 
-    def key(self, query: str, k: int, config_sig: str,
-            filters_sig: str = "") -> str:
-        return _key("q", normalize_query(query), str(k), config_sig, filters_sig)
+    def key(self, query: str, k: int, config: object, filters: object = None,
+            generation: int = 0) -> str:
+        return _key(QUERY_SCHEMA_VER, "q", normalize_query(query), str(k),
+                    canonical(config), canonical(filters or {}),
+                    str(generation))
 
 
 class ResponseCache(_Cache):
     def __init__(self, corpus: str | Path) -> None:
         super().__init__(corpus, "responses_cache.sqlite", RESPONSE_TTL)
 
-    def key(self, question: str, model: str, k: int, prompt_version: str) -> str:
-        return _key("a", normalize_query(question), model, str(k), prompt_version)
+    def key(self, question: str, model: str, k: int, prompt_version: str,
+            generation: int = 0) -> str:
+        return _key(RESPONSE_SCHEMA_VER, "a", normalize_query(question), model,
+                    str(k), prompt_version, str(generation))

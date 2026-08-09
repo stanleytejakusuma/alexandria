@@ -6,7 +6,10 @@ import time
 from alexandria.cache import (
     QueryCache,
     ResponseCache,
+    canonical,
     normalize_query,
+    read_index_generation,
+    write_index_generation,
 )
 from alexandria.index.bm25 import BM25Index
 from alexandria.index.embedder import HashEmbedder
@@ -79,14 +82,14 @@ def test_search_engine_query_cache_hit_returns_same_results(tmp_path):
     engine = build_engine(tmp_path)
     engine.query_cache = cache
     r1 = engine.search("sweep page lint")
-    assert engine.last_cache_hit is False  # first call: miss
+    assert engine.last_cache_hit == 0  # first call: miss
     assert len(r1) == 2
     r2 = engine.search("sweep page lint")
-    assert engine.last_cache_hit is True  # second call: hit
+    assert engine.last_cache_hit == 1  # second call: query-cache hit
     assert [x.chunk_id for x in r2] == [x.chunk_id for x in r1]
     # different k: cache miss
     engine.search("sweep page lint", k=1)
-    assert engine.last_cache_hit is False
+    assert engine.last_cache_hit == 0
 
 
 def test_search_engine_cache_never_breaks_pipeline(tmp_path):
@@ -95,4 +98,50 @@ def test_search_engine_cache_never_breaks_pipeline(tmp_path):
     engine.query_cache = cache
     results = engine.search("sweep page lint")
     assert len(results) == 2
-    assert engine.last_cache_hit is False
+    assert engine.last_cache_hit == 0
+
+
+def test_query_cache_key_binds_to_corpus_generation(tmp_path):
+    c = QueryCache(tmp_path)
+    k0 = c.key("same query", 5, {"a": 1}, {"tier": "map"}, generation=0)
+    k1 = c.key("same query", 5, {"a": 1}, {"tier": "map"}, generation=1)
+    assert k0 != k1  # reindex must invalidate
+
+
+def test_response_cache_key_binds_to_generation(tmp_path):
+    c = ResponseCache(tmp_path)
+    k = c.key("q", "model-x", 8, "v1", generation=3)
+    assert k != c.key("q", "model-x", 8, "v1", generation=4)
+
+
+def test_canonical_is_deterministic_and_not_repr(tmp_path):
+    a = canonical({"b": [1, 2], "a": {"x": {3, 1}}, "f": 0.5})
+    b = canonical({"a": {"x": {1, 3}}, "b": [1, 2], "f": 0.5})
+    assert a == b  # key order + set order free
+    assert "set(" not in a and "at 0x" not in a
+    # config dict and filter dict both fold into the key
+    assert QueryCache(tmp_path).key("q", 5, {"top_k": 3}, {"tier": "map"}) != \
+        QueryCache(tmp_path).key("q", 5, {"top_k": 4}, {"tier": "map"})
+
+
+def test_index_generation_roundtrip(tmp_path):
+    assert read_index_generation(tmp_path) == 0  # missing file
+    assert write_index_generation(tmp_path) == 1
+    assert write_index_generation(tmp_path) == 2
+    assert read_index_generation(tmp_path) == 2
+
+
+def test_embedder_cache_mode_separation(tmp_path):
+    """Red: query-space and document-space vectors of the SAME text must
+    never satisfy each other through the embedding cache."""
+    from alexandria.index.embedder import CachedEmbedder
+    cache = CachedEmbedder(HashEmbedder(), tmp_path / "emb.sqlite")
+    cache.embed(["some text"], mode="d")
+    assert cache.last_cache_stats == {"hits": 0, "misses": 1}
+    # same text, same mode: hit
+    cache.embed(["some text"], mode="d")
+    assert cache.last_cache_stats == {"hits": 1, "misses": 0}
+    # query-mode request never reads the document-mode row
+    cache.embed(["some text"], mode="q")
+    assert cache.last_cache_stats == {"hits": 0, "misses": 1}
+    assert cache._key("some text", "d") != cache._key("some text", "q")

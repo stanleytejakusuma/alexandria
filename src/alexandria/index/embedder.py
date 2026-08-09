@@ -247,18 +247,19 @@ class CachedEmbedder:
     def embed_queries(self, texts: list[str]) -> list[list[float]]:
         """Embed QUERIES: instruct-prefixed per the model's own template.
 
-        Lives here (not per-provider) so every provider gets it identically, and the
-        cache stays correct for free -- the prefixed text is the cache key, so query
-        vectors and raw-document vectors of the same string can never collide.
-        """
-        return self.embed([f"{QUERY_PREFIX}{text}" for text in texts])
+        Lives here (not per-provider) so every provider gets it identically. The
+        cache key carries BOTH the explicit query mode token and the prefixed
+        text (Red 2026-08-09: asymmetric models produce different vectors for
+        the same text in query vs document space; mode must be part of the
+        identity, never implicit)."""
+        return self.embed([f"{QUERY_PREFIX}{text}" for text in texts], mode="q")
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], *, mode: str = "d") -> list[list[float]]:
         if not texts:
             self.last_cache_stats = {"hits": 0, "misses": 0}
             return []
         started = time.monotonic()
-        keys = [self._key(text) for text in texts]
+        keys = [self._key(text, mode) for text in texts]
         vectors: list[list[float] | None] = [None] * len(texts)
         pending: dict[str, tuple[str, list[int]]] = {}
         hits = 0
@@ -292,8 +293,16 @@ class CachedEmbedder:
         self._report_progress(len(texts), started)
         return [vector for vector in vectors if vector is not None]
 
-    def _key(self, text: str) -> str:
-        return hashlib.sha256(f"{self.name}\\n{text}".encode("utf-8")).hexdigest()
+    @property
+    def revision(self) -> str:
+        """Provider revision where one exists (pinned weights); '' means the
+        provider name already pins the model (local weights)."""
+        return getattr(self.provider, "revision", "")
+
+    def _key(self, text: str, mode: str = "d") -> str:
+        return hashlib.sha256(
+            f"{self.name}\\n{self.revision}\\n{mode}\\n{text}".encode("utf-8")
+        ).hexdigest()
 
     def _read(self, key: str) -> list[float] | None:
         row = self._connection.execute(
