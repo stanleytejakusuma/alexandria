@@ -63,6 +63,11 @@ class LLMClient:
     base_delay: float = 2.0
     min_interval: float = 0.0     # floor between calls from one client; be a good citizen
     _last_call: float = field(default=0.0, repr=False)
+    # Prompt-cache accounting: the gateway decides actual prompt-cache hits
+    # (OpenRouter/Anthropic cache billing is server-side); we record what we
+    # see so the audit trail can show prompt-token drift. Populated by _once.
+    last_usage: dict = field(default_factory=dict, repr=False)
+    last_usage_error: str = field(default="", repr=False)
 
     # Retry only what retrying can fix. A 400 is a bad request and will stay bad;
     # hammering it wastes somebody's quota to no purpose.
@@ -156,6 +161,19 @@ class LLMClient:
             err = LLMError(str(exc))
             err.retryable = True          # transport-level: worth another try
             raise err from exc
+        try:
+            usage = body.get("usage") or {}
+            details = usage.get("prompt_tokens_details")
+            self.last_usage = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+                "cache_read": details.get("cached_tokens", 0)
+                              if isinstance(details, dict) else 0,
+            }
+            self.last_usage_error = ""
+        except Exception as exc:  # usage is advisory; never fail a call on it
+            self.last_usage_error = f"{type(exc).__name__}: {exc}"
         try:
             return body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:

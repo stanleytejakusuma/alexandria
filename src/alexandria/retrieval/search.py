@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ..cache import QueryCache
 from ..index.bm25 import BM25Index, searchable_text
 from ..index.embedder import Embedder
 from ..index.filtering import normalize_filters
@@ -61,7 +63,7 @@ class SearchResult:
 class SearchEngine:
     def __init__(self, embedder: Embedder, store: VectorStore, bm25: BM25Index, reranker: Reranker,
                  config: SearchConfig | None = None, logger: QueryLogger | None = None,
-                 client: str = "cli") -> None:
+                 client: str = "cli", query_cache: "QueryCache | None" = None) -> None:
         self.embedder = embedder
         self.store = store
         self.bm25 = bm25
@@ -69,7 +71,9 @@ class SearchEngine:
         self.config = config or SearchConfig()
         self.logger = logger
         self.client = client
+        self.query_cache = query_cache
         self.last_trace: dict[str, Any] = {}
+        self.last_cache_hit = False
 
     def search(self, query: str, *, k: int | None = None, filters: Mapping[str, Any] | None = None,
                tier: str = "map") -> list[SearchResult]:
@@ -86,6 +90,41 @@ class SearchEngine:
             trace["reason"] = "empty query or zero result limit"
             self.last_trace = trace
             return []
+
+        # QUERY CACHE: exact (whitespace-normalized) query -> stored results.
+        # Key covers k, config knobs and filters; TTL bounds staleness against
+        # corpus drift (reindex changes embeddings, but 24h is a deliberate
+        # ponytail ceiling: invalidation-by-index-sha is the upgrade path if
+        # stale hits ever show up in the query-log review).
+        cached: list[SearchResult] | None = None
+        if self.query_cache is not None:
+            ckey = self.query_cache.key(
+                query, limit,
+                repr(sorted(dataclasses.asdict(self.config).items())),
+                repr(sorted(metadata_filter.items())))
+            payload = self.query_cache.get(ckey)
+            if payload is not None:
+                cached = [
+                    SearchResult(
+                        c["chunk_id"], c["doc_id"], c["text"], c.get("heading_path", ""),
+                        c.get("layer", ""), c.get("score", 0.0), rank, {
+                            "cache_hit": True, "latency_ms": _elapsed_ms(started),
+                        })
+                    for rank, c in enumerate(payload, start=1)
+                ]
+        if cached is not None:
+            self.last_cache_hit = True
+            trace["cache_hit"] = True
+            trace["latency_ms"] = _elapsed_ms(started)
+            self.last_trace = trace
+            if self.logger is not None:
+                self.logger.log(
+                    query=query, filters=metadata_filter, tier=tier,
+                    retrieved_ids=[r.chunk_id for r in cached],
+                    scores=[r.score for r in cached], latency_ms=trace["latency_ms"],
+                    cache_hit=True, client=self.client)
+            return cached
+        self.last_cache_hit = False
 
         embed_started = time.perf_counter()
         query_vector = None
@@ -204,8 +243,14 @@ class SearchEngine:
                 query=query, filters=metadata_filter, tier=tier,
                 retrieved_ids=[result.chunk_id for result in results],
                 scores=[result.score for result in results], latency_ms=trace["latency_ms"],
-                cache_hit=bool(cache_stats.get("hits")), client=self.client,
+                cache_hit=bool(cache_stats.get("hits")) or self.last_cache_hit, client=self.client,
             )}
+        # QUERY CACHE write: only non-degraded, non-empty result sets.
+        if self.query_cache is not None and results and not trace.get("reranker", {}).get("degraded"):
+            self.query_cache.put(ckey, [{
+                "chunk_id": r.chunk_id, "doc_id": r.doc_id, "text": r.text,
+                "heading_path": r.heading_path, "layer": r.layer, "score": r.score,
+            } for r in results])
         return results
 
 

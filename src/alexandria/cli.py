@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .auditlog import AuditLogger, audit_summary
+from .cache import QueryCache, ResponseCache
 from .config import AppConfig, load_config
 from .corpus import Doc
 from .connectors.inbox import INBOX_META_RE, InboxConnector, parse_inbox_file
@@ -307,7 +308,8 @@ def cmd_search(args) -> int:
     logger = AuditLogger(corpus)
     logger.search(query=args.query, k=args.k,
                   latency_ms=int((time.time() - _t0) * 1000),
-                  hits=len(results), caller=args.caller, user=args.user)
+                  hits=len(results), caller=args.caller, user=args.user,
+                  cache_hit=engine.last_cache_hit)
     for result in results:
         print(f"{result.rank}. {result.chunk_id}  score={result.score:.6f}\n"
               f"   {result.heading_path}\n   {result.text[:400].replace(chr(10), ' ')}")
@@ -323,12 +325,28 @@ def cmd_answer(args) -> int:
     corpus and prints the emitted page. The page is written to --save-dir (or a
     temp dir) -- never into the private corpus wiki implicitly.
     """
+    from .cache import ResponseCache
     from .llm import LLMClient
     from .synthesis.pipeline import run_pipeline
 
     config = _config_for(args)
     corpus = config.corpus_path
     engine = _build_search_engine(config, corpus)
+    response_cache = ResponseCache(corpus)
+    rkey = response_cache.key(args.question, args.llm_model, args.k,
+                              args.prompt_version)
+
+    # RESPONSE CACHE: a previously-emitted answer for the same question/model
+    # config is replayed verbatim (TTL 7d); the pipeline is skipped entirely.
+    cached_page = response_cache.get(rkey)
+    if cached_page is not None:
+        logger = AuditLogger(config.corpus_path)
+        logger.answer(query=args.question, total_ms=0, emitted=True,
+                      model=args.llm_model, n_claims=cached_page.get("n_claims", 0),
+                      stages={}, caller=args.caller, user=args.user,
+                      trace={"cache_hit": True})
+        print("[cached] " + cached_page["text"])
+        return 0
 
     save_dir = Path(args.save_dir).expanduser() if args.save_dir else None
     emit_root = save_dir if save_dir else Path(tempfile.mkdtemp(prefix="alexandria-answer-"))
@@ -376,6 +394,7 @@ def cmd_answer(args) -> int:
                   model=args.llm_model, n_claims=n_claims,
                   stages=getattr(result, "timings_ms", {}),
                   caller=args.caller, user=args.user, trace=trace)
+    response_cache.put(rkey, {"text": page_text, "n_claims": n_claims})
     print(page_text)
     if not save_dir:
         shutil.rmtree(emit_root, ignore_errors=True)
@@ -468,11 +487,38 @@ def cmd_eval(args) -> int:
     return 1 if args.fail_on_regression and delta is not None and regressions(delta) else 0
 
 
+def cmd_cache(args) -> int:
+    """Cache stats + maintenance (query cache, response cache, embedding cache)."""
+    from .cache import QueryCache, ResponseCache
+    config = _config_for(args)
+    corpus = config.corpus_path
+    embed_path = corpus / ".alexandria" / "cache" / "embeddings.sqlite"
+    if not args.clear:
+        for name, cache in (("query", QueryCache(corpus)),
+                            ("response", ResponseCache(corpus))):
+            st = cache.stats()
+            print(f"{name} cache: {st.size} row(s), ttl={cache.ttl // 3600}h")
+            print(f"  errors: {len(cache.errors)}")
+        if embed_path.exists():
+            import sqlite3
+            con = sqlite3.connect(embed_path)
+            rows = con.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+            con.close()
+            print(f"embedding cache: {rows} row(s)")
+        else:
+            print("embedding cache: not built yet")
+        return 0
+    total = QueryCache(corpus).clear() + ResponseCache(corpus).clear()
+    print(f"cache --clear: removed {total} row(s) (embedding cache kept; "
+          "it is content-hash keyed and self-invalidating)")
+    return 0
+
+
 def _config_for(args) -> AppConfig:
     return load_config(corpus_override=getattr(args, "corpus", None))
 
 
-def _build_search_engine(config: AppConfig, corpus: Path) -> SearchEngine:
+def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True) -> SearchEngine:
     return SearchEngine(
         _cached_embedder(config, corpus),
         VectorStore(corpus / ".alexandria" / "index"),
@@ -481,6 +527,7 @@ def _build_search_engine(config: AppConfig, corpus: Path) -> SearchEngine:
         SearchConfig(prefetch=config.rerank_prefetch, top_k=config.rerank_top_k,
                      wiki_boost=config.wiki_boost, rrf_k=config.rrf_k),
         QueryLogger(corpus / ".alexandria" / "queries.sqlite"),
+        query_cache=QueryCache(corpus) if query_cache else None,
     )
 
 
@@ -686,6 +733,10 @@ def build_parser() -> argparse.ArgumentParser:
     au = sub.add_parser("audit", help="summarize the pipeline audit logs")
     au.add_argument("--last", type=int, default=200)
     au.set_defaults(func=lambda a: print(audit_summary(_config_for(a).corpus_path, a.last)) or 0)
+
+    c = sub.add_parser("cache", help="cache stats and maintenance")
+    c.add_argument("--clear", action="store_true")
+    c.set_defaults(func=cmd_cache)
 
     d = sub.add_parser("decay", help="propose eviction from a capped memory store")
     d.add_argument("stores", nargs="+")

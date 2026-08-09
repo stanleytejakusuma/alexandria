@@ -53,13 +53,14 @@ class AuditLogger:
         })
 
     def search(self, *, query: str, k: int, latency_ms: int,
-               hits: int, caller: str = "cli", user: str = "local") -> None:
+               hits: int, caller: str = "cli", user: str = "local",
+               cache_hit: bool = False) -> None:
         """One search invocation row (retrieval-only calls)."""
         self._append("search", {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "kind": "search", "query": query, "k": k,
             "latency_ms": latency_ms, "hits": hits,
-            "caller": caller, "user": user,
+            "caller": caller, "user": user, "cache_hit": cache_hit,
         })
 
     def sync(self, *, connector: str, duration_ms: int, discovered: int,
@@ -105,7 +106,9 @@ def audit_summary(corpus: Path, last: int = 200) -> str:
             elif r["kind"] == "search":
                 lines.append(
                     f"  {r['ts']} [{who}] search k={r['k']} {r['latency_ms']}ms "
-                    f"hits={r['hits']} q={r['query'][:40]!r}")
+                    f"hits={r['hits']}"
+                    + (" CACHED" if r.get("cache_hit") else "")
+                    + f" q={r['query'][:40]!r}")
             else:
                 lines.append(
                     f"  {r['ts']} [{who}] sync {r['connector']} {r['duration_ms']}ms "
