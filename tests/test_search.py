@@ -17,6 +17,9 @@ def record(chunk_id: str, doc_id: str, text: str, vector: list[float], **meta) -
         "source": meta.pop("source", "test"), "tags": meta.pop("tags", []),
         "entities": meta.pop("entities", []), "layer": meta.pop("layer", None),
         "generated_at": meta.pop("generated_at", None),
+        "enrichment": meta.pop("enrichment", None),
+        "kind": meta.pop("kind", None), "parent_doc": meta.pop("parent_doc", None),
+        "target_chunk": meta.pop("target_chunk", None),
     }
 
 

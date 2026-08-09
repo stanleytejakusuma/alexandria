@@ -201,6 +201,17 @@ def cmd_index(args) -> int:
     records, errors = _load_chunk_records(corpus, config, args.limit, args.workers)
     for error in errors:
         print(f"skip: {error}", file=sys.stderr)
+    if args.enrich:
+        from .enrich import EnrichmentStore, enrich_docs_for_index, recipe_signature
+        from .llm import LLMClient
+        store = EnrichmentStore(corpus / ".alexandria" / "index")
+        llm = LLMClient(model=args.enrich_model, base_url=args.base_url,
+                        api_key_env=args.api_key_env)
+        recipe = recipe_signature(args.enrich_model, args.enrich_prompt_version)
+        estats = enrich_docs_for_index(
+            records, llm=llm, embedder=_cached_embedder(config, corpus),
+            store=store, recipe=recipe, limit=args.enrich_limit)
+        print(f"enrich: {estats}")
     store = VectorStore(corpus / ".alexandria" / "index")
     lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
     if args.rebuild:
@@ -261,13 +272,37 @@ def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_
         try:
             for start in range(0, len(records), batch_size):
                 batch = records[start:start + batch_size]
-                # Embed the heading breadcrumb alongside the body, matching what
-                # BM25 indexes. Without it a chunk's structural context ("Payments
-                # service > Retry behaviour") is invisible to BOTH retrievers.
-                vectors = embedder.embed([searchable_text(record) for record in batch])
+                # Enrichment synthetic records carry a precomputed vector
+                # (query-space embeddings, see enrich.py). Partition the
+                # batch so only the rest goes through the embedder; order
+                # is preserved on reassembly. Dimension/finiteness of
+                # precomputed vectors is validated below.
+                needs_embed = [r for r in batch if "vector" not in r]
+                pre_vec = [r for r in batch if "vector" in r]
+                if needs_embed:
+                    vectors = embedder.embed(
+                        [searchable_text(record) for record in needs_embed])
+                else:
+                    vectors = []
                 cache_stats = dict(embedder.last_cache_stats)   # snapshot NOW, not later
-                indexed_records = [record | {"vector": vector}
-                                   for record, vector in zip(batch, vectors, strict=True)]
+                dim = getattr(embedder, "dim", None)
+                indexed_records: list[dict] = []
+                it = iter(vectors)
+                for record in batch:
+                    if "vector" in record:
+                        vector = record["vector"]
+                        if dim is not None and len(vector) != dim:
+                            raise ValueError(
+                                f"precomputed vector for {record['chunk_id']} has "
+                                f"dim {len(vector)}, embedder dim {dim}")
+                        if any(not isinstance(v, (int, float))
+                               or v != v for v in vector):
+                            raise ValueError(
+                                f"precomputed vector for {record['chunk_id']} "
+                                f"contains NaN/non-numeric values")
+                    else:
+                        vector = next(it)
+                    indexed_records.append(record | {"vector": vector})
                 work.put((indexed_records, cache_stats))
         except BaseException as exc:  # noqa: BLE001 -- must reach the main thread
             failure.append(exc)
@@ -697,6 +732,14 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--rebuild", action="store_true", help="recreate index tables (retain embedding cache)")
     index.add_argument("--limit", type=int, default=0, help="maximum documents to index")
     index.add_argument("--workers", type=int, default=1, help="parallel document chunking workers")
+    index.add_argument("--enrich", action="store_true",
+                       help="enrich documents (summary/keywords/hypotheticals) before indexing")
+    index.add_argument("--enrich-model", default="deepseek-v4-flash",
+                       help="LLM for document enrichment")
+    index.add_argument("--enrich-limit", type=int, default=100,
+                       help="max documents that need enrichment this run (0=all)")
+    index.add_argument("--enrich-prompt-version", default="v1",
+                       help="enrichment recipe version; a change forces re-enrichment")
     index.set_defaults(func=cmd_index)
 
     search = sub.add_parser("search", help="hybrid retrieval over indexed chunks")

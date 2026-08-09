@@ -16,7 +16,7 @@ __all__ = ["VectorStore"]
 
 SCALAR_FIELDS = ("chunk_id", "doc_id", "text", "heading_path", "type", "project", "status",
                  "source", "layer", "generated_at")
-ALL_FIELDS = (*SCALAR_FIELDS, "vector", "tags", "entities")
+ALL_FIELDS = (*SCALAR_FIELDS, "vector", "tags", "entities", "enrichment", "kind", "parent_doc", "target_chunk")
 
 
 class VectorStore:
@@ -46,6 +46,17 @@ class VectorStore:
         if table is None:
             self._db.create_table(self.table_name, data=records)
             return
+        # Red 2026-08-09: detect old LanceDB schemas before issuing field
+        # projections. A table created before the enrichment columns existed
+        # silently drops them on merge; the fix is an explicit rebuild.
+        existing = {field.name for field in table.schema}
+        if any(records[0].get(field) is not None for field in ("enrichment", "kind", "parent_doc", "target_chunk")):
+            missing = [field for field in ("enrichment", "kind", "parent_doc", "target_chunk")
+                       if field not in existing]
+            if missing:
+                raise RuntimeError(
+                    "index schema predates enrichment columns "
+                    f"({', '.join(missing)}); run `alexandria index --rebuild`")
         merger = table.merge_insert("chunk_id")
         merger.when_matched_update_all().when_not_matched_insert_all().execute(records)
 
@@ -139,8 +150,16 @@ class _SQLiteVectorStore:
             "CREATE TABLE IF NOT EXISTS chunks ("
             "chunk_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, text TEXT NOT NULL, heading_path TEXT NOT NULL, "
             "vector TEXT NOT NULL, type TEXT, project TEXT, status TEXT, source TEXT, tags TEXT NOT NULL, "
-            "entities TEXT NOT NULL, layer TEXT NOT NULL, generated_at TEXT)"
+            "entities TEXT NOT NULL, layer TEXT NOT NULL, generated_at TEXT,"
+            " enrichment TEXT, kind TEXT, parent_doc TEXT, target_chunk TEXT)"
         )
+        # Red release change: enrich the schema in place for pre-existing DBs
+        # (sqlite >= 3.35 supports ADD COLUMN IF NOT EXISTS).
+        for column in ("enrichment TEXT", "kind TEXT", "parent_doc TEXT", "target_chunk TEXT"):
+            try:
+                self.connection.execute(f"ALTER TABLE chunks ADD COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass  # already present
         self.connection.commit()
 
     def upsert(self, records: list[dict]) -> None:
@@ -200,6 +219,8 @@ def _normalise_record(chunk: Mapping[str, Any]) -> dict:
         value = record.get(field) or []
         record[field] = [str(item) for item in value]
     record["vector"] = [float(value) for value in record["vector"]]
+    for field in ("enrichment", "kind", "parent_doc", "target_chunk"):
+        record[field] = record.get(field)
     return {field: record.get(field) for field in ALL_FIELDS}
 
 

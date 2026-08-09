@@ -20,7 +20,7 @@ from typing import Any
 ENRICH_SYSTEM = (
     "You enrich a private knowledge-base document for retrieval. Read the "
     "document and return ONE JSON object with exactly these keys:\n"
-    '{"summary": string under 40 words capturing the document\\'s core '
+    '{"summary": string under 40 words capturing the document core '
     "subject and its claims, \"keywords\": array of 4-8 topical keywords, "
     "\"hypotheticals\": array of 3-5 plausible USER QUESTIONS this document "
     "would answer, phrased the way a user would actually ask them, not "
@@ -65,13 +65,109 @@ def _parse_enrichment(raw: str) -> dict[str, Any]:
 
 
 def doc_fingerprint(doc_records) -> str:
-    """Cheap content fingerprint of a doc's chunk texts (for skip-if-unchanged)."""
-    return hashlib.sha256(
-        "\x1f".join(r["text"] for r in doc_records).encode()).hexdigest()[:16]
+    """Unambiguous canonical fingerprint of a doc's chunk texts.
+
+    Length-framed canonical framing (json list) + FULL sha256 -- Red
+    2026-08-09: joins need framing, 16 hex chars needlessly halves the
+    digest."""
+    texts = [r["text"] for r in doc_records]
+    return hashlib.sha256(json.dumps(texts, sort_keys=True).encode()).hexdigest()
+
+
+def synthetic_records(doc_records, payload: dict, anchor_chunk_id: str,
+                      vectors: list[list[float]]) -> list[dict]:
+    """Synthetic chunk records from enrichment hypotheticals.
+
+    Red 2026-08-09: synthetic records carry EXPLICIT metadata -- kind,
+    parent_doc, target_chunk -- never a naming-convention parse. They are
+    document-routing signals: at search time a hypothetical hit boosts its
+    target real chunk; synthetic records are never surfaced to rerank,
+    synthesis, or citations."""
+    base = dict(doc_records[0])
+    out: list[dict] = []
+    for i, (hq, vector) in enumerate(
+            zip(payload.get("hypotheticals", []), vectors, strict=True)):
+        out.append({
+            **base,
+            "chunk_id": f"{anchor_chunk_id}::hq{i + 1}",
+            "text": str(hq),
+            "heading_path": base.get("heading_path") or "",
+            "layer": "synthetic",
+            "vector": vector,
+            "enrichment": None,
+            "kind": "synthetic",
+            "parent_doc": base["doc_id"],
+            "target_chunk": anchor_chunk_id,
+        })
+    return out
+
+
+def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: EnrichmentStore,
+                          recipe: str, limit: int = 0,
+                          max_hypotheticals: int = MAX_HYPOTHETICALS) -> dict:
+    """Enrich documents and attach payloads + synthetic records.
+
+    - one LLM call per document, persisted to the store immediately (the
+      store IS the checkpoint: a crash resumes without re-calling)
+    - stored payloads are REATTACHED (no LLM call) -- replay semantics
+    - failures are never stored, so they stay retryable on the next run
+    - limit counts documents that NEED work, not already-enriched ones
+      (Red: --enrich-limit applies to pending docs)
+    - limit == 0 means the whole corpus in one bounded, resumable run
+    """
+    by_doc: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for record in records:
+        doc_id = record["doc_id"]
+        if doc_id not in by_doc:
+            by_doc[doc_id] = []
+            order.append(doc_id)
+        by_doc[doc_id].append(record)
+    stats = {"enriched": 0, "reattached": 0, "failed": 0, "synthetic": 0}
+    pending = 0
+    for doc_id in order:
+        doc_records = by_doc[doc_id]
+        sha = doc_fingerprint(doc_records)
+        payload = store.get(doc_id, sha, recipe)
+        if payload is None:
+            if limit and pending >= limit:
+                break  # budget spent on docs that need work; rest stay pending
+            pending += 1
+            payload = enrich_doc(llm, doc_id,
+                                 "\n\n".join(r["text"] for r in doc_records))
+            if not payload or "error" in payload:
+                stats["failed"] += 1
+                continue
+            store.put(doc_id, sha, recipe, payload)
+            stats["enriched"] += 1
+        else:
+            stats["reattached"] += 1
+        if payload.get("hypotheticals"):
+            hypotheticals = payload["hypotheticals"][:max_hypotheticals]
+            if hasattr(embedder, "embed_queries"):
+                vectors = embedder.embed_queries(hypotheticals)
+            else:
+                vectors = embedder.embed(hypotheticals)
+            anchor = doc_records[0]["chunk_id"]
+            records.extend(synthetic_records(doc_records, payload, anchor, vectors))
+            stats["synthetic"] += len(hypotheticals)
+        for record in doc_records:
+            record["enrichment"] = json.dumps(payload, sort_keys=True)
+    return stats
+
+
+def recipe_signature(model: str, prompt_version: str = "v1") -> str:
+    """Enrichment recipe: model + prompt version. A change in either must
+    force re-enrichment (Red: version by recipe, not only doc contents)."""
+    return f"{model}@{prompt_version}"
 
 
 class EnrichmentStore:
-    """doc_id -> {sha, payload} so re-indexes skip already-enriched docs."""
+    """doc_id -> payload, keyed by fingerprint + recipe.
+
+    Stores the SUCCESSFUL payload, not a boolean (Red: replay semantics --
+    a rebuild reattaches the stored enrichment without new LLM calls;
+    failures are never stored, so they stay retryable)."""
 
     def __init__(self, index_dir: str | Path) -> None:
         path = Path(index_dir) / "enrichment.sqlite"
@@ -79,20 +175,30 @@ class EnrichmentStore:
         self.con = sqlite3.connect(path)
         self.con.execute(
             "CREATE TABLE IF NOT EXISTS enriched_docs ("
-            "doc_id TEXT PRIMARY KEY, sha TEXT NOT NULL, payload TEXT NOT NULL)")
+            "doc_id TEXT PRIMARY KEY, sha TEXT NOT NULL, recipe TEXT NOT NULL,"
+            " payload TEXT NOT NULL)")
         self.con.commit()
 
-    def is_enriched(self, doc_id: str, sha: str) -> bool:
+    def get(self, doc_id: str, sha: str, recipe: str) -> dict | None:
+        """The stored payload only when BOTH the content fingerprint and the
+        enrichment recipe match; otherwise None (doc needs re-enrichment)."""
         row = self.con.execute(
-            "SELECT 1 FROM enriched_docs WHERE doc_id = ? AND sha = ?",
-            (doc_id, sha)).fetchone()
-        return row is not None
+            "SELECT payload FROM enriched_docs WHERE doc_id = ? AND sha = ? "
+            "AND recipe = ?", (doc_id, sha, recipe)).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
-    def put(self, doc_id: str, sha: str, payload: dict) -> None:
+    def put(self, doc_id: str, sha: str, recipe: str, payload: dict) -> None:
         self.con.execute(
-            "INSERT INTO enriched_docs (doc_id, sha, payload) VALUES (?, ?, ?) "
-            "ON CONFLICT(doc_id) DO UPDATE SET sha=excluded.sha, payload=excluded.payload",
-            (doc_id, sha, json.dumps(payload, sort_keys=True)))
+            "INSERT INTO enriched_docs (doc_id, sha, recipe, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(doc_id) DO UPDATE SET "
+            "sha=excluded.sha, recipe=excluded.recipe, payload=excluded.payload",
+            (doc_id, sha, recipe, json.dumps(payload, sort_keys=True)))
         self.con.commit()
 
     def count(self) -> int:

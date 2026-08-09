@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
@@ -196,23 +197,54 @@ class SearchEngine:
         layers = {chunk_id: record["layer"] for chunk_id, record in records.items()}
         before = _ordered(base_scores)
         boosted_scores = apply_layer_boost(base_scores, layers, wiki_boost=self.config.wiki_boost)
-        after = _ordered(boosted_scores)
+        # Enrichment routing (Red 2026-08-09): synthetic records (kind
+        # "synthetic") are never surfaced -- their score boosts their
+        # explicit target_chunk (a real chunk), so a hypothetical-question
+        # match retrieves the document. Targets missing from the RRF set
+        # are fetched in ONE bounded lookup.
+        enriched_hits = 0
+        collapsed: dict[str, float] = {}
+        missing_targets: list[str] = []
+        for chunk_id, score in boosted_scores.items():
+            record = records.get(chunk_id)
+            if record is not None and record.get("kind") == "synthetic":
+                enriched_hits += 1
+                target = record.get("target_chunk")
+                if target and target in records:
+                    collapsed[target] = max(collapsed.get(target, 0.0), score)
+                elif target and target not in missing_targets:
+                    missing_targets.append(target)
+            else:
+                collapsed[chunk_id] = max(collapsed.get(chunk_id, 0.0), score)
+        if missing_targets:
+            try:
+                for chunk_id, record in self.store.get_many(missing_targets).items():
+                    records[chunk_id] = record
+                    collapsed[chunk_id] = max(
+                        collapsed.get(chunk_id, 0.0),
+                        boosted_scores.get(chunk_id, collapsed.get(chunk_id, 0.0)))
+            except Exception:
+                pass  # routing enhancement is best-effort; never breaks search
+        after = _ordered(collapsed)
         trace["stages"]["fusion"] = {
             "in": {"bm25": len(lexical), "dense": len(dense)},
             "out": len(after),
             "scores_before_boost": base_scores,
-            "scores": boosted_scores,
+            "scores": collapsed,
             "boost_changed_order": before != after,
             "lookup_errors": lookup_errors,
+            "enriched_hits": enriched_hits,
             "timing_ms": _elapsed_ms(fusion_started),
         }
         candidates = [
             # Heading included: the reranker judges "does this passage answer the
             # query?", and judging that on text stripped of its own title is how a
             # document whose TITLE matches the query gets dropped. All three stages
-            # (bm25, embedder, reranker) must see the same text.
-            RerankCandidate(chunk_id, searchable_text(records[chunk_id]),
-                            boosted_scores[chunk_id])
+            # (bm25, embedder, reranker) must see the same text. Enrichment
+            # summary (if any) is appended so a question phrased differently from
+            # the document's own wording can still be judged relevant.
+            RerankCandidate(chunk_id, _rerank_text(records[chunk_id]),
+                            collapsed[chunk_id])
             for chunk_id in after[:self.config.prefetch] if chunk_id in records
         ]
 
@@ -267,6 +299,24 @@ class SearchEngine:
                 "heading_path": r.heading_path, "layer": r.layer, "score": r.score,
             } for r in results])
         return results
+
+
+def _rerank_text(record: dict) -> str:
+    """The passage the reranker judges: body + heading, plus the enrichment
+    summary when present (a differently-worded question can match the
+    summary even if the body phrasing differs)."""
+    text = searchable_text(record)
+    raw = record.get("enrichment")
+    if not raw:
+        return text
+    try:
+        payload = json.loads(raw)
+        summary = payload.get("summary") if isinstance(payload, dict) else ""
+    except (json.JSONDecodeError, TypeError):
+        return text
+    if not summary:
+        return text
+    return f"{text}\n\nsummary: {summary}"
 
 
 def _ordered(scores: Mapping[str, float]) -> list[str]:
