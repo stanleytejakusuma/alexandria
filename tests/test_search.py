@@ -187,3 +187,24 @@ def test_search_uses_the_query_prefixed_embedding_path(tmp_path: Path):
                  IdentityReranker()).search("my question")
     assert calls.get("embed_queries") == ["my question"]
     assert "embed" not in calls
+
+
+def test_normalise_record_never_stores_none_in_new_columns():
+    """LanceDB repro: a table created with NULL new-columns crashes later
+    merge_insert (Spill error); the store must coerce to empty strings."""
+    from alexandria.index.store import _normalise_record
+
+    record = _normalise_record({
+        "chunk_id": "c", "doc_id": "d", "text": "t",
+        "heading_path": "h", "vector": [1.0],
+        "tags": [], "entities": [],
+    })
+    for field in ("enrichment", "kind", "parent_doc", "target_chunk"):
+        assert record[field] == ""
+    # enrichment JSON and synthetic routing values pass through
+    enriched = _normalise_record(dict(record, enrichment='{"s":1}',
+                                      kind="synthetic",
+                                      parent_doc="d", target_chunk="c"))
+    assert enriched["kind"] == "synthetic"
+    assert enriched["enrichment"] == '{"s":1}'
+    assert enriched["target_chunk"] == "c"

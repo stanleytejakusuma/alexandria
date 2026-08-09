@@ -220,7 +220,12 @@ def _normalise_record(chunk: Mapping[str, Any]) -> dict:
         record[field] = [str(item) for item in value]
     record["vector"] = [float(value) for value in record["vector"]]
     for field in ("enrichment", "kind", "parent_doc", "target_chunk"):
-        record[field] = record.get(field)
+        # LanceDB (pinned by a live repro): a table created with NULL in these
+        # columns crashes any later merge_insert touching them ("Spill has
+        # sent an error"). Empty string is the safe neutral value; routing
+        # code checks truthiness, so "" behaves as absent.
+        value = record.get(field)
+        record[field] = value if value is not None else ""
     return {field: record.get(field) for field in ALL_FIELDS}
 
 
