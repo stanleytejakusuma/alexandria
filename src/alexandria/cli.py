@@ -740,6 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="max documents that need enrichment this run (0=all)")
     index.add_argument("--enrich-prompt-version", default="v1",
                        help="enrichment recipe version; a change forces re-enrichment")
+    index.add_argument("--base-url", default="http://127.0.0.1:20128/v1",
+                       help="gateway base URL for the enrichment LLM")
+    index.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY",
+                       help="environment variable holding the gateway API key")
     index.set_defaults(func=cmd_index)
 
     search = sub.add_parser("search", help="hybrid retrieval over indexed chunks")
