@@ -104,7 +104,8 @@ def synthetic_records(doc_records, payload: dict, anchor_chunk_id: str,
 
 def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: EnrichmentStore,
                           recipe: str, limit: int = 0, workers: int = 1,
-                          max_hypotheticals: int = MAX_HYPOTHETICALS) -> dict:
+                          max_hypotheticals: int = MAX_HYPOTHETICALS,
+                          progress_every: int = 0) -> dict:
     """Enrich documents and attach payloads + synthetic records.
 
     - one LLM call per document, persisted to the store immediately (the
@@ -127,6 +128,15 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
             order.append(doc_id)
         by_doc[doc_id].append(record)
     stats = {"enriched": 0, "reattached": 0, "failed": 0, "synthetic": 0}
+    next_progress = progress_every
+    def _progress() -> None:
+        nonlocal next_progress
+        done = stats["enriched"] + stats["reattached"] + stats["failed"]
+        if progress_every and done >= next_progress:
+            print(f"enrich progress: {done} docs "
+                  f"({stats['enriched']} new, {stats['reattached']} reattached, "
+                  f"{stats['failed']} failed)", flush=True)
+            next_progress = done + progress_every
     pending = 0
     # batch of (doc_id, doc_records, sha, payload|None) resolved before writes
     resolved: list[tuple[list[dict], str, dict | None]] = []
@@ -156,11 +166,13 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
             payload = called.get(i)
             if not payload or "error" in payload:
                 stats["failed"] += 1
+                _progress()
                 continue
             store.put(doc_id, sha, recipe, payload)
             stats["enriched"] += 1
         else:
             stats["reattached"] += 1
+        _progress()
         if payload.get("hypotheticals"):
             hypotheticals = payload["hypotheticals"][:max_hypotheticals]
             if hasattr(embedder, "embed_queries"):

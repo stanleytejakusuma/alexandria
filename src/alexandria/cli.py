@@ -207,11 +207,22 @@ def cmd_index(args) -> int:
         store = EnrichmentStore(corpus / ".alexandria" / "index")
         llm = LLMClient(model=args.enrich_model, base_url=args.base_url,
                         api_key_env=args.api_key_env)
+        # Preflight: one tiny call so a degraded gateway fails the run in
+        # seconds, not in a 25k-doc retry cascade (observed live 2026-08-10:
+        # gateway queue stall -> every enrichment call timed out -> the whole
+        # run churned ~2h then finished as 100% failed).
+        try:
+            llm.complete("Reply with the single word: ok", "preflight",
+                         temperature=0.1)
+        except Exception as exc:
+            print(f"enrich: preflight failed ({exc}); aborting "
+                  f"--enrich run", file=sys.stderr)
+            return 3
         recipe = recipe_signature(args.enrich_model, args.enrich_prompt_version)
         estats = enrich_docs_for_index(
             records, llm=llm, embedder=_cached_embedder(config, corpus),
             store=store, recipe=recipe, limit=args.enrich_limit,
-            workers=args.enrich_workers)
+            workers=args.enrich_workers, progress_every=100)
         print(f"enrich: {estats}")
     store = VectorStore(corpus / ".alexandria" / "index")
     lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
