@@ -138,52 +138,73 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
                   f"{stats['failed']} failed)", flush=True)
             next_progress = done + progress_every
     pending = 0
-    # batch of (doc_id, doc_records, sha, payload|None) resolved before writes
-    resolved: list[tuple[list[dict], str, dict | None]] = []
-    to_call: list[tuple[int, str, str]] = []  # (order_index, doc_id, text)
-    for i, doc_id in enumerate(order):
+    _pending: list[str] = []
+
+    def _pending_items():
+        for doc_id in _pending:
+            yield doc_id, "\n\n".join(r["text"] for r in by_doc[doc_id])
+
+    def _persist(doc_id: str, payload: dict) -> None:
+        doc_records = by_doc[doc_id]
+        sha = doc_fingerprint(doc_records)
+        if not payload or "error" in payload:
+            stats["failed"] += 1
+            _progress()
+            return
+        store.put(doc_id, sha, recipe, payload)
+        stats["enriched"] += 1
+        _apply_payload(doc_records, payload, embedder, records, stats)
+        _progress()
+
+    # Reattached docs first (no LLM, no store writes): attach enrichment to
+    # their chunk records immediately so progress lines flow fast.
+    for doc_id in order:
         doc_records = by_doc[doc_id]
         sha = doc_fingerprint(doc_records)
         payload = store.get(doc_id, sha, recipe)
-        if payload is None:
-            if limit and pending >= limit:
-                break  # budget spent on docs that need work; rest stay pending
+        if payload is not None:
+            stats["reattached"] += 1
+            _apply_payload(doc_records, payload, embedder, records, stats)
+            _progress()
+        elif limit and pending >= limit:
+            break
+        else:
             pending += 1
-            to_call.append((i, doc_id, "\n\n".join(r["text"] for r in doc_records)))
-        resolved.append((doc_records, sha, payload))
-    if to_call and workers > 1:
+            _pending.append(doc_id)
+    # Pending docs stream through the pool; each completed doc is persisted
+    # IMMEDIATELY (store is the checkpoint -- a crash mid-pool keeps every
+    # completed doc; the write phase is not a barrier).
+    def _call(item):
+        doc_id, text = item
+        return doc_id, enrich_doc(llm, doc_id, text)
+
+    if workers > 1:
         import concurrent.futures as _futures
         with _futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(
-                lambda item: (item[0], enrich_doc(llm, item[1], item[2])),
-                to_call))
+            futs = {pool.submit(_call, item): item for item in _pending_items()}
+            for fut in _futures.as_completed(futs):
+                doc_id, payload = fut.result()  # enrich_doc never raises
+                _persist(doc_id, payload)
     else:
-        results = [(i, enrich_doc(llm, doc_id, text)) for i, doc_id, text in to_call]
-    called = {i: payload for i, payload in results}
-    for i, (doc_records, sha, payload) in enumerate(resolved):
-        doc_id = doc_records[0]["doc_id"]
-        if payload is None:
-            payload = called.get(i)
-            if not payload or "error" in payload:
-                stats["failed"] += 1
-                _progress()
-                continue
-            store.put(doc_id, sha, recipe, payload)
-            stats["enriched"] += 1
+        for item in _pending_items():
+            doc_id, payload = _call(item)
+            _persist(doc_id, payload)
+    return stats
+
+
+def _apply_payload(doc_records, payload, embedder, records, stats) -> None:
+    """Attach enrichment to chunk records + extend with synthetic vectors."""
+    if payload.get("hypotheticals"):
+        hypotheticals = payload["hypotheticals"][:MAX_HYPOTHETICALS]
+        if hasattr(embedder, "embed_queries"):
+            vectors = embedder.embed_queries(hypotheticals)
         else:
-            stats["reattached"] += 1
-        _progress()
-        if payload.get("hypotheticals"):
-            hypotheticals = payload["hypotheticals"][:max_hypotheticals]
-            if hasattr(embedder, "embed_queries"):
-                vectors = embedder.embed_queries(hypotheticals)
-            else:
-                vectors = embedder.embed(hypotheticals)
-            anchor = doc_records[0]["chunk_id"]
-            records.extend(synthetic_records(doc_records, payload, anchor, vectors))
-            stats["synthetic"] += len(hypotheticals)
-        for record in doc_records:
-            record["enrichment"] = json.dumps(payload, sort_keys=True)
+            vectors = embedder.embed(hypotheticals)
+        anchor = doc_records[0]["chunk_id"]
+        records.extend(synthetic_records(doc_records, payload, anchor, vectors))
+        stats["synthetic"] += len(hypotheticals)
+    for record in doc_records:
+        record["enrichment"] = json.dumps(payload, sort_keys=True)
     return stats
 
 
