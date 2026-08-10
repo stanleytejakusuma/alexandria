@@ -103,7 +103,7 @@ def synthetic_records(doc_records, payload: dict, anchor_chunk_id: str,
 
 
 def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: EnrichmentStore,
-                          recipe: str, limit: int = 0,
+                          recipe: str, limit: int = 0, workers: int = 1,
                           max_hypotheticals: int = MAX_HYPOTHETICALS) -> dict:
     """Enrich documents and attach payloads + synthetic records.
 
@@ -114,6 +114,9 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
     - limit counts documents that NEED work, not already-enriched ones
       (Red: --enrich-limit applies to pending docs)
     - limit == 0 means the whole corpus in one bounded, resumable run
+    - workers > 1 fans the LLM calls out across threads (the gateway is
+      the bottleneck, not the local machine); store writes stay on the
+      main thread -- sqlite is a single writer
     """
     by_doc: dict[str, list[dict]] = {}
     order: list[str] = []
@@ -125,7 +128,10 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
         by_doc[doc_id].append(record)
     stats = {"enriched": 0, "reattached": 0, "failed": 0, "synthetic": 0}
     pending = 0
-    for doc_id in order:
+    # batch of (doc_id, doc_records, sha, payload|None) resolved before writes
+    resolved: list[tuple[list[dict], str, dict | None]] = []
+    to_call: list[tuple[int, str, str]] = []  # (order_index, doc_id, text)
+    for i, doc_id in enumerate(order):
         doc_records = by_doc[doc_id]
         sha = doc_fingerprint(doc_records)
         payload = store.get(doc_id, sha, recipe)
@@ -133,8 +139,21 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
             if limit and pending >= limit:
                 break  # budget spent on docs that need work; rest stay pending
             pending += 1
-            payload = enrich_doc(llm, doc_id,
-                                 "\n\n".join(r["text"] for r in doc_records))
+            to_call.append((i, doc_id, "\n\n".join(r["text"] for r in doc_records)))
+        resolved.append((doc_records, sha, payload))
+    if to_call and workers > 1:
+        import concurrent.futures as _futures
+        with _futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(
+                lambda item: (item[0], enrich_doc(llm, item[1], item[2])),
+                to_call))
+    else:
+        results = [(i, enrich_doc(llm, doc_id, text)) for i, doc_id, text in to_call]
+    called = {i: payload for i, payload in results}
+    for i, (doc_records, sha, payload) in enumerate(resolved):
+        doc_id = doc_records[0]["doc_id"]
+        if payload is None:
+            payload = called.get(i)
             if not payload or "error" in payload:
                 stats["failed"] += 1
                 continue

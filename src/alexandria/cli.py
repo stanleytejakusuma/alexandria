@@ -210,7 +210,8 @@ def cmd_index(args) -> int:
         recipe = recipe_signature(args.enrich_model, args.enrich_prompt_version)
         estats = enrich_docs_for_index(
             records, llm=llm, embedder=_cached_embedder(config, corpus),
-            store=store, recipe=recipe, limit=args.enrich_limit)
+            store=store, recipe=recipe, limit=args.enrich_limit,
+            workers=args.enrich_workers)
         print(f"enrich: {estats}")
     store = VectorStore(corpus / ".alexandria" / "index")
     lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
@@ -738,6 +739,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="LLM for document enrichment")
     index.add_argument("--enrich-limit", type=int, default=100,
                        help="max documents that need enrichment this run (0=all)")
+    index.add_argument("--enrich-workers", type=int, default=1,
+                       help="threads for the enrichment LLM calls (default 1)")
     index.add_argument("--enrich-prompt-version", default="v1",
                        help="enrichment recipe version; a change forces re-enrichment")
     index.add_argument("--base-url", default="http://127.0.0.1:20128/v1",
