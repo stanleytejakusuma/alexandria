@@ -1,95 +1,95 @@
 # BACKLOG
 
-Single list of open work. Opened 2026-08-11 after a full-system audit found open
-items scattered across seven work orders, three decision docs, and no index.
+Single list of open work. Opened 2026-08-11 after a full-system audit found open items
+scattered across seven work orders with no index. **Re-ordered 2026-08-11** after two
+adversarial audit passes and the deployment-model decision.
 
-**Ordering principle:** by retrofit cost, not by difficulty. Boundaries first
-(expensive to add later), then blind spots (cheap, and everything else depends on
-seeing), then features, then deferred items with named triggers.
+**Strategy:** single-tenant per install (on-prem / customer VPC). See
+`SPEC-multi-tenant-and-learning-loop.md` §12. The stated requirement — "multiple users
+simultaneously and concurrently" — is a **concurrency** requirement, not a
+**tenant-isolation** one. Structural multi-tenant work is deliberately deferred; the
+fundamentals it was sitting in front of are not.
 
-Legend: **P0** liability · **P1** blocks other work · **P2** valuable · **P3** deferred
+**Ordering principle:** cheap and load-bearing first. Prefer what is expensive to retrofit
+(boundaries, durable signal) over what is additive later (index types).
+
+Audit sources: `/tmp/alx/audit/FINAL-GAP-PASS.md` (pass 1, 29 findings),
+`/tmp/alx/audit/PASS2-CORRECTIONS.md` (pass 2, corrections + strategy).
 
 ---
 
-## P0 — Liabilities
+## Top 10 — the critical path
+
+| # | Item | Why now | Blocks |
+|---|---|---|---|
+| 1 | **SQLite concurrency: WAL + `busy_timeout` + per-connection handling** (N4) | ~30 lines, and it is the literal prerequisite for concurrent users — the actual reading of the requirement | `serve`, every concurrency test, #2 |
+| 2 | **Generation-counter correctness** (N2 + N3) — re-read per query, locked bump | Two of the cheapest P1 fixes in the repo. `SearchEngine._generation` is frozen at construction, so a `serve` process serves stale answers after reindex; the bump is an unlocked read-modify-write that loses invalidations | Any trust in cache correctness once `serve` exists |
+| 3 | **`alexandria serve`, single-tenant** | The only unlock that makes Alexandria something a customer can run against. Per §12 it does **not** need tenant-scope machinery first — only #1, #2, and ordinary per-user auth | Every "sellable" claim; dogfooding (§H) |
+| 4 | **Cost ledger** (N8) + **move the UUID out of the system prompt** (N9) | `last_usage` is already parsed and never read (`llm.py:167`). Cheapest fix that gives cost visibility; today not even one logged run can be costed | Any "low opex" claim procurement would test |
+| 5 | **Enrichment injection framing + retrieval-poisoning fix** (spec §F, corrected) | Framing is a string change; filter and invalidate-hatch are small. Hard blocker the moment any third-party document enters the pipeline — i.e. the first customer, not the second | #14 (enterprise connectors). Land before, not concurrently |
+| 6 | **Deletion / erasure path** (N1) — delete verb, index reconciliation, embedding-cache escape hatch | Erasure survives in ≥6 unlinked copies; there is no code path at all. Any single customer can ask for their data back — this is not a multi-tenant-only problem | Any DPA a real customer signs |
+| 7 | **Backup/restore of `.alexandria` state** (N5) — queries, audit, eval, state, generation (not the rebuildable indexes) | Total loss today permanently destroys the learning-loop training signal (#9). Cheap relative to what it protects | #9's credibility; incident recovery |
+| 8 | **Real attribution, structurally verified** (N16 + pass-2 authz) | Today's `--user`/`--caller` is **worse than absent**: a forgeable, plausible-looking audit trail. Fix at the `serve` boundary as a verified value, never a passthrough string | Audit-log claims, chargeback, learning-loop attribution |
+| 9 | **Citation-linkage build-out** (spec §C1, corrected) — `query_id` return, durable `(query_id, claim_id, doc_id, chunk_id, rank, verdict, source_round)` in `answers.jsonl` | The actual precondition for the learning loop. Both #12/#14 below and spec E3 currently rest on a false premise — citations are discarded at `cli.py:454` | Learning loop entirely; spec E3 |
+| 10 | **Procurement floor** — `SECURITY.md`, published threat model, CI against `uv.lock` not floating specifiers, honest RTO (N18: measure one real rebuild, correct the false `<30min` in `README.md:116`) | Zero procurement artifacts exist. This is the gate a buyer hits *before* technical evaluation | Any actual sale |
+
+---
+
+## P1 — Also open, not on the critical path
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | **Cross-tenant response-cache leak** | `ResponseCache.key()` carries no scope dimension; two tenants asking the same question share a cache row. Harmless at one user, a breach at two. `SPEC-multi-tenant-and-learning-loop.md` §A1 |
-| 2 | **Verify the weekly loop actually runs** | `run-weekly-loop.sh` missing-`mkdir` fixed in `315418b`, but the fix is **unverified in the wild** — the loop has never once completed successfully. Do not trust it until one real run produces a digest. |
-| 3 | **Re-sync the frozen corpus** | Corpus stopped ingesting ~Aug 8. Even with the loop fixed, the three-day gap needs an explicit catch-up sync. |
-| 3b | **Prompt-injection guard** | `chunk.text` is raw-interpolated into `<chunk>` delimiters in `synthesis/write.py`, `gather.py`, `repair.py`; no untrusted-data framing anywhere. Delimiter escape + instruction-following. Amplified by citations, and the real blast radius is the downstream agent's tools. Spec §F |
-| 3c | **Global generation counter** | `cache.py:26` — one counter per install, so any tenant's reindex invalidates every tenant's cache. Right mechanism, wrong granularity. Spec §E4 |
+| 11 | **Verify the weekly loop actually runs** | `mkdir` fixed in `315418b` but **unverified in the wild** — the loop has never once completed. Do not trust it until one real run produces a digest |
+| 12 | **Re-sync the frozen corpus** | Ingestion stopped ~Aug 8; the catch-up is still explicit work |
+| 13 | **Staleness metric** (spec C5) | Age of newest indexed doc, failing loudly past a threshold. The gate that would have caught #12 on day one |
+| 14 | **Measurement preconditions** (spec C6) | Three instances in one day of a correct metric measuring an unintended state. An eval invoked mid-index must refuse to report, not emit a delta |
+| 15 | **Non-atomic rebuild** (N10) | A crashed rebuild serves stale answers silently; `--rebuild` appears in zero tests (N26), with no resume marker |
+| 16 | **Hardcoded `~/alexandria-corpus`** (N6) in two signatures bypasses config; **owner-machine paths as CLI defaults** (N7) risk ingesting personal agent data |
+| 17 | **Model supply chain unpinned** (pass 2) | A same-name weight swap on HuggingFace is invisible and would corrupt every vector |
+| 18 | **No observability** (N19) | An operator would see nothing on failure |
+| 19 | **Embedder change = global rebuild** (N11); same-dimension swaps silently write mixed-model vectors |
+| 20 | **Golden set not in the repo** (N20) — the certification gate is unreproducible by anyone but the author |
+| 21 | **Golden set structurally blind** (N21) — zero negative cases, recall-only, n=49. G6 is meaningless until this is fixed |
+| 22 | **Nothing real is exercised** (N22) — real models, transport, and JSON contracts are never tested |
+| 23 | **TTLs are decorative** (N13) — nothing is ever purged; `cache/embeddings.sqlite` is already 4.45 GB |
+| 24 | **Audit log is empty** — `.alexandria/audit/answers.sqlite` and `state/queries.sqlite` are both 0 B. A log that exists but never records is worse than none |
+| 25 | **No PII/secret detection at ingestion** (N14); **no encryption at rest** (N15) |
+| 26 | **Gate-freezing discipline** (spec §G) | Gates frozen before runs; failures persist; post-hoc strata are findings, never certifications |
 
 ---
 
-## P1 — Blind spots (everything else depends on measuring correctly)
-
-| # | Item | Detail |
-|---|---|---|
-| 4 | **Staleness metric** | Age of newest indexed doc, per scope, failing loudly past a threshold. This is the gate that would have caught #3 on day one. Quality metrics cannot detect liveness failures. |
-| 5 | **Fix caller attribution** | All 1,961 logged queries record `client='cli'`. Per-consumer and per-tenant analysis is impossible, and it is already corrupting the signal the learning loop would train on. |
-| 6 | **p50 latency measures the wrong thing** | Eval now records 0.4–1ms cache lookups, so the `<500ms` gate is unobservable rather than passing. Needs a cold-path measurement, or the gate is theatre. |
-| 7 | **MRR drifted −3.1% with the gate green** | The regression gate did not fire on a real quality drop. Either the threshold is too loose or the metric is the wrong one. |
-| 7b | **Gate-freezing discipline** | Gates frozen in a commit before the run; failed runs leave persistent FAIL rows; post-hoc strata are findings, never certifications. Self-concealing failure mode — a moved gate leaves an artifact that looks like a pass. Spec §G |
-| 7c | **Cold-path + per-tenant-age metrics** | Fleet-average cache hit rate is dominated by the oldest tenant and hides new-tenant experience. Spec §E8 |
-
----
-
-## P2 — Build
-
-| # | Item | Detail |
-|---|---|---|
-| 8 | **`alexandria serve`** | One stdlib HTTP service. Top unlock: no consumer except in-process Pi can reach Alexandria today, though `README.md:201` promises "anything that can call an HTTP endpoint". Also the natural home for auth and tenant resolution. |
-| 9 | **Tenant scope object** | Resolved once at the entry boundary, threaded through retrieval / synthesis / cache / audit. Structural, not a filter a caller can forget. Spec §A2–A3 |
-| 10 | **Per-tenant index sharding** | Physical isolation; also delivers deletion-as-drop-index and per-tenant policy tuning in the same mechanism. Spec §A3 |
-| 11 | **Concurrency model** | A serving layer creates the first concurrent readers/writers against SQLite + vector store. Untested territory. Spec §B3 |
-| 12 | **Citation-label extraction** | Route traces already record which retrieved chunks were cited — a free implicit relevance label on every real query, currently discarded. Extract `(query, chunk_id, rank, was_cited)`. Spec §C1 |
-| 13 | **Log the full retrieved set with ranks** | Precondition for #12 being unbiased. Only retrieved chunks can be cited, so naive training reinforces existing blind spots. Spec §C4 |
-| 14 | **Offline policy tuning** | Tune RRF weights, `wiki_boost` (a `1.25` nobody measured), rerank depth, `k`, chunk strategy — validated against the held-out human golden set. Spec §C2–C3 |
-| 15 | **Wikilink-graph traversal** | Borrowed from the Tencent comparison: BFS over wikilinks reaches documents with zero lexical or vector overlap. Directly targets the 38.9% zero-overlap band, which is the weakest measured surface. Highest-value external idea found. |
-| 16 | **Split bulk vs interactive LLM endpoints** | As **config, not services** (~20 lines). Enrichment/synthesis is latency-tolerant and wants a cheap model; the answer path is quality-critical. `--base-url`/`--api-key-env` already landed in `da2993d`; per-invocation flag juggling has already caused one slip. |
-| 17 | **Phase-2 full sweep** | `WORK-ORDER-phase2-full-sweep.md` was written and never dispatched. The 97.1% figure is a post-hoc stratum that excludes the failing cluster; the sweep is what would make it real. |
-| 18 | **Fresh-clone step 4/5 hard-fails** | `wiki-site` exits 2 in the clean-clone path, masked by a `|| true`. The phase-4 "works from a fresh clone" claim rests on a suppressed error. |
-| 18b | **Citation-derived cache scope** | An answer's cache scope = the join of its cited chunks' scopes. Answers citing only shared material are globally cacheable; one private citation makes it tenant-scoped. Provenance becomes a performance feature. Spec §E3 |
-| 18c | **Share the embedding cache globally** | Already content-addressed (`sha256(model+revision+mode+text)`) with no tenant component — needs a placement decision, not a redesign. Largest single cold-start win. Spec §E2 |
-| 18d | **Per-tenant cache quota + eviction** | No LRU, no ceiling, no quota exists; only a full `DELETE FROM cache`. Noisy-neighbour vector. Spec §E5 |
-| 18e | **Onboarding warm-up pass** | Pre-run a seed query set derived from corpus structure so cold-start is a provisioning cost, not a customer-facing latency cost. Spec §E6 |
-| 18f | **Single-flight** | Concurrent identical misses currently impossible (process-per-invocation); routine once `serve` exists. Spec §E7 |
-| 18g | **Dogfooding after `serve`** | Nobody noticed a 3-day corpus freeze — the system is built and measured but not depended upon. Blocked on #8, not on discipline. Spec §H |
-
----
-
-## P3 — Deferred, with named triggers
+## P2 / P3 — Deferred, with named triggers
 
 | # | Item | Trigger |
 |---|---|---|
-| 19 | IVF index | A tenant crosses ~200k chunks (currently ~40k). Additive `create_index`; no refactor. |
-| 20 | HNSW | Latency becomes critical **and** RAM is cheap **and** reindex frequency drops. Hostile to incremental update. |
-| 21 | PQ quantization | Memory-bound only. Trades recall for RAM, and would degrade the 38.9% zero-overlap band — already the weakest surface. Measure the recall cost if ever adopted. |
-| 22 | Distributed ANN | A single tenant exceeds ~10M chunks, or genuine cross-tenant search becomes a requirement. Sharding by tenant addresses the actual scaling axis. |
-| 23 | Proxy pattern | Inject memory into any OpenAI/Anthropic-compatible client without per-harness extensions. Wait until #8 exists — the proxy is a thin layer over it. |
-| 24 | Conversational distillation layer | Compress raw session logs before indexing. Wait for evidence that raw sessions are hurting retrieval. |
-| 25 | Enterprise ingestion connectors | Current connectors read harness-native local stores. Wikis / chat / document stores / drives are the actual product surface. Blocked on the tenant model (#9). |
+| 27 | **Tenant scope object** and **per-tenant sharding** (spec A2/A3) | **Not** "a second customer org". The real trigger is **the first customer requiring intra-organization document ACLs** — see spec §12.4. Ask this in the first sales conversation |
+| 28 | Per-tenant generation counters (E4), cache quotas (E5), shared embedding cache (E2) | Same trigger as #27. The global counter is *correct* for one install |
+| 29 | Offline policy tuning (spec C2–C3) | Blocked on **both** #9 (citation linkage) and #21 (golden set needs negative cases and a significance bar) |
+| 30 | Wikilink-graph traversal | Targets the 38.9% zero-overlap band — highest-value external idea found. Unblocked, but below the critical path |
+| 31 | Split bulk vs interactive LLM endpoints | Config, not services (~20 lines) |
+| 32 | Phase-2 full sweep | `WORK-ORDER-phase2-full-sweep.md` written, never dispatched |
+| 33 | Fresh-clone step 4/5 hard-fails | `wiki-site` exits 2, masked by `|| true` |
+| 34 | CJK chunker under-count ~3× (N23) | No-tokenizer fallback path |
+| 35 | IVF index | A corpus crosses ~200k chunks (currently ~40k pre-enrichment, ~125k after) |
+| 36 | HNSW / PQ / distributed ANN | See spec §4. PQ avoided by default — it degrades the weakest measured surface |
+| 37 | Enterprise ingestion connectors | Blocked on #5 (injection guard). Do not open a third-party ingestion path first |
+| 38 | Proxy pattern; conversational distillation | Below the line until `serve` exists |
+| 39 | Orphan 0 B `enrichment.sqlite` at corpus root (N28/pass-2 P3) | Ops-confusion hazard — the real DB is at `index/enrichment.sqlite` (26.9 MB). Already caused one auditor disagreement |
 
 ---
 
 ## Documentation debt
 
-| # | Item | Detail |
-|---|---|---|
-| 26 | **Phase certification language** | Audit found 0 of 6 phase rows fully SOLID against their own gates, while docs read as certified. Either re-measure or downgrade the claims — the discrepancy is the problem, not the numbers. |
-| 27 | **Phase-3 harness doc vs shipped extension** | The decision text says "two tools, nothing else"; the installed extension ships four, including a working write verb. Reconcile. |
-| 28 | **`bb7923b` "pre-registered" claim** | The admission that it was not pre-registered lands only in follow-up `35c9e80`. The original claim should carry the correction inline. |
-| 29 | **README endpoint promise** | `README.md:201` promises an HTTP endpoint that does not exist. Fix the README or build #8. |
+| # | Item |
+|---|---|
+| 40 | **Phase certification language** — 0 of 6 phase rows fully solid against their own gates while all read as certified. Re-measure or downgrade |
+| 41 | **Phase-3 harness doc vs shipped extension** — decision says "two tools, nothing else"; four ship |
+| 42 | **`bb7923b` "pre-registered" claim** — the correction lands only in follow-up `35c9e80` |
+| 43 | **`README.md:201`** promises an HTTP endpoint that does not exist (closed by #3) |
 
 ---
 
-## Open questions
+## Closed by audit
 
-Carried from `SPEC-multi-tenant-and-learning-loop.md` §7 — these block design, not code:
-
-1. **Is a tenant an org, a workspace, or a user?** Propagates into every scope key.
-2. **Embedding-model migration.** Changing the embedder invalidates every vector; with many tenants this needs a staged re-embed, not a global rebuild.
-3. **Cost attribution + rate limiting per tenant.** Enterprise buyers expect caps and chargeback.
-4. **Exposing provenance to end users.** Per-claim citation and route traces are the differentiator, currently visible only in a static site renderer.
+- ~~Log the full retrieved set with ranks~~ — **already implemented**, 2,030/2,030 rows populated.
+- ~~Add untrusted-data framing to `write.py`/`gather.py`/`repair.py`~~ — **already present** since 2026-08-05/07. The gap is `enrich.py` only (#5).
