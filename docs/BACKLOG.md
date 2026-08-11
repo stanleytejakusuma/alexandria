@@ -18,6 +18,8 @@ Legend: **P0** liability · **P1** blocks other work · **P2** valuable · **P3*
 | 1 | **Cross-tenant response-cache leak** | `ResponseCache.key()` carries no scope dimension; two tenants asking the same question share a cache row. Harmless at one user, a breach at two. `SPEC-multi-tenant-and-learning-loop.md` §A1 |
 | 2 | **Verify the weekly loop actually runs** | `run-weekly-loop.sh` missing-`mkdir` fixed in `315418b`, but the fix is **unverified in the wild** — the loop has never once completed successfully. Do not trust it until one real run produces a digest. |
 | 3 | **Re-sync the frozen corpus** | Corpus stopped ingesting ~Aug 8. Even with the loop fixed, the three-day gap needs an explicit catch-up sync. |
+| 3b | **Prompt-injection guard** | `chunk.text` is raw-interpolated into `<chunk>` delimiters in `synthesis/write.py`, `gather.py`, `repair.py`; no untrusted-data framing anywhere. Delimiter escape + instruction-following. Amplified by citations, and the real blast radius is the downstream agent's tools. Spec §F |
+| 3c | **Global generation counter** | `cache.py:26` — one counter per install, so any tenant's reindex invalidates every tenant's cache. Right mechanism, wrong granularity. Spec §E4 |
 
 ---
 
@@ -29,6 +31,8 @@ Legend: **P0** liability · **P1** blocks other work · **P2** valuable · **P3*
 | 5 | **Fix caller attribution** | All 1,961 logged queries record `client='cli'`. Per-consumer and per-tenant analysis is impossible, and it is already corrupting the signal the learning loop would train on. |
 | 6 | **p50 latency measures the wrong thing** | Eval now records 0.4–1ms cache lookups, so the `<500ms` gate is unobservable rather than passing. Needs a cold-path measurement, or the gate is theatre. |
 | 7 | **MRR drifted −3.1% with the gate green** | The regression gate did not fire on a real quality drop. Either the threshold is too loose or the metric is the wrong one. |
+| 7b | **Gate-freezing discipline** | Gates frozen in a commit before the run; failed runs leave persistent FAIL rows; post-hoc strata are findings, never certifications. Self-concealing failure mode — a moved gate leaves an artifact that looks like a pass. Spec §G |
+| 7c | **Cold-path + per-tenant-age metrics** | Fleet-average cache hit rate is dominated by the oldest tenant and hides new-tenant experience. Spec §E8 |
 
 ---
 
@@ -47,6 +51,12 @@ Legend: **P0** liability · **P1** blocks other work · **P2** valuable · **P3*
 | 16 | **Split bulk vs interactive LLM endpoints** | As **config, not services** (~20 lines). Enrichment/synthesis is latency-tolerant and wants a cheap model; the answer path is quality-critical. `--base-url`/`--api-key-env` already landed in `da2993d`; per-invocation flag juggling has already caused one slip. |
 | 17 | **Phase-2 full sweep** | `WORK-ORDER-phase2-full-sweep.md` was written and never dispatched. The 97.1% figure is a post-hoc stratum that excludes the failing cluster; the sweep is what would make it real. |
 | 18 | **Fresh-clone step 4/5 hard-fails** | `wiki-site` exits 2 in the clean-clone path, masked by a `|| true`. The phase-4 "works from a fresh clone" claim rests on a suppressed error. |
+| 18b | **Citation-derived cache scope** | An answer's cache scope = the join of its cited chunks' scopes. Answers citing only shared material are globally cacheable; one private citation makes it tenant-scoped. Provenance becomes a performance feature. Spec §E3 |
+| 18c | **Share the embedding cache globally** | Already content-addressed (`sha256(model+revision+mode+text)`) with no tenant component — needs a placement decision, not a redesign. Largest single cold-start win. Spec §E2 |
+| 18d | **Per-tenant cache quota + eviction** | No LRU, no ceiling, no quota exists; only a full `DELETE FROM cache`. Noisy-neighbour vector. Spec §E5 |
+| 18e | **Onboarding warm-up pass** | Pre-run a seed query set derived from corpus structure so cold-start is a provisioning cost, not a customer-facing latency cost. Spec §E6 |
+| 18f | **Single-flight** | Concurrent identical misses currently impossible (process-per-invocation); routine once `serve` exists. Spec §E7 |
+| 18g | **Dogfooding after `serve`** | Nobody noticed a 3-day corpus freeze — the system is built and measured but not depended upon. Blocked on #8, not on discipline. Spec §H |
 
 ---
 
