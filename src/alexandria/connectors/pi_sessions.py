@@ -60,6 +60,13 @@ RULES, in priority order:
    "capital-gate.ts". Bad: "market-data-service (main @ 2b68ec2)", "coverage table
    (stock rows)". Detail belongs in `facts`, not in an entity name.
 
+5. Return AT MOST 20 observations. If the session supports more, keep the 20 most
+   durable and drop the rest. This is not a stylistic preference: a response that
+   exceeds the model's output limit is cut off mid-string and parses as nothing,
+   so an over-long answer yields ZERO observations rather than many. A bounded
+   list always beats an exhaustive one. (Observed 2026-08-11: 14 of 465 bursts
+   were lost this way; the average productive burst yields ~7.)
+
 Return ONLY valid JSON, with no prose before or after it:
 {"observations": [{"title": str, "narrative": str, "facts": [str],
                    "entities": [str], "tags": [str]}]}

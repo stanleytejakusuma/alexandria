@@ -189,3 +189,38 @@ def test_open_with_deadline_returns_body(monkeypatch):
     monkeypatch.setattr(llm_mod.urllib.request, "urlopen", lambda req, timeout: FastResponse())
     body = _open_with_deadline(urllib.request.Request("http://x"), timeout=5)
     assert body == b'{"ok": true}'
+
+
+def test_a_truncated_response_says_so_instead_of_yielding_broken_json(monkeypatch):
+    """finish_reason=length means the model was cut off mid-stream. Returning the
+    partial content makes the CALLER fail with 'Unterminated string starting at
+    column 30744', which reads like a parser bug and hides the real cause -- how
+    14 of 465 session bursts failed on 2026-08-11."""
+    import json as _json
+
+    from alexandria import llm as _llm
+
+    body = _json.dumps({
+        "choices": [{"finish_reason": "length",
+                     "message": {"content": '{"observations": [{"title": "half a str'}}],
+        "usage": {"completion_tokens": 8192},
+    })
+    monkeypatch.setattr(_llm, "_open_with_deadline", lambda req, timeout: body)
+    client = LLMClient(base_url="http://x/v1", model="m")
+
+    with pytest.raises(LLMError) as caught:
+        client._once("sys", "user")
+    assert "truncated" in str(caught.value)
+    assert "8192" in str(caught.value), "should report how much came back"
+    assert caught.value.retryable is False, "an identical request truncates identically"
+
+
+def test_a_complete_response_is_returned_untouched(monkeypatch):
+    import json as _json
+
+    from alexandria import llm as _llm
+
+    body = _json.dumps({"choices": [{"finish_reason": "stop",
+                                     "message": {"content": "full answer"}}]})
+    monkeypatch.setattr(_llm, "_open_with_deadline", lambda req, timeout: body)
+    assert LLMClient(base_url="http://x/v1", model="m")._once("s", "u") == "full answer"

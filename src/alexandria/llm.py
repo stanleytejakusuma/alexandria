@@ -175,8 +175,25 @@ class LLMClient:
         except Exception as exc:  # usage is advisory; never fail a call on it
             self.last_usage_error = f"{type(exc).__name__}: {exc}"
         try:
-            return body["choices"][0]["message"]["content"]
+            choice = body["choices"][0]
         except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"unexpected response shape: {str(body)[:200]}") from exc
+        # A truncated response is not a malformed one. Without this check the
+        # caller parses a half-written JSON object and reports "Unterminated
+        # string starting at column 30744", which reads like a parser bug and
+        # says nothing about the real cause. Observed 2026-08-11: 14 of 465
+        # session bursts failed exactly this way. NOT retryable -- an identical
+        # request truncates at an identical place, so retrying only burns calls.
+        if choice.get("finish_reason") == "length":
+            err = LLMError(
+                "response truncated at the output limit (finish_reason=length, "
+                f"{self.last_usage.get('completion_tokens', 0)} completion tokens) -- "
+                "send less input or raise the limit")
+            err.retryable = False
+            raise err
+        try:
+            return choice["message"]["content"]
+        except (KeyError, TypeError) as exc:
             raise LLMError(f"unexpected response shape: {str(body)[:200]}") from exc
 
 
