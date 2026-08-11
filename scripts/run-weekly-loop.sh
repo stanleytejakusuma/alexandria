@@ -107,8 +107,12 @@ VERIFY_STATUS=0
 # the self-check is that a silent failure becomes visible, so push it somewhere
 # with a human on the other end. Best-effort: never let notification failure
 # change the run's verdict.
-if [ "$VERIFY_STATUS" -ne 0 ] && command -v terminal-notifier >/dev/null 2>&1; then
-  terminal-notifier \
+# Absolute path deliberately: launchd runs with PATH=/usr/bin:/bin:/usr/sbin:/sbin,
+# which cannot see /opt/homebrew/bin, so a bare `terminal-notifier` here would
+# silently never fire -- a failure notifier that is itself an invisible no-op.
+NOTIFIER="${ALEXANDRIA_NOTIFIER:-/opt/homebrew/bin/terminal-notifier}"
+if [ "$VERIFY_STATUS" -ne 0 ] && [ -x "$NOTIFIER" ]; then
+  "$NOTIFIER" \
     -title "Alexandria weekly loop FAILED" \
     -subtitle "$(grep -c '\[FAIL\]' "$DIGEST" 2>/dev/null || echo '?') check(s) failed" \
     -message "$(grep '\[FAIL\]' "$DIGEST" | tail -3 | tr '\n' ' ' | cut -c1-180)" \
