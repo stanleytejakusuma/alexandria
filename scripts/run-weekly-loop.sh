@@ -4,7 +4,11 @@
 # 2. index the newly synced docs so retrieval can actually see them
 # 3. review the query log (gaps, cluster jumps, latency)
 # 4. append a digest + commit the corpus snapshot
-# Exit 0 always; failures are recorded in the digest, never fatal.
+# 5. VERIFY the run actually changed something, and exit non-zero if it did not
+# Individual step failures are recorded in the digest and are never fatal, so one
+# bad sync cannot stop the rest. The final verification is different: it exits
+# non-zero, because a loop that silently does nothing is the failure this script
+# has actually suffered, and a digest nobody reads cannot surface it.
 set -u
 CORPUS="${ALEXANDRIA_CORPUS:-$HOME/alexandria-corpus}"
 REPO="$HOME/codebase/alexandria"
@@ -16,6 +20,11 @@ DIGEST="$CORPUS/.alexandria/loop/weekly-digest.md"
 # each sync from executing at all, leaving only the --allow-empty commit as
 # evidence of a "successful" run. (Observed: 1 empty commit, 0 syncs.)
 mkdir -p "$(dirname "$DIGEST")"
+# Snapshot BEFORE the run so the post-run check can compare against something
+# real rather than trusting exit codes.
+DOCS_BEFORE=$(find "$CORPUS/sources" "$CORPUS/wiki" -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
+GEN_BEFORE=$(python3 -c "import json;print(json.load(open('$CORPUS/.alexandria/index/generation.json')).get('generation',0))" 2>/dev/null || echo 0)
+
 STAMP="$(date '+%Y-%m-%d %H:%M %Z')"
 KEY="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"
 
@@ -85,4 +94,14 @@ else
     || echo "corpus commit FAILED" >> "$DIGEST"
 fi
 
+# The load-bearing step. Everything above reports what it INTENDED to do; this
+# checks what actually happened to the corpus, the index, and retrieval.
+echo "### verify (did the loop actually change anything?)" >> "$DIGEST"
+VERIFY_STATUS=0
+"$REPO/.venv/bin/python" "$REPO/scripts/verify-loop-run.py" \
+  --corpus "$CORPUS" --binary "$REPO/.venv/bin/alexandria" \
+  --docs-before "$DOCS_BEFORE" --generation-before "$GEN_BEFORE" \
+  >> "$DIGEST" 2>&1 || VERIFY_STATUS=1
+
 echo "done" >> "$DIGEST"
+exit "$VERIFY_STATUS"
