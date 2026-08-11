@@ -657,94 +657,138 @@ Per project doctrine, phases advance on measurement, not on feeling done.
 
 ---
 
-## 12. Deployment model — RESOLVED: single-tenant per install
+## 12. Access model — RESOLVED: one brain, two boundaries
 
-**Decision (2026-08-11):** target **one install per customer organization**
-(on-prem / customer VPC / self-hosted), not a shared multi-tenant SaaS. This resolves
-open question §11.1 and reorders much of this document.
+> **This section supersedes a decision made earlier the same day.** The prior §12
+> concluded *single-tenant per install, on-prem, no shared platform*. That was wrong. It
+> is recorded rather than deleted, per §7 G3b — a superseded decision is evidence about
+> how the reasoning failed, and deleting it would hide the pattern.
+>
+> **How it failed:** the stated requirement ("multiple users simultaneously and
+> concurrently") was read as a *concurrency* requirement and the isolation half was
+> argued away. The real requirement is both, and the isolation half has more structure
+> than either draft assumed. The lesson generalizes: when a requirement is ambiguous
+> between two readings, the failure mode is picking the cheaper one and building a
+> justification, rather than asking.
 
-### 12.1 The distinction the earlier draft missed
+**Decision:** one shared platform — "a single brain" — reachable from many installs on
+many machines, serving **many organizations and many teams within each organization.**
 
-The requirement was stated as *"multiple users would be able to use this simultaneously
-and concurrently."* Earlier sections of this spec read that as a **tenant-isolation**
-requirement and ordered everything around it. It is primarily a **concurrency**
-requirement.
+### 12.1 Two boundaries, not one
 
-Those are different problems with different costs:
+The earlier drafts modelled a single boundary and got it wrong in both directions. There
+are two, with *opposite* mechanisms:
 
-| | Concurrency | Tenant isolation |
+| | **Organization** | **Team / user (within an org)** |
 |---|---|---|
-| Problem | N users hitting one install at once | N *organizations* sharing one install |
-| Needs | serving layer, SQLite/WAL config, single-flight, connection handling | scope threading, per-tenant indexes/caches/generations, quotas, cross-tenant tests |
-| Required by the stated goal | **Yes** | Only under a SaaS deployment model |
+| Nature | hard boundary | **graded visibility** |
+| Cross-boundary read | never | **deliberate, directional — the point of the product** |
+| Mechanism | physical separation: own index, own generation, own caches | one shared index, ACL-filtered at query time |
+| Deletion | drop the index | reconcile within the index |
 
-Every enterprise buyer needs the first. Only a shared-SaaS deployment needs the second.
+**Why the team boundary must NOT be physical.** The driving scenario: a contract in
+flight, biz dev holding the client relationship. Midway, the client asks to see
+implementation. Engineering taps the pool, reads *what the client actually asked for* as
+captured by biz dev, builds it, reports back through biz dev. That cross-team read **is
+the value**. Sharding physically by team would destroy it. Meanwhile engineering must not
+reach C-level material, and C-level must read across everything to monitor progress.
 
-### 12.2 Why single-tenant is the right first target
+That is a *directed visibility graph*, not a partition. Part A3's physical-isolation
+argument stands at the organization level and is **withdrawn at the team level**.
 
-- **It is what enterprise knowledge buyers actually procure.** Systems ingesting internal
-  documents are overwhelmingly deployed on-prem or in the customer's own cloud account.
-  Shared-SaaS is the harder sale for exactly this category.
-- **It matches the product's actual differentiator.** Local-first sovereignty is the
-  strongest scored axis against alternatives. A shared multi-tenant SaaS *discards* that
-  advantage — it moves the privacy boundary off the customer's machine, which is the
-  thing the design exists to avoid.
-- **Isolation becomes free and absolute.** Separate installs cannot leak to each other by
-  construction. No scope key can be forgotten, because there is no scope key.
-- **It removes the largest and least certain body of work** in this spec at the exact
-  moment the fundamentals (deletion, backup, auth, cost, observability) are unbuilt.
+### 12.2 The primitive: scope-set intersection, not RBAC
 
-### 12.3 What this changes
+One concept, deliberately minimal:
 
-**Deprioritized** — retained as design record, not scheduled:
+- every chunk carries a **`scope`** label;
+- every principal carries a **`visible_scopes`** set;
+- retrieval returns a chunk only where `chunk.scope ∈ principal.visible_scopes`.
 
-- Part A2/A3 tenant scope threading and per-tenant index sharding.
-- E4 per-tenant generation counters (the global counter is *correct* for one install).
-- E5 per-tenant cache quotas — noisy-neighbour requires neighbours.
-- E2's cross-tenant embedding-cache sharing, and with it its side-channel question.
+No roles, no inheritance tree, no policy language. That single field expresses every case
+required so far:
 
-**Promoted** — these are now the critical path, and are required under *either* model:
+| Case | Configuration |
+|---|---|
+| Hierarchical (exec / bizdev / eng) | `eng = {eng, shared}`, `bizdev = {bizdev, shared}`, `exec = ⊤` |
+| Flat team — everyone sees everything | every principal gets `⊤` |
+| **Administrator / owner** | `⊤` — the unfiltered set (see 12.3) |
+| Single personal install | one principal holding `⊤`; no configuration required |
 
-- **B3 concurrency** (was P2, now P0): the actual reading of the stated requirement.
-- **Deletion** (pass-1 N1): erasure survives in ≥6 unlinked copies. A DPA fails on this
-  regardless of deployment model.
-- **Backup/restore** (N5), **observability** (N19), **cost measurement** (N8).
-- **F3 enrichment injection guard**: an on-prem customer ingests *their* documents, which
-  are third-party relative to this code. The premise that ingestion is trusted dies with
-  the first customer, not the second.
-- **Procurement artifacts**: LICENSE fitness, SECURITY.md, threat model, data-handling
-  statement, a versioned release artifact. A sale stops here before code quality is ever
-  in scope.
+**Enforcement point already exists.** `store.py:74` passes `prefilter=True`, so the
+metadata filter runs *before* the vector scan. Built for performance; it is now also the
+security gate. Do not add a post-filter — a post-filtered ANN search leaks through result
+counts and scores even when it hides text.
 
-**Unaffected:** Parts C (learning loop), G (measurement discipline), H (dependability),
-and D (index strategy) are deployment-model-independent.
+### 12.3 The administrative scope
 
-### 12.4 The one place the earlier analysis still holds — the ACL trigger
+There is an explicit **unfiltered principal**: an administrator holds `⊤`, the scope set
+that matches every chunk, and retrieves across the entire knowledge pool with no filter
+applied. Three requirements attach to it, because an always-on superuser is a standing
+risk as well as a feature:
 
-Pass 2 concluded that single-tenant makes Part A "almost entirely moot." That is too
-strong, and the exception is worth stating precisely.
+- **12.3a** — `⊤` is a real value in the same lattice, not a code path that skips
+  filtering. A branch that bypasses the filter is a branch that can be reached by
+  accident; a scope value that happens to match everything cannot be.
+- **12.3b** — administrative reads are **audit-logged with the scope actually used**, so
+  "who saw everything, when" is answerable. This is the primary compensating control.
+- **12.3c** — an administrative answer must never populate a cache entry visible to a
+  narrower principal. This follows from 12.4 but is called out because it is the exact
+  shape of the leak: the admin has, by construction, retrieved across every scope.
 
-The cross-cache leak of §A1 is **not** eliminated by single-tenancy. It is *reclassified*
-from a cross-**organization** leak to a cross-**user** one. `ResponseCache` still has no
-scope dimension, so within one install, if user A asks a question answered from documents
-user B cannot access, B receives A's cached answer on the same question.
+**The single-user install is this case.** The owner is an administrator holding `⊤`.
+There is no separate single-user mode — personal use is the degenerate configuration of
+the same model, which means the enterprise path is exercised daily by ordinary use
+instead of being an untested branch.
 
-Whether that matters is a single, answerable product question:
+### 12.4 Cache scope is the permission set, not the user
 
-> **Do all users within a customer install share identical document access?**
+The §A1 leak returns with a sharper edge. Inside one org, a C-level principal and an
+engineer ask the same question; `ResponseCache` has no scope dimension, so the engineer
+receives the C-level answer. This is precisely the failure the access model exists to
+prevent, and organization-level partitioning does nothing about it.
 
-- **Yes** (a single engineering team over shared dev exhaust — the likely first wedge):
-  the leak is genuinely moot, and §12.3's deprioritization is correct as written.
-- **No** (any org with HR, legal, finance, or per-team document boundaries): the scope
-  work returns immediately — as a **per-principal ACL** rather than a per-tenant scope,
-  but the mechanism in A1–A3 is the same and the cache key still needs a scope dimension.
+Keying the cache per *user* would be correct and nearly useless — hit rate collapses to
+per-person. The right granularity is the **permission set**: principals with identical
+`visible_scopes` share cache entries.
 
-**Trigger to re-admit Part A:** not "a second customer organization", but **the first
-customer requiring intra-organization document access control.** That is a much earlier
-and more likely trigger than a SaaS pivot, and it should be asked in the first sales
-conversation, not discovered during implementation.
+**And E3 becomes an enforcement mechanism, not just an optimization.**
+`scope(answer) = join(scope of every cited chunk)` computes precisely which principals may
+receive a cached answer; an answer citing one C-level chunk is automatically C-level-only.
+The per-claim citation system does the enforcement. That design survives this reversal
+unchanged and is strengthened by it — but it remains **blocked on C1** (see §5 E3).
 
-### 12.5 Re-entry conditions
+### 12.5 ACLs change; caches and policies remember
 
-Return to shared multi-tenancy only on: a deliberate SaaS pivot, or a self-serve tier
-where per-customer install cost exceeds revenue per customer. Neither is near.
+People move teams, documents get reclassified, contracts close. Both cached answers and
+any learned policy (Part C) encode the permissions in force when they were written.
+
+**Requirement 12.5:** a scope-membership change invalidates dependent cache entries. The
+generation counter is the existing mechanism and can carry this if keyed per scope rather
+than per install (see E4, which is re-admitted by this decision).
+
+### 12.6 What this re-admits
+
+Reversing the prior §12 restores to the critical path: **A1/A2** (scope threading, cache
+scope dimension), **A3 at organization granularity only**, **E4** per-scope generation
+counters, **E5** quotas, and **E2**'s shared-embedding-cache side-channel question.
+Deferred, per the owner's instruction to stop before real enterprise input: full RBAC,
+delegation, scope hierarchies, and cross-org federation.
+
+### 12.7 The unsolved problem: who assigns scope at ingestion
+
+The primitive above is cheap. Assigning it is not, and this is where comparable systems
+fail. Connectors read sources that already carry their own permissions — a channel, a
+folder, a repository. **Hand-labelled scopes will drift and leak within weeks.** The only
+durable answer is scope *inherited* from each source system's existing permission model,
+which makes it a per-connector integration problem rather than a core-model problem.
+
+Deliberately deferred until a real deployment supplies the requirement. Build the
+primitive; defer the assignment. Recorded here so the deferral is explicit rather than an
+oversight, because it is the most likely cause of a future breach.
+
+### 12.8 Positioning note
+
+The driving scenario is a *workflow* story, not a retrieval story: **the right team can
+find what another team learned, without seeing what they shouldn't.** That is a sharper
+and more defensible pitch than "enterprise RAG", and unlike per-claim citation it is not
+a feature a competitor can add in a sprint. Worth treating as the wedge.
