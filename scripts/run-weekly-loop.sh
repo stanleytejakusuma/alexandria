@@ -41,6 +41,13 @@ echo "### sync journal (accountability digest)" >> "$DIGEST"
   --journal-path "$HOME/citadel/personal-finance/accountability.md" \
   >> "$DIGEST" 2>&1 || echo "journal sync FAILED" >> "$DIGEST"
 
+# The vault is the upstream for ~70% of the corpus and the ONLY durable home of
+# ~1,296 harness memories the live store has already rotated out. No LLM, no
+# gateway: pure normalize-and-copy, so it runs even when the gateway is down.
+echo "### sync knowledge-graph (vault memories)" >> "$DIGEST"
+"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" sync knowledge-graph \
+  >> "$DIGEST" 2>&1 || echo "knowledge-graph sync FAILED" >> "$DIGEST"
+
 echo "### sync inbox (explicit memories)" >> "$DIGEST"
 "$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" sync inbox \
   >> "$DIGEST" 2>&1 || echo "inbox sync FAILED" >> "$DIGEST"

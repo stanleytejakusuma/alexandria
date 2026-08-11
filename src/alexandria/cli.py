@@ -30,6 +30,7 @@ from .config import AppConfig, load_config
 from .corpus import Doc
 from .connectors.inbox import INBOX_META_RE, InboxConnector, parse_inbox_file
 from .connectors.journal import JournalConnector
+from .connectors.knowledge_graph import KnowledgeGraphConnector
 from .connectors.md_memory import SEPARATOR, MarkdownMemoryConnector
 from .connectors.pi_sessions import PiSessionsConnector
 from .eval.golden import load_golden, verify_targets
@@ -93,6 +94,8 @@ def _sync_connector(args):
             memory_dir=args.memory_dir or str(Path.home() / ".pi/agent/memory"),
             projects_dir=args.projects_dir or None,
         )
+    if args.connector == "knowledge-graph":
+        return KnowledgeGraphConnector(vault_dir=args.vault_dir)
     if args.connector == "inbox":
         return InboxConnector(inbox_dir=corpus / "inbox")
     if args.connector == "journal":
@@ -793,6 +796,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--memory-dir", default=os.environ.get("ALEXANDRIA_MEMORY_DIR", ""),
                   help="harness memory store dir (markdown-memory)")
     s.add_argument("--projects-dir", default="")
+    s.add_argument("--vault-dir", default=str(Path.home() / "knowledge-graph"),
+                   help="Obsidian knowledge-graph vault (knowledge-graph connector)")
     s.add_argument("--journal-path",
                    default=str(Path.home() / "citadel/personal-finance/accountability.md"))
     s.add_argument("--base-url", default="http://127.0.0.1:20128/v1")
