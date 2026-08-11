@@ -148,10 +148,37 @@ def test_parser_exposes_answer_verb():
     assert "answer" in verbs
 
 
+def test_searching_a_corpus_that_was_never_indexed_fails_loudly(tmp_path):
+    """Measured on a real host 2026-08-11: `search` against a corpus directory
+    that did not exist returned EXIT=0 and printed nothing, because building the
+    engine created the index directory on the way past. Zero hits from a missing
+    corpus is indistinguishable from zero hits from a corpus that genuinely lacks
+    the answer, so a mis-provisioned consumer reports confident false negatives.
+    """
+    with pytest.raises(SystemExit) as exc:
+        app(["--corpus", str(tmp_path), "search", "anything"])
+    assert "never indexed" in str(exc.value)
+    assert not (tmp_path / ".alexandria" / "index" / "chunks.lance").exists(), \
+        "the guard must refuse BEFORE the store materialises an empty index"
+
+
+def _stub_index(corpus):
+    """Satisfy the "corpus was actually indexed" precondition.
+
+    These tests stub `run_pipeline`, so the engine is never used for retrieval --
+    but building it still asserts an index exists. Before that check, an
+    unindexed corpus silently produced an EMPTY index and zero hits, which is
+    why the assertion exists; faking the artifact here keeps these tests about
+    answer rendering rather than about indexing.
+    """
+    (corpus / ".alexandria" / "index" / "chunks.lance").mkdir(parents=True, exist_ok=True)
+
+
 def test_answer_prints_the_emitted_page(tmp_path, monkeypatch, capsys):
     from pathlib import Path
     import alexandria.synthesis.pipeline as synth_pipeline
 
+    _stub_index(tmp_path)
     page = tmp_path / "emitted" / "what-happened.md"
     page.parent.mkdir()
     page.write_text("---\ntitle: what happened\n---\n\nThe signer crashed. [^1]\n", encoding="utf-8")
@@ -174,6 +201,7 @@ def test_answer_prints_the_emitted_page(tmp_path, monkeypatch, capsys):
 
 
 def test_answer_failure_exits_one_with_failed_claims(tmp_path, monkeypatch, capsys):
+    _stub_index(tmp_path)
     import alexandria.synthesis.pipeline as synth_pipeline
 
     claim = type("C", (), {"id": "c1", "text": "a claim that could not be cited"})()

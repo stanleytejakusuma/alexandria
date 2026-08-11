@@ -677,8 +677,29 @@ def _config_for(args) -> AppConfig:
     return load_config(corpus_override=getattr(args, "corpus", None))
 
 
+def _require_index(corpus: Path) -> None:
+    """Refuse to search a corpus that was never indexed.
+
+    ``VectorStore.__init__`` does ``mkdir(parents=True, exist_ok=True)``, so
+    building an engine over a missing corpus CREATES an empty index and returns
+    exit 0 with zero hits -- indistinguishable from "this knowledge does not
+    exist". A wrong ``--corpus`` path or an unprovisioned host therefore becomes
+    a confident false negative rather than a loud failure. Checked here because
+    this is the single chokepoint for search, answer, and eval.
+    """
+    index_dir = corpus / ".alexandria" / "index"
+    if (index_dir / "chunks.lance").exists() or (index_dir / "fallback.sqlite").exists():
+        return
+    raise SystemExit(
+        f"alexandria: no index at {index_dir} -- the corpus is missing or was "
+        f"never indexed, so every query would return zero results. "
+        f"Run: alexandria --corpus {corpus} index"
+    )
+
+
 def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True,
                          corpus_root: Path | None = None) -> SearchEngine:
+    _require_index(corpus)
     return SearchEngine(
         _cached_embedder(config, corpus),
         VectorStore(corpus / ".alexandria" / "index"),
