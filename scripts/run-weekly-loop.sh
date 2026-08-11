@@ -10,6 +10,11 @@ REPO="$HOME/codebase/alexandria"
 BASE_URL="${ALEXANDRIA_BASE_URL:?set in LaunchAgent}"
 KEYCHAIN_SERVICE="${ALEXANDRIA_KEYCHAIN_SERVICE:?set in LaunchAgent}"
 DIGEST="$CORPUS/.alexandria/loop/weekly-digest.md"
+# Every line below appends to $DIGEST. Bash resolves redirects BEFORE running
+# the command, so a missing parent dir does not just lose the log -- it stops
+# each sync from executing at all, leaving only the --allow-empty commit as
+# evidence of a "successful" run. (Observed: 1 empty commit, 0 syncs.)
+mkdir -p "$(dirname "$DIGEST")"
 STAMP="$(date '+%Y-%m-%d %H:%M %Z')"
 KEY="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"
 

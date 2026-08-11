@@ -198,3 +198,71 @@ def test_search_routes_synthetic_hit_to_real_chunk(tmp_path):
     assert all("::hq" not in r.chunk_id for r in results)
     assert results[0].chunk_id == "sources/doc#0"
     assert engine.last_trace["stages"]["fusion"]["enriched_hits"] == 1
+
+
+def test_synthetic_hit_carries_its_score_to_an_unretrieved_target(tmp_path):
+    """THE zero-overlap case, which is the whole reason enrichment exists.
+
+    When the real chunk is NOT in the RRF set (neither BM25 nor dense found
+    it) but its hypothetical question matched, the recovered target must
+    inherit the synthetic's score. Ranking it at 0.0 puts the one document
+    enrichment was supposed to rescue dead last -- enrichment paying off
+    only when it was not needed.
+    """
+    from alexandria.index.bm25 import BM25Index
+    from alexandria.index.embedder import HashEmbedder
+    from alexandria.index.store import VectorStore
+    from alexandria.retrieval.rerank import IdentityReranker
+    from alexandria.retrieval.search import SearchConfig, SearchEngine
+
+    question = "what happens when the retry budget runs out"
+    # Fixed geometry: the query lands on axis 0, the synthetic sits exactly
+    # on it, distractors sit near it, and the real chunk is orthogonal --
+    # so the real chunk cannot enter the dense prefetch. It shares no
+    # vocabulary with the query either, so BM25 misses it too. That is a
+    # zero-overlap document whose hypothetical question is the only bridge.
+    class FixedEmbedder:
+        dim = 4
+
+        def embed(self, texts):
+            return [_VECTORS[t] for t in texts]
+
+    _VECTORS = {}
+    query_vec = [1.0, 0.0, 0.0, 0.0]
+    _VECTORS[question] = query_vec
+
+    rows = []
+    real_text = "escalation ladder pages the on-call owner after three cycles"
+    _VECTORS[real_text] = [0.0, 0.0, 0.0, 1.0]  # orthogonal to the query
+    rows.append(record("sources/doc#0", "sources/doc", real_text,
+                       _VECTORS[real_text]))
+    syn_text = "what happens when the retry budget runs out?"
+    _VECTORS[syn_text] = [1.0, 0.0, 0.0, 0.0]  # exactly on the query
+    rows.append(record("sources/doc#0::hq1", "sources/doc", syn_text,
+                       _VECTORS[syn_text], layer="synthetic", kind="synthetic",
+                       parent_doc="sources/doc", target_chunk="sources/doc#0"))
+    # distractors: closer to the query than the real chunk on both channels,
+    # and numerous enough to fill the prefetch window ahead of it.
+    for i in range(8):
+        text = f"retry budget runs out note {i} what happens"
+        _VECTORS[text] = [0.9, 0.1, 0.0, 0.0]
+        rows.append(record(f"sources/n{i}", f"sources/n{i}", text, _VECTORS[text]))
+
+    embedder = FixedEmbedder()
+    store = VectorStore(tmp_path / "index")
+    store.upsert(rows)
+    lexical = BM25Index(tmp_path / "fts.sqlite")
+    lexical.index(rows)
+    engine = SearchEngine(embedder, store, lexical, IdentityReranker(),
+                          SearchConfig(prefetch=4, top_k=3, wiki_boost=1.25))
+    results = engine.search(question)
+    assert "sources/doc#0" not in engine.last_trace["stages"]["fusion"][
+        "scores_before_boost"], "premise broken: target was already retrieved"
+
+    scores = engine.last_trace["stages"]["fusion"]["scores"]
+    assert "sources/doc#0" in scores, "target was never recovered"
+    assert scores["sources/doc#0"] > 0.0, (
+        "recovered target was ranked at 0.0 -- the synthetic's score was "
+        "dropped, neutralizing enrichment in exactly the zero-overlap case")
+    assert all("::hq" not in r.chunk_id for r in results)
+    assert results and results[0].chunk_id == "sources/doc#0"

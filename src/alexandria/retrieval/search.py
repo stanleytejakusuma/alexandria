@@ -204,7 +204,12 @@ class SearchEngine:
         # are fetched in ONE bounded lookup.
         enriched_hits = 0
         collapsed: dict[str, float] = {}
-        missing_targets: list[str] = []
+        # target -> best synthetic score seen for it. The score MUST travel
+        # with the id: a target absent from the RRF set is precisely the
+        # zero-overlap case enrichment exists to rescue, and recovering it
+        # at 0.0 would rank it last -- enrichment paying off only in the
+        # cases where it was not needed.
+        missing_targets: dict[str, float] = {}
         for chunk_id, score in boosted_scores.items():
             record = records.get(chunk_id)
             if record is not None and record.get("kind") == "synthetic":
@@ -212,17 +217,20 @@ class SearchEngine:
                 target = record.get("target_chunk")
                 if target and target in records:
                     collapsed[target] = max(collapsed.get(target, 0.0), score)
-                elif target and target not in missing_targets:
-                    missing_targets.append(target)
+                elif target:
+                    missing_targets[target] = max(
+                        missing_targets.get(target, 0.0), score)
             else:
                 collapsed[chunk_id] = max(collapsed.get(chunk_id, 0.0), score)
         if missing_targets:
             try:
-                for chunk_id, record in self.store.get_many(missing_targets).items():
+                for chunk_id, record in self.store.get_many(
+                        list(missing_targets)).items():
                     records[chunk_id] = record
                     collapsed[chunk_id] = max(
                         collapsed.get(chunk_id, 0.0),
-                        boosted_scores.get(chunk_id, collapsed.get(chunk_id, 0.0)))
+                        boosted_scores.get(chunk_id, 0.0),
+                        missing_targets[chunk_id])
             except Exception:
                 pass  # routing enhancement is best-effort; never breaks search
         after = _ordered(collapsed)
