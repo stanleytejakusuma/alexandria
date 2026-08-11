@@ -61,8 +61,21 @@ echo "### query-log review (7d)" >> "$DIGEST"
 "$REPO/.venv/bin/python" "$REPO/scripts/query-log-review.py" --corpus "$CORPUS" --since 7 \
   >> "$DIGEST" 2>&1 || echo "review FAILED" >> "$DIGEST"
 
-# keep the corpus weekly-snapshot-able (the quarterly contest needs it)
-git -C "$CORPUS" add notes sources wiki .alexandria/loop 2>/dev/null
-git -C "$CORPUS" commit -q -m "weekly loop digest $(date '+%Y-%m-%d')" --allow-empty 2>/dev/null
+# keep the corpus weekly-snapshot-able (the quarterly contest needs it).
+# Only `sources` and `wiki`: `notes` does not exist, and `.alexandria/` is
+# gitignored as derived state. git add is ATOMIC across pathspecs, so naming
+# either one made the whole add fail ("fatal: pathspec 'notes' did not match")
+# and stage nothing -- while --allow-empty still produced a commit. Observed
+# 2026-08-11: 2,277 new notes untracked, commit reported 0 files changed.
+# No --allow-empty: a commit must mean something was actually captured.
+git -C "$CORPUS" add sources wiki >> "$DIGEST" 2>&1 || echo "git add FAILED" >> "$DIGEST"
+if git -C "$CORPUS" diff --cached --quiet; then
+  echo "corpus snapshot: nothing new to commit" >> "$DIGEST"
+else
+  staged=$(git -C "$CORPUS" diff --cached --numstat | wc -l | tr -d ' ')
+  git -C "$CORPUS" commit -q -m "weekly loop digest $(date '+%Y-%m-%d')" \
+    && echo "corpus snapshot: committed $staged file(s)" >> "$DIGEST" \
+    || echo "corpus commit FAILED" >> "$DIGEST"
+fi
 
 echo "done" >> "$DIGEST"
