@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -55,6 +56,33 @@ def newest_docs(corpus: Path, n: int = 5) -> list[Path]:
     """
     docs = [p for d in INDEXED_DIRS for p in (corpus / d).rglob("*.md")]
     return sorted(docs, key=lambda p: p.stat().st_mtime, reverse=True)[:n]
+
+
+def chunks_for(corpus: Path, doc: Path) -> int:
+    """How many chunks the index holds for this document.
+
+    Deterministic membership, with no ranking involved. "Is it in the index" and
+    "does search rank it" are different questions, and conflating them made a
+    healthy index look broken: two vault notes titled `[[none]]` and `[[TOOL]]`
+    hold 420 and 103 chunks respectively, yet neither title is a query that can
+    find anything.
+    """
+    key = str(doc.relative_to(corpus).with_suffix(""))
+    try:
+        con = sqlite3.connect(f"file:{corpus}/.alexandria/index/fts.sqlite?mode=ro", uri=True)
+        with con:
+            return con.execute("SELECT count(*) FROM chunk_metadata WHERE chunk_id LIKE ?",
+                               (f"{key}#%",)).fetchone()[0]
+    except sqlite3.Error:
+        return 0
+
+
+def is_probeable(title: str) -> bool:
+    """Whether a title is usable as a search query at all. A bare wikilink or a
+    one-word label cannot rank against tens of thousands of documents, so failing
+    it would say nothing about retrieval."""
+    cleaned = title.strip().strip("[]").strip()
+    return len(cleaned) >= 15 and len(cleaned.split()) >= 3
 
 
 def title_of(doc: Path) -> str:
@@ -117,17 +145,29 @@ def main() -> int:
                    f"{args.generation_before} -> {gen_after}"
                    + ("" if gen_ok else "  <-- documents arrived but the index did not move")))
 
-    # A stale index fails EVERY probe, so a majority rule still catches the
-    # failure this exists for, while tolerating an individual unfindable note.
+    # Two separate questions, deliberately not merged.
+    #
+    # (a) INDEXED: are the newest documents in the index at all? Exact, so it is
+    #     required of every probe -- this is the three-day-freeze detector.
     probes = newest_docs(corpus)
     if not probes:
+        checks.append(("indexed", False, "corpus contains no documents"))
         checks.append(("retrievable", False, "corpus contains no documents"))
     else:
-        hits = [d for d in probes if is_retrievable(args.binary, corpus, d)[0]]
-        misses = [d.name for d in probes if d not in hits]
-        checks.append(("retrievable", len(hits) * 2 >= len(probes),
-                       f"{len(hits)}/{len(probes)} of the newest documents found"
-                       + (f"  (missed: {', '.join(m[:40] for m in misses[:2])})" if misses else "")))
+        missing = [d.name for d in probes if chunks_for(corpus, d) == 0]
+        checks.append(("indexed", not missing,
+                       f"{len(probes) - len(missing)}/{len(probes)} newest documents have chunks"
+                       + (f"  (absent: {', '.join(m[:40] for m in missing[:2])})" if missing else "")))
+
+        # (b) RETRIEVABLE: can search actually surface one end to end? Only a
+        #     document whose title is a meaningful query can answer that.
+        probeable = next((d for d in probes if is_probeable(title_of(d))), None)
+        if probeable is None:
+            checks.append(("retrievable", True,
+                           "skipped: none of the newest documents has a searchable title"))
+        else:
+            found, why = is_retrievable(args.binary, corpus, probeable)
+            checks.append(("retrievable", found, f"{probeable.name[:56]}: {why}"))
 
     # A commit is only meaningful if it captured something. An empty commit after
     # new documents arrived is the --allow-empty failure resurfacing.

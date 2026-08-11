@@ -103,5 +103,17 @@ VERIFY_STATUS=0
   --docs-before "$DOCS_BEFORE" --generation-before "$GEN_BEFORE" \
   >> "$DIGEST" 2>&1 || VERIFY_STATUS=1
 
+# A non-zero exit is recorded by launchd and read by nobody. The whole point of
+# the self-check is that a silent failure becomes visible, so push it somewhere
+# with a human on the other end. Best-effort: never let notification failure
+# change the run's verdict.
+if [ "$VERIFY_STATUS" -ne 0 ] && command -v terminal-notifier >/dev/null 2>&1; then
+  terminal-notifier \
+    -title "Alexandria weekly loop FAILED" \
+    -subtitle "$(grep -c '\[FAIL\]' "$DIGEST" 2>/dev/null || echo '?') check(s) failed" \
+    -message "$(grep '\[FAIL\]' "$DIGEST" | tail -3 | tr '\n' ' ' | cut -c1-180)" \
+    -group alexandria-weekly-loop >/dev/null 2>&1 || true
+fi
+
 echo "done" >> "$DIGEST"
 exit "$VERIFY_STATUS"
