@@ -111,3 +111,86 @@ def test_body_still_searchable_when_heading_absent(tmp_path: Path):
     index = BM25Index(tmp_path / "fts.sqlite")
     index.index([{"chunk_id": "c1", "doc_id": "d1", "text": "quarantine after repeated lint failures"}])
     assert [cid for cid, _ in index.search("quarantine lint", 5)] == ["c1"]
+
+
+def test_reindexing_a_chunk_replaces_it_rather_than_duplicating(tmp_path):
+    """The batched DELETE must keep exact upsert semantics.
+
+    chunks_fts declares chunk_id UNINDEXED, so the delete-before-insert has no
+    index to use and costs a full scan. Doing it once per batch instead of once
+    per row is only safe if replacement still happens for every id in the batch.
+    """
+    from alexandria.index.bm25 import BM25Index
+
+    index = BM25Index(tmp_path / "fts.sqlite")
+    first = [{"chunk_id": f"c{i}", "doc_id": "d", "text": f"alpha unique{i}",
+              "tags": [], "entities": []} for i in range(5)]
+    index.index(first)
+    second = [{"chunk_id": f"c{i}", "doc_id": "d", "text": f"beta unique{i}",
+               "tags": [], "entities": []} for i in range(5)]
+    index.index(second)
+
+    rows = index.connection.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
+    assert rows == 5, f"reindex duplicated rows instead of replacing: {rows}"
+    assert index.search("alpha", k=10) == [], "stale text survived the reindex"
+    assert len(index.search("beta", k=10)) == 5
+
+
+def test_append_only_skips_the_delete_scan_on_a_fresh_table(tmp_path):
+    """On a rebuild, chunks_fts was just dropped -- there is nothing to delete.
+
+    Deleting anyway means a full O(table) scan per flush for zero effect (chunk_id
+    is UNINDEXED, so DELETE...WHERE has no index to use). append_only=True must
+    skip the DELETE entirely, not just batch it.
+    """
+    from alexandria.index.bm25 import BM25Index
+
+    index = BM25Index(tmp_path / "fts.sqlite")
+    # sqlite3.Connection.execute is a read-only attribute, so it cannot be
+    # monkeypatched; set_trace_callback is the supported way to observe every
+    # statement the connection actually runs.
+    statements: list[str] = []
+    index.connection.set_trace_callback(statements.append)
+    # "alpha {i}", not "alpha{i}": FTS5 tokenises alpha0 as a single token, so a
+    # search for "alpha" would match nothing and the assertion below would fail
+    # for a tokenisation reason rather than the behaviour under test.
+    chunks = [{"chunk_id": f"c{i}", "doc_id": "d", "text": f"alpha {i}",
+               "tags": [], "entities": []} for i in range(5)]
+    index.index(chunks, append_only=True)
+    index.connection.set_trace_callback(None)
+
+    deletes = [s for s in statements if s.strip().upper().startswith("DELETE")]
+    assert deletes == [], f"append_only issued a DELETE anyway: {deletes}"
+    assert len(index.search("alpha", k=10)) == 5
+
+
+def test_append_only_still_dedupes_within_the_same_call(tmp_path):
+    """A duplicate chunk_id inside one append_only batch must not double-insert
+    into chunks_fts (metadata's ON CONFLICT already handles chunk_metadata)."""
+    from alexandria.index.bm25 import BM25Index
+
+    index = BM25Index(tmp_path / "fts.sqlite")
+    chunks = [{"chunk_id": "dup", "doc_id": "d", "text": "first version",
+               "tags": [], "entities": []},
+              {"chunk_id": "dup", "doc_id": "d", "text": "second version",
+               "tags": [], "entities": []}]
+    index.index(chunks, append_only=True)
+
+    rows = index.connection.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
+    assert rows == 1, f"append_only duplicate chunk_id produced {rows} fts rows, want 1"
+
+
+def test_batch_delete_spans_more_ids_than_one_sqlite_statement_allows(tmp_path):
+    """A batch larger than the parameter chunk must still fully replace."""
+    from alexandria.index.bm25 import BM25Index
+
+    index = BM25Index(tmp_path / "fts.sqlite")
+    n = BM25Index._DELETE_CHUNK * 2 + 37
+    make = lambda word: [{"chunk_id": f"c{i}", "doc_id": "d", "text": f"{word} u{i}",
+                          "tags": [], "entities": []} for i in range(n)]
+    index.index(make("alpha"))
+    index.index(make("beta"))
+
+    rows = index.connection.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
+    assert rows == n, f"expected {n} rows after replacement, got {rows}"
+    assert index.search("alpha", k=5) == []

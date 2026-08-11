@@ -792,3 +792,529 @@ The driving scenario is a *workflow* story, not a retrieval story: **the right t
 find what another team learned, without seeing what they shouldn't.** That is a sharper
 and more defensible pitch than "enterprise RAG", and unlike per-claim citation it is not
 a feature a competitor can add in a sprint. Worth treating as the wedge.
+
+---
+
+## 13. Scope model v5 — the implementation spec
+
+**Status: converged, buildable.** §12 established the decision ("one brain, two
+boundaries", the scope-set-intersection primitive, admin as the degenerate case). This
+section is the engineering spec that survived four adversarial rounds (security
+attacker, driving-scenario walkthrough, ruthless-simplification pass, each ×4) against
+it. Every file:line below was re-read from source during this pass, not carried forward.
+Where a prior round's own citation had drifted, the correct line is used here without
+further narration.
+
+### 13.1 THE MODEL
+
+Two boundaries, stated precisely enough to build from:
+
+- **ORG = hard boundary.** Physically separate index (own `.alexandria/index`, own
+  `.alexandria/cache`, own generation counter). Deletion = drop the directory. No
+  cross-org code path exists or is proposed. A process that must touch two orgs runs
+  two separate `AppConfig`/CLI invocations — never one process holding two org
+  bindings at once.
+- **TEAM/USER = soft boundary, inside one org's shared index.** ACL-filtered at query
+  time, because controlled cross-team read is the feature, not a leak to be prevented
+  (constraint 3). Physically sharding by team would make the driving scenario
+  (engineering reading biz dev's client thread) impossible by construction.
+
+The primitive, deliberately minimal — not an RBAC engine, no role tree, no policy DSL:
+
+- Every chunk carries `scope`: an opaque string label, **list-valued** (a chunk may
+  carry more than one scope, e.g. a thread dual-labeled `bizdev`+`eng` for a specific
+  handoff — see §13.3). No delimiter grammar; no hierarchy is parsed from the string.
+  Hierarchy lives entirely in `visible_scopes` membership, not in the label.
+- Every principal carries `visible_scopes: frozenset[str] | None`. `None` means "no
+  filter" — the admin/flat/C-level degenerate case (§13.2). It is **never**
+  client-supplied at request time; it is resolved once from install-local
+  configuration only (§13.4). `--caller`/`--user`/`ALEXANDRIA_USER`
+  (`cli.py:796,845,847,872,874`) remain audit-trail identity labels, explicitly
+  excluded as a `visible_scopes` source — they are unverified, forgeable strings with
+  no validation anywhere in the codebase today.
+- Retrieval visibility rule: a chunk is visible to a principal if the chunk's `scope`
+  is NULL/empty (unlabeled = universally visible, §13.3), **or** any value in the
+  chunk's `scope` list intersects the principal's `visible_scopes`.
+- `config.visible_scopes` (new `AppConfig` field, §13.4) is documented as *absent
+  (`None`) or a non-empty list* — never an explicit empty list. One assertion closes
+  the ambiguity: `if raw is not None and not raw: raise ValueError("visible_scopes
+  must be absent or non-empty")`. A scoped principal with zero granted scopes is a
+  config bug, not a distinct state to support — and because unlabeled chunks are
+  universally visible regardless, an empty set wouldn't even produce a meaningfully
+  different result, so defining it just needs to not silently happen.
+
+### 13.2 THE ADMIN ROLE
+
+An administrator binds `visible_scopes=None`. This is not a separate code path — it is
+the same `if self._visible_scopes is not None:` branch (§13.4) that every other
+principal also passes through; for `None` the branch is simply not taken and
+`metadata_filter` is left exactly as it is today. The single-user personal install is
+this case with zero configuration: no `alexandria.toml` scope entry needed,
+byte-identical to current unfiltered behavior.
+
+**Exact blast radius of `None`.** An admin-bound `SearchEngine` retrieves across every
+chunk in the org's index with no scope predicate applied at any of the three
+enforcement surfaces (§13.4): the BM25 scan (`bm25.py:66-79`), the dense scan
+(`store.py:90-101`/`store.py:207-219`, `prefilter=True`), and the `get_many` hydration
+(`store.py:115-142`, wrapped per §13.4 item 4). An admin's synthesized answers
+(§13.4 item 8) and cached results (§13.4 item 9) can therefore legitimately contain
+material from every scope in the org, including scopes no other principal can see.
+
+**Why this doesn't become a silent leak — the two mitigations that matter:**
+
+1. **Cache.** `None` is a real value in `visible_scopes`'s domain, not a bypass
+   grafted onto the cache key — it participates in `canonical(visible_scopes)`
+   (§13.4 item 9) exactly like any other principal's set does. This means an
+   admin's cache rows are keyed distinctly from a `{eng,shared}`-bound principal's
+   rows for the same question, and are **never** served to that narrower principal.
+   The one place `None` *does* collide is with another `None`-bound principal — see
+   §13.3's flat/admin note; this is by design, not an oversight, and is the only
+   sharing `None` ever causes.
+2. **Audit.** `cmd_audit`'s handler (`cli.py:886`) and `cmd_wiki_site`'s unconditional
+   `audit_dir` pass (`cli.py:555-556`) are gated: if `resolve_visible_scopes(config) is
+   None`, `cmd_audit` refuses and `cmd_wiki_site` passes `audit_dir=None` (skipping
+   `render_audit`, `wiki_site.py:228`, and the `_audit_card`/audit-html render guarded
+   at `wiki_site.py:201,214-215`). This is a **binary admin-only gate**, not per-row
+   filtering — deliberately, because no subset-comparison mechanism exists anywhere
+   else in this design (the primitive is set-intersection only) and audit's actual
+   value (debugging, accountability) doesn't need partial views.
+
+**One accepted, stated residual risk on the admin role, not mitigated further per
+constraint 1 (YAGNI):** once any principal is ever bound `None`, they can read every
+query string and cited-doc-id pool ever logged by every *other* principal on that
+install, for all time — including rows logged while they themselves were previously
+scoped. Audit history is not time-partitioned by scope-at-time-of-write; the per-row
+`visible_scopes` field added at §13.4 item 10 is write-only, for accountability
+display, and is never read back for access control. This is the intended behavior for
+a genuine admin (consistent with admin being the degenerate case of the same model),
+stated explicitly here so the write-side field is not mistaken for a future
+filtering key.
+
+### 13.3 THE THREE CONFIGURATIONS
+
+**Hierarchical.** `eng={eng,shared}`, `bizdev={bizdev,shared}`, `C-level=None`.
+C-level is bound `None`, the same value as admin/flat — not a fourth enumerated value —
+because C-level's stated role ("monitor everything") is definitionally the admin
+bypass, and `None` doesn't depend on the NULL-inclusive disjunct's correctness the way
+an enumerated full-scope-set would.
+
+*Concrete handoff mechanic for the driving scenario:* biz dev's client thread is
+labeled `scope: [bizdev]` by default. For engineering to read it, the thread must be
+relabeled — either to `shared` (visible org-wide, likely broader than intended) or,
+more precisely, dual-labeled `[bizdev, eng]` (visible only to the two teams actually in
+the handoff). The model supports both; it does not pick one automatically — **this is
+an ingestion/reclassification decision, explicitly deferred per §13.6**, done today by
+editing frontmatter and re-running `alexandria index`. Synthesis output on the way back
+(engineering's report, §13.4 item 8) is stamped with the *emitting engine's entire
+binding* (e.g. `[bizdev, eng]` if that's what the engine was constructed with for this
+task), not a narrower per-citation scope — deliberately: precise per-citation scoping
+was considered and rejected (§13.8) for cost and failure-mode reasons. The practical
+consequence: whoever drives a cross-team synthesis task is responsible for binding the
+engine no wider than the task requires; over-binding silently widens what the resulting
+page exposes to every scope in that binding, not just the scope actually relevant to
+the cited content.
+
+**Flat — everyone sees everything.** Every principal binds `visible_scopes=None`.
+Mechanically identical to admin; not a fourth code path.
+
+**Single-admin / zero-config.** One principal, `visible_scopes=None`, no
+`alexandria.toml` entry required. Byte-identical to today's behavior — this is the
+owner's own personal install.
+
+**Named consequence of admin/flat/C-level sharing `None`:** they share literal cache
+rows (`canonical(None)` is one value). This is correct and intentional when the org's
+configuration is genuinely flat, or when "admin" and "C-level" are the same trust tier.
+It is a foot-gun with **no code-level guard** the moment a hierarchical org adds one
+admin principal alongside scoped ones: nothing prevents that admin's cache writes from
+being read by a *different* future `None`-bound principal who shouldn't share the
+admin's trust tier. Not fixed here (would require a principal-identity dimension on the
+cache key, which reopens the "key per user, hit-rate collapses" problem §12.4 already
+rejected) — named as an operational invariant to test (§13.7's fixture) and to state in
+deployment docs, not a mechanism gap.
+
+**Test requirement, all three configurations:** one two-principal hierarchical fixture
+(`eng`/`bizdev`/`shared`, one scope-empty/NULL chunk, at least one synthesized page)
+exercised through search → answer → cache-hit → `get_many`-recovery → synthesis-emit →
+audit-read-gate, **plus** an explicit assertion that a caller-supplied filter containing
+a `"scope"` key is **overwritten**, not merged, by the engine's bound value at §13.4
+item 3 — this is a real collision surface the moment `scope` is a normal `FILTER_FIELDS`
+member. The single-admin/flat configurations are structurally unable to exercise the
+enforcement code at all (`if self._visible_scopes is not None` is never taken) — the
+owner's own daily use provides **zero regression signal** for whether the hierarchical
+case still works; this fixture is the only thing standing between "shipped" and
+"shipped-untested-in-the-only-environment-that-runs-daily."
+
+### 13.4 WHERE IT IS ENFORCED
+
+Every enforcement point, in the order a request passes through them. Each item is a
+targeted diff against **existing** code — no new module, no new class.
+
+1. **Schema — three independent field lists, all three need `scope`, confirmed as
+   three *separate* schemas, not one:**
+   - `filtering.py:14-15` `FILTER_FIELDS`, `filtering.py:16` `LIST_FIELDS` — add
+     `"scope"` to **both** (list-valued, matching `tags`/`entities`'s existing
+     OR-semantics, not a new scalar field).
+   - `store.py:17-18` `SCALAR_FIELDS` / `store.py:19` `ALL_FIELDS` — `scope` joins the
+     `tags`/`entities` list-handling in `_normalise_record` (`store.py:245-247`
+     pattern: `for field in ("tags","entities"): value = record.get(field) or [];
+     record[field] = [str(item) for item in value]` — extend the tuple to include
+     `"scope"`), **not** `SCALAR_FIELDS`. Sqlite fallback `CREATE TABLE`
+     (`store.py:177-182`) gets `scope TEXT NOT NULL` (JSON-encoded list, same idiom as
+     `tags`); `ALTER TABLE` loop (`store.py:185-189`) gets `"scope TEXT"` added to the
+     in-place-upgrade tuple, reusing the exact four-column pattern already used for
+     `enrichment`/`kind`/`parent_doc`/`target_chunk`. Lance drift-guard tuple
+     (`store.py:53-55`, the `("enrichment","kind","parent_doc","target_chunk")`
+     staleness check) is a distinct mechanism unrelated to `scope` — no change needed
+     there.
+   - `bm25.py:21` `METADATA_COLUMNS`, `bm25.py:26-30`'s own `CREATE TABLE
+     chunk_metadata` (a table **separate from** `store.py`'s, used only as the FTS
+     metadata gate), and the `INSERT`/`ON CONFLICT` at `bm25.py:53,58-64` — add
+     `scope` as a `json_dumps_list`-encoded column, same idiom already used for
+     `tags`/`entities` there. **This is a genuinely independent schema** — omitting it
+     means lexical (BM25) retrieval never sees the scope column at all, since
+     `sqlite_where` at that call site (`bm25.py:70`, `alias="m"`) is applied against
+     BM25's own `chunk_metadata` table, not `store.py`'s.
+
+2. **Ingestion write.** `cli.py:716-730` `_chunk_metadata` — add
+   `"scope": list(frontmatter.get("scope") or [])`, matching the exact idiom already
+   used for `tags`/`entities` at `cli.py:726-727`. Who writes `scope:` into
+   frontmatter is explicitly out of scope (§13.6).
+
+3. **NULL/empty-inclusive filter semantics.** `filtering.py:41-51` (`sqlite_where`)
+   and `filtering.py:53-70` (`lancedb_where`) — extend the existing `LIST_FIELDS`
+   branch with an OR-disjunct: unlabeled (`NULL` or `[]`) stays universally visible.
+   SQLite: `(scope = '[]' OR EXISTS (SELECT 1 FROM json_each(scope) WHERE value IN
+   (?,...)))`; Lance: the equivalent `(array_length(scope) == 0 OR
+   array_has_any(scope, [...]))`-shaped disjunct. Without this disjunct, standard
+   `IN (...)` semantics silently drop every unlabeled chunk from every scoped
+   principal's results the day filtering is turned on — the inverse of a leak, but
+   just as severe for day-one usability given most of the corpus predates any scope
+   assignment.
+
+4. **Retrieval filter — the actual security gate.** `store.py:90-101` (Lance
+   `search_vector`, `prefilter=True` already at line 96-98) and
+   `store.py:207-219` (sqlite fallback `search_vector`) already run `metadata_filter`
+   *before* the scan — this is the pre-existing performance mechanism that becomes
+   the security gate for free. Add to `SearchEngine.__init__`
+   (`retrieval/search.py:64-67`) a `visible_scopes: frozenset[str] | None = None`
+   constructor param, stored as `self._visible_scopes`. Inside `search()`
+   (`retrieval/search.py:83`), immediately after `metadata_filter =
+   normalize_filters(filters)` (`retrieval/search.py:90`): `if self._visible_scopes
+   is not None: metadata_filter["scope"] = sorted(self._visible_scopes)` —
+   **overwriting**, not merging, any client-supplied `scope` key (closes §13.3's
+   fixture requirement). Because `scope` is a `LIST_FIELDS` member (item 1),
+   `normalize_filters` (`filtering.py:19-38`) already accepts the list value
+   structurally — no bespoke "accept list for field=='scope'" branch is needed.
+   `visible_scopes` binds at the engine, **not** on `SearchConfig`
+   (`retrieval/search.py:24-48`, a frozen tuning-knob dataclass already folded into
+   `canonical(config)` at `cache.py:161-165` — putting scope there would double-key
+   it). Binding at construction, not as an optional per-call kwarg, means
+   `gather.py` (`gather.py:58-59,74,83`, which calls `engine.search(...)` with no
+   `filters` kwarg at either call site today) needs **zero signature change** — it
+   inherits the bound scope automatically, closing what was otherwise the single
+   largest unscoped surface in the whole system.
+
+5. **`_build_search_engine` wiring — the fix everything above is inert without.**
+   `cli.py:650-662` `_build_search_engine(config, corpus, query_cache=True,
+   corpus_root=None)`, three internal CLI call sites confirmed at `cli.py:413`
+   (`cmd_search`), `cli.py:446` (`cmd_answer`), `cli.py:600` (`cmd_eval`). Add a new
+   `AppConfig.visible_scopes: list[str] | None = None` field (`config.py:15-38`, no
+   such field exists today), sourced from `alexandria.toml` only — not env or CLI
+   flag, matching the reasoning that config-file editability is the install's own
+   trust boundary, while env/flag is spoofable per-invocation by the process being
+   scoped. New `resolve_visible_scopes(config: AppConfig) -> frozenset[str] | None`.
+   **Resolution happens inside `_build_search_engine` itself** via a sentinel
+   default (`visible_scopes: frozenset[str] | None = _SENTINEL`, where the sentinel
+   means "resolve from `config.visible_scopes` automatically" and an explicit `None`
+   or set overrides it) — **not** by requiring every caller to remember
+   `visible_scopes=resolve_visible_scopes(config)`. This is what makes
+   `scripts/run-phase2-sweep.py:54` and `scripts/synthesize-golden-pages.py:346`
+   (both import `_build_search_engine` directly from `alexandria.cli`, bypassing the
+   three CLI call sites entirely) pick up scoping automatically the moment
+   `config.visible_scopes` is set, with **zero script edits** — closing the exact
+   gap that made an earlier draft of this fix a no-op for the one script whose
+   live-corpus write (`run-phase2-sweep.py:87-88`, `corpus_root=corpus` — the real
+   corpus, unconditionally) was the stated justification for shipping this at all.
+
+6. **`get_many` bypass — two call sites, both needed.** `store.py:115-142`
+   `get_many()` has no `where`/scope parameter in either backend. Call sites:
+   `retrieval/search.py:193` (`records = self.store.get_many(list(base_scores))` —
+   the primary hydration for every RRF candidate) and `retrieval/search.py:227-228`
+   (`self.store.get_many(list(missing_targets))` — synthetic-chunk target recovery).
+   Wrap the returned dict at **both** call sites, before the result is written into
+   `records`/`collapsed`/`layers` (all three derive from the same dict, so filtering
+   at the `get_many()` boundary covers all three downstream uses in one place):
+   `{cid: r for cid, r in raw.items() if self._visible_scopes is None or not
+   r.get("scope") or set(r["scope"]) & self._visible_scopes}`. Without this, a
+   scope-mismatched synthetic hypothetical-question chunk's target — recovered via
+   the second call site — can surface a chunk the initial BM25/dense scan correctly
+   excluded; this is a bypass of the retrieval-time filter, independent of item 4
+   being implemented correctly.
+
+7. **`VectorStore.get()` (`store.py:105-113`) — deliberately left unwrapped.** Zero
+   callers outside `store.py` today except `enrich.py:234`'s `EnrichmentStore.get()`,
+   a different class with a different signature. No comment, no guard added — a
+   warning comment nobody's tooling enforces is diff noise, not a guardrail. If a
+   real caller appears (e.g. a future citation drill-down UI), fix it there with the
+   same 3-line pattern as item 6, at that time.
+
+8. **Synthesis emit.** `synthesis/pipeline.py:71-92` `_emit()` — stamp
+   `frontmatter["scope"] = sorted(self._visible_scopes) if self._visible_scopes else
+   None`, sourced from the emitting engine's own binding (`engine._visible_scopes`),
+   threaded via a new `scope` parameter on `_emit(page, corpus_root, scope=...)`
+   from `run_pipeline`'s one call site (`synthesis/pipeline.py:67`). Because `scope`
+   is a `LIST_FIELDS` member (item 1), this list round-trips cleanly through
+   `_chunk_metadata`'s `list(frontmatter.get("scope") or [])` (item 2) on re-index —
+   this is what makes emitted pages inherit a scope at all, closing the "synthesis
+   output erases the scope boundary of everything it touches" gap. Per-citation
+   narrowest-scope stamping was considered and rejected: new I/O per emit, a new
+   failure mode, no safety gain over the engine-binding upper bound (§13.8).
+   Contingent on item 5: an engine bound `None` still emits unscoped, correctly,
+   since `None` is the flat/admin binding.
+
+9. **`ResponseCache` key.** `cache.py:172-175` `ResponseCache.key(question, model, k,
+   prompt_version, generation=0)` — add a `filters: object = None` param, reusing
+   `canonical()` (`cache.py:33-46`, already handles sets deterministically via the
+   `isinstance(v, set)` branch at `cache.py:41-42`) exactly as `QueryCache.key()`
+   already does (`cache.py:161-165`, `canonical(filters or {})` at line 165) — not a
+   new hand-rolled `",".join(sorted(...))` string convention. Wire at
+   `cli.py:449-450` (`rkey = response_cache.key(...)`): pass `filters=visible_scopes`
+   (the frozenset itself; `canonical()` normalizes it). Bump
+   `RESPONSE_SCHEMA_VER`/`QUERY_SCHEMA_VER` (`cache.py:24-25`, currently
+   `"a2"`/`"q2"`) in the same commit so pre-scope cache rows cannot replay
+   post-scope. `QueryCache.key()` needs no change — filters (including scope, via
+   item 4) already flow through `metadata_filter` → `canonical(filters)`. This is
+   the single highest-severity item in the whole spec: `cli.py:454-462` today prints
+   a cache hit's `cached_page["text"]` and returns **before `run_pipeline` is ever
+   constructed** — a full synthesized answer, with citations, replayed to any caller
+   who asks a normalized-identical question, with no scope check anywhere near that
+   return path. Up to `RESPONSE_TTL` = 7 days (`cache.py:20`) of cross-principal
+   replay without this fix.
+
+10. **Audit write.** `auditlog.py:41-53` (`AuditLogger.answer`), `auditlog.py:55-64`
+    (`AuditLogger.search`) — add a `visible_scopes: str = ""` field (sorted-join,
+    human-readable — audit rows are read by people via `audit_summary()`
+    (`auditlog.py:78-113`), not re-fed into `canonical()`, so a plain string is
+    correct here, not a `canonical()`-shaped value).
+
+11. **Audit read gate.** `cli.py:886` (`cmd_audit`'s `au.set_defaults(func=lambda a:
+    print(audit_summary(...)) or 0)`) becomes a named function that refuses when
+    `resolve_visible_scopes(config) is not None`. `cli.py:545-558` `cmd_wiki_site`
+    passes `audit_dir=None` (instead of the current unconditional
+    `config.corpus_path / ".alexandria" / "audit"` at `cli.py:555-556`) when scoped —
+    which short-circuits `render_site`'s guards at `wiki_site.py:201,214-215` and
+    prevents `render_audit` (`wiki_site.py:228`) from ever writing `r['query']`
+    (`wiki_site.py:255`) into the rendered static `audit.html`. Per-row filtering was
+    considered and rejected: no subset-comparison mechanism exists anywhere else in
+    this design (§13.1 deliberately has only set-intersection, not a hierarchy
+    comparison), and audit's actual value doesn't need partial views. This item is
+    **not retrofittable** in the meaningful sense — a completed unauthorized read of
+    a rendered `audit.html` is not undone by a later patch — so it ships with the
+    rest of §13.4, not as hardening after the fact.
+
+### 13.5 WHAT IS DELIBERATELY NOT BUILT
+
+- **Per-row audit filtering** (fine-grained "show me only rows I could have caused").
+  Trigger to re-open: a real customer needs an audit view narrower than
+  admin-or-nothing — at that point a subset-comparison mechanism has to be designed,
+  which is a second primitive this spec deliberately avoids introducing pre-emptively.
+- **Role hierarchy / RBAC / policy DSL parsing `scope` strings for structure.**
+  Trigger: a real deployment needs a scope relationship expressible only as "eng is a
+  subset of engineering-org" computed from the label itself, not from extensional
+  `visible_scopes` membership. Until then, hierarchy lives entirely in the
+  `visible_scopes` data, never in string parsing.
+- **Fine-grained per-document / per-thread grants without a scope-label edit.** The
+  current model expresses "give eng read access to this one bizdev thread" only via
+  relabeling (dual-label or widen to `shared`) — there is no ACL entry independent of
+  the chunk's own `scope` field. Trigger: a real deployment needs one-off grants at a
+  rate that makes manual relabeling operationally unworkable — at that point a
+  genuine grants table becomes justified, not before.
+- **Per-scope embedding-cache partitioning.** `CachedEmbedder._key()`
+  (`embedder.py:302-305`, `sha256(name+revision+mode+text)`) is shared across every
+  principal in an org — two different principals asking identical query text produce
+  the same cache-hit/miss timing, which is a confirmed existence-only side channel
+  ("this exact text was asked before, by someone") surfaced via
+  `trace["stages"]["embed"]["cache"]` (`retrieval/search.py:146-151`) and `--trace`
+  JSON output. Trigger: a customer whose threat model includes query-text
+  confidentiality between teams, not just answer content confidentiality — per-scope
+  embedding caches would multiply storage and defeat the point of a shared corpus
+  cache, so this is accepted risk, not deferred work, until that trigger fires.
+- **Cache-at-rest encryption/partitioning.** `responses_cache.sqlite`/
+  `queries_cache.sqlite` (`cache.py` `_db()`, one file per corpus under
+  `.alexandria/cache/`) are unencrypted and unpartitioned at the filesystem layer —
+  anyone with filesystem read access to that file sees every cached answer across
+  every scope binding that ever ran on the install, and the deterministic key hash
+  creates a same-question-bucket-existence oracle. Trigger: any deployment where
+  filesystem access does not already imply corpus access (this design's stated trust
+  model today is that it does).
+- **Server-side per-request identity resolution / `alexandria serve`.** No server
+  exists (confirmed: no `cmd_serve`, no `serve` subcommand anywhere in `cli.py`).
+  §13.4's `resolve_visible_scopes` is install-level/per-process, resolved once at
+  `_build_search_engine` call time — correct for the CLI (each invocation constructs
+  a fresh engine, confirmed at all three call sites) and correct for a single shared
+  machine used by one person, but **not** a per-human-user boundary on a
+  shared-login CLI machine: two real people invoking the CLI under the same OS
+  account/`alexandria.toml` get the same `visible_scopes`, indistinguishable by this
+  design. Trigger: building `alexandria serve` at all — at that point, identity
+  resolution per-request (not per-process) and engine-instance lifecycle (rebuild on
+  reindex *or* on scope-config-change — the same fix for both, not two axes) both
+  need a real design, not the one-process-per-invocation shortcut this spec relies
+  on today.
+
+### 13.6 OPEN RISKS
+
+- **Scope assignment at ingestion is not designed — this is the risk that matters
+  most and is explicitly out of scope.** §13.4's schema/filter work is plumbing with
+  no faucet until something writes `scope:` into document frontmatter. It depends on
+  source-system permissions and needs real deployment input (constraint 4) — a
+  connector reading a Slack channel, a shared drive folder, or a ticketing system's
+  own ACL is the durable answer; hand-labelling by a human will drift and leak within
+  weeks. Not designed here. Flagged as the most likely cause of a future breach
+  precisely because it's the one piece every other item in this spec assumes exists.
+- **Mid-workflow re-scoping (the handoff mechanic in §13.3) is manual.** Relabeling a
+  bizdev thread to include `eng` today means editing frontmatter and re-running
+  `alexandria index` — an existing, if entirely manual, mechanism. No tooling assists
+  this decision or defaults it sensibly; the natural failure mode if left
+  undocumented is a same-team default (engineering's write-back defaults to
+  `eng`-only) that silently breaks the feedback loop the scenario requires, rather
+  than a leak.
+- **No principal-identity cache invalidation on team change or scope revocation.**
+  A narrowed principal's *own* future queries self-correct (a different
+  `visible_scopes` set produces a different cache key, so old wide-scope rows are
+  simply missed, not served) — but old rows persist up to
+  `RESPONSE_TTL`/`QUERY_TTL` and would replay verbatim if a *different* principal is
+  later assigned the exact same `visible_scopes` set (e.g. a new hire mirrors a
+  departed employee's team membership). Narrow, latent, not fixed — content-keyed-by-
+  scope-set means this is a staleness risk, not a boundary-crossing one.
+- **Hybrid admin-inside-hierarchical-org has no code-level guard** (§13.3) — an admin
+  principal's cache rows are readable by any other `None`-bound principal on the same
+  install, which is fine if they're the same trust tier and a foot-gun if not. No
+  mechanism proposed; named so it's tested for, not assumed away.
+- **Enrichment's synthetic-chunk scope inheritance is correct by accident of code
+  shape, not by design.** `enrich.py:86` `base = dict(doc_records[0])` spreads every
+  field of the anchor chunk — including `scope`, once item 1 lands — onto each
+  synthetic hypothetical-question record via `**base` (`enrich.py:88`-adjacent
+  construction). This is the safe outcome today, but it is not a designed guarantee:
+  a future refactor of `synthetic_records()` toward an explicit field list (the way
+  `_normalise_record` in `store.py` explicitly lists
+  `enrichment`/`kind`/`parent_doc`/`target_chunk`) could silently drop `scope`, and a
+  dropped/NULL scope matches every principal's filter per item 3's NULL-inclusive
+  rule. The actual exposure if that happens is narrow — the synthetic record's own
+  text is never surfaced to rerank or citation (only its score boosts the real
+  `target_chunk`, which stays correctly gated by item 6) — but it's a latent trap
+  worth a one-line comment at the call site when item 1 ships, not a new mechanism.
+- **Generation-counter staleness is a real but currently-inert risk in a
+  long-lived process.** `SearchEngine._generation` (`retrieval/search.py:80-81`) is
+  read once at construction. Harmless today because every CLI invocation constructs
+  a fresh engine (confirmed at `cli.py:413,446,600`). Becomes live the moment
+  `alexandria serve` reuses one engine across requests — named under §13.5's server
+  deferral, not re-designed here; the fix (rebuild the engine on reindex *or* on a
+  scope-config-change event) is the same fix for both triggers, not two separate
+  axes.
+
+### 13.7 BUILD ORDER
+
+Ordered by retrofit cost — expensive-to-retrofit-later first, per §0's ordering
+principle, not by implementation difficulty:
+
+1. **§13.4 item 8, synthesis scope-stamping, together with item 5's script wiring.**
+   *Why first:* every day `run-phase2-sweep.py`'s unconditional live-corpus write
+   (`run-phase2-sweep.py:87-88`) runs unscoped, more provenance-free pages land whose
+   correct scope can never be reconstructed after the fact — the citation data
+   needed to compute it only exists at emit time. Both halves (the stamp mechanism
+   and the wiring that makes the sweep script actually call it) must ship together;
+   shipping only the mechanism while the script bypasses it reproduces the exact bug
+   being fixed. **Size: small** — one param on `_emit`, one sentinel-default change
+   on `_build_search_engine`, no new files.
+2. **§13.4 item 11, audit read gate.** *Why second, not lower:* not retrofittable at
+   all — a completed unauthorized read of `audit.html` or `cmd_audit` output is not
+   undone by a later patch, unlike every other item on this list which is
+   schema/cache plumbing with no historical-data problem. **Size: small** — one
+   guard function, one conditional `audit_dir` value.
+3. **§13.4 items 1–4 and 6, schema + retrieval filter + `get_many` wrapper.**
+   *Why third:* cheap individually, but together they are the mechanism everything
+   else (items 5, 8, 9) is inert without — items 5/8/9 have no effect if `scope`
+   isn't a real column feeding a real filter yet. Not itself expensive to retrofit
+   (a missing `scope` column defaults to visible-to-all under item 3's
+   NULL-inclusive rule regardless of when it's added) but blocking for everything
+   downstream. **Size: medium** — three independent schema surfaces (item 1), one
+   filter predicate change in two backends (item 3), one constructor param (item 4),
+   one wrapped dict comprehension at two call sites (item 6).
+4. **§13.4 item 5, `_build_search_engine` wiring.** *Why fourth, not first:* the
+   single most consequential line-item for making 1–3 reach real callers, but its
+   cost of delay is bounded by item 3's plumbing already being inert without it
+   anyway — no marginal leak from sequencing it after item 3, since nothing is
+   scoped until both land together. **Size: small** — one sentinel-default
+   parameter, one new `AppConfig` field, one `resolve_visible_scopes` function.
+5. **§13.4 item 9, `ResponseCache` key.** *Why fifth despite being the sharpest
+   single finding across all four attack rounds:* cheap to retrofit in the narrow
+   technical sense (worst case on delay: flush `responses_cache.sqlite`, lose up to
+   7 days of cache per `RESPONSE_TTL`) — but there is no reason to actually delay
+   it, since it's nearly free and its absence is a live, un-audited cross-principal
+   replay path the moment items 3–5 land and any principal narrower than admin
+   exists. Sequenced here only because its retrofit cost is bounded, not because it
+   is low-severity — treat as a same-week follow-on to items 3–5, not a later
+   phase. **Size: small** — one param on `ResponseCache.key`, reusing
+   `canonical()`; one wire-up at the call site; one schema-version bump.
+6. **§13.4 items 2, 10, and the §13.1 empty-set assertion.** *Why last:* genuinely
+   cheap to retrofit — pure schema/filter plumbing and a single validation line, no
+   historical-data problem, no security exposure from sequencing them after
+   everything else. **Size: trivial** — one line each.
+
+### 13.8 REJECTED PROPOSALS
+
+- **Wildcard sentinel value (`"*"`) instead of `None` for the admin case.**
+  Rejected: a distinct sentinel is a third state to design and test; `None` already
+  means "no filter was resolved," which is the correct behavior for
+  admin/flat/C-level, and reuses the exact idiom the CLI already has for every other
+  optional filter (`cli.py:414-416`, `{field: value for field, value in
+  {...}.items() if value is not None}`). No new value type earns its keep here.
+- **Per-citation narrowest-scope stamping for synthesis output**, instead of
+  stamping the emitting engine's full binding (§13.4 item 8). Rejected: requires a
+  new I/O call per citation at emit time (a `store.get()` per source chunk to read
+  back its scope), a new failure mode (what happens when citations disagree or one
+  lookup fails), and buys no safety over the engine-binding upper bound — a page can
+  never expose more than what its own engine could already see. The precision loss
+  (§13.3's over-binding note) is accepted as the caller's operational
+  responsibility, not automated.
+- **A hand-rolled `scope_key: str` string convention on `ResponseCache.key()`**
+  (`",".join(sorted(visible_scopes))`), instead of reusing `canonical()`. Rejected
+  on a second look: `cache.py` already has exactly the right tool three lines away
+  (`QueryCache.key()`'s `canonical(filters or {})`), and `canonical()` already
+  normalizes sets deterministically. A second serialization idiom in the same file
+  for the same concept is unnecessary surface, not a functional difference.
+- **A `where`/scope parameter added directly to `get_many()`'s signature**, instead
+  of wrapping its return value at the two call sites. Rejected: `get_many` combines
+  a chunk-id-list predicate with a scope predicate awkwardly, for a path that's
+  already a best-effort synthetic-target rescue wrapped in its own try/except
+  (`retrieval/search.py:225-235`). Post-fetch filtering at the two call sites is
+  smaller and covers `records`, `layers`, and `collapsed` in one place, since all
+  three derive from the same dict.
+- **A comment-only guard on `VectorStore.get()`** warning future callers it's
+  unscoped, instead of leaving it untouched (§13.4 item 7). Rejected: a warning
+  comment nobody's tooling enforces and nobody will grep before writing a new bug is
+  diff noise, not a guardrail. Zero real callers exist today outside a differently-
+  shaped `EnrichmentStore.get()`; fix it at the call site if and when a real caller
+  appears.
+- **A `monitor.py` `QueryLogger` identity/scope column**, parallel to the
+  `auditlog.py` fix (item 10). Rejected: `monitor.py`'s `QueryLogger` is a second,
+  best-effort, silently-swallowing (bare `except (OSError, sqlite3.Error): return
+  False`) SQLite logging path that duplicates fields `auditlog.py` already
+  captures, and nothing downstream reads it back (`audit_summary()` reads only
+  `auditlog.py`'s JSONL files). Adding a column to a table nothing consumes is pure
+  cost. The duplication between the two logging systems is a separate, pre-existing
+  piece of tech debt, not a scope-model gap — noted, not fixed here.
+- **Server-side generation-staleness "fix" written out as its own mechanism/design
+  subsection**, ahead of `alexandria serve` existing at all. Rejected as
+  speculative abstraction for a component that isn't built (constraint 1): the
+  actual decision fits one sentence (§13.6's last bullet) — rebuild the bound
+  engine on reindex or on a scope-config-change event, both collapse to the same
+  fix — and doesn't need a rejected-alternatives subsection of its own before the
+  server it applies to exists.
+- **Full RBAC / role inheritance / attribute-based access control**, considered and
+  rejected at the outset per constraint 1 and reaffirmed at every round: the
+  three-tier scenario (hierarchical, flat, single-admin) is fully expressible by
+  scope-set intersection alone; nothing in four rounds of adversarial review found a
+  case the primitive couldn't express without inventing hierarchy-in-the-label
+  parsing or per-document grant tables. Stays rejected until a real deployment
+  demonstrates a case it cannot express (§13.5's stated triggers).

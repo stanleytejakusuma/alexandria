@@ -82,3 +82,32 @@ def test_get_many_agrees_with_get(tmp_path: Path):
     store = VectorStore(tmp_path / "index")
     store.upsert([record("a", "sources/n/a", [1.0, 0.0])])
     assert store.get_many(["a"])["a"] == store.get("a")
+
+
+def test_append_matches_upsert_for_new_records(tmp_path: Path):
+    """append() skips merge_insert's match scan, which is O(table size) per call and
+    makes a full rebuild O(n^2). It is only sound when every chunk_id is new, so the
+    rows it produces must be indistinguishable from the upsert path's."""
+    rows = [record(f"c{i}", f"sources/{i}", [1.0, 0.0]) for i in range(5)]
+
+    merged = VectorStore(tmp_path / "merged")
+    merged.upsert(rows)
+    appended = VectorStore(tmp_path / "appended")
+    appended.append(rows)
+
+    assert appended.count() == merged.count() == 5
+    for i in range(5):
+        assert appended.get(f"c{i}") == merged.get(f"c{i}")
+
+
+def test_append_in_several_calls_keeps_every_row(tmp_path: Path):
+    """The rebuild path appends in buffered batches, not one shot -- a later append
+    must not clobber or drop rows written by an earlier one."""
+    store = VectorStore(tmp_path / "index")
+    store.append([record("a", "sources/a", [1.0, 0.0])])
+    store.append([record("b", "sources/b", [0.0, 1.0])])
+    store.append([])
+
+    assert store.count() == 2
+    assert store.get("a")["chunk_id"] == "a"
+    assert store.get("b")["chunk_id"] == "b"

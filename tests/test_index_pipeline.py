@@ -32,6 +32,7 @@ class SlowStore:
     def __init__(self, delay=0.05):
         self.delay = delay
         self.calls = []
+        self.appended = []
         self._lock = threading.Lock()
 
     def upsert(self, records):
@@ -40,13 +41,18 @@ class SlowStore:
         with self._lock:
             self.calls.append((start, time.monotonic(), len(records)))
 
+    def append(self, records):
+        with self._lock:
+            self.appended.append(len(records))
+        self.upsert(records)
+
 
 class SlowLexical:
     def __init__(self):
         self.indexed = []
         self._lock = threading.Lock()
 
-    def index(self, records):
+    def index(self, records, *, append_only=False):
         with self._lock:
             self.indexed.extend(r["chunk_id"] for r in records)
 
@@ -148,3 +154,87 @@ def test_embedded_text_includes_the_heading_breadcrumb():
 def test_searchable_text_handles_a_missing_heading():
     from alexandria.index.bm25 import searchable_text
     assert searchable_text({"text": "body only"}) == "body only"
+
+
+def test_write_batch_commits_far_less_often_than_it_embeds():
+    """Each store write is one LanceDB commit, and a commit rewrites a manifest
+    listing every prior fragment -- so committing per 32-row embed batch made a full
+    rebuild O(n^2). Measured on the real corpus: 3,970 fragments, 561MB of manifest
+    churn against 683MB of data, throughput halved 480 -> 256 chunks/min. Commit
+    granularity must therefore be independent of embed granularity."""
+    embedder, store, lexical = SlowEmbedder(0.001), SlowStore(0.001), SlowLexical()
+    stats = _run_index_pipeline(_records(250), embedder, store, lexical, batch_size=10,
+                                progress_every=1_000_000, progress_stream=None,
+                                write_batch=100)
+
+    assert len(embedder.calls) == 25                      # embed granularity unchanged
+    assert [c[2] for c in store.calls] == [100, 100, 50]  # 3 commits, not 25
+    assert stats.indexed == 250
+    assert sorted(lexical.indexed) == sorted(f"c{i}" for i in range(250))
+
+
+def test_the_final_partial_buffer_is_never_dropped():
+    """Records short of a full write_batch still have to reach the store: the bug
+    this guards against loses the tail of every corpus that is not an exact multiple
+    of the batch size."""
+    embedder, store, lexical = SlowEmbedder(0.001), SlowStore(0.001), SlowLexical()
+    stats = _run_index_pipeline(_records(7), embedder, store, lexical, batch_size=2,
+                                progress_every=1_000_000, progress_stream=None,
+                                write_batch=1000)
+
+    assert sum(c[2] for c in store.calls) == 7
+    assert stats.indexed == 7
+
+
+def test_default_write_batch_preserves_commit_per_embed_batch():
+    """write_batch=0 is the compatibility default -- existing callers must keep
+    committing exactly as before."""
+    embedder, store, lexical = SlowEmbedder(0.001), SlowStore(0.001), SlowLexical()
+    _run_index_pipeline(_records(20), embedder, store, lexical, batch_size=5,
+                        progress_every=1_000_000, progress_stream=None)
+
+    assert [c[2] for c in store.calls] == [5, 5, 5, 5]
+
+
+def test_rebuild_routes_writes_to_append_not_merge():
+    """After store.drop() every row is new, so merge_insert's match scan can only
+    ever find nothing. The rebuild path must take append(), or it pays that scan on
+    every batch for no result."""
+    embedder, store, lexical = SlowEmbedder(0.001), SlowStore(0.001), SlowLexical()
+    _run_index_pipeline(_records(30), embedder, store, lexical, batch_size=10,
+                        progress_every=1_000_000, progress_stream=None,
+                        write_batch=10, append_only=True)
+
+    assert store.appended == [10, 10, 10]
+
+    store2 = SlowStore(0.001)
+    _run_index_pipeline(_records(30), SlowEmbedder(0.001), store2, SlowLexical(),
+                        batch_size=10, progress_every=1_000_000, progress_stream=None,
+                        write_batch=10)
+    assert store2.appended == []      # incremental indexing still merges
+
+
+def test_precomputed_batches_do_not_recount_the_previous_batch_cache_stats():
+    """`last_cache_stats` is only refreshed BY an embed() call.
+
+    Enrichment's synthetic records carry precomputed query-space vectors and skip
+    the embedder entirely, so a batch made only of those never calls embed() --
+    and the old code snapshotted the stale stats from the previous batch and
+    added them again. Observed on the real corpus: a 124,751-chunk rebuild
+    reported `cache 89902 hit/0 miss` when only 38,963 chunks were ever embedded,
+    which is a number that cannot be reconciled with the corpus and sent me
+    hunting a data-loss bug that did not exist.
+    """
+    records = _records(40)
+    for i in range(10, 30):                       # middle two batches are precomputed
+        records[i]["vector"] = [0.5, 0.5, 0.5, 0.5]
+
+    embedder, store, lexical = SlowEmbedder(0.001), SlowStore(0.001), SlowLexical()
+    stats = _run_index_pipeline(records, embedder, store, lexical, batch_size=10,
+                                progress_every=1_000_000, progress_stream=None)
+
+    assert len(embedder.calls) == 2, "only the two non-precomputed batches embed"
+    assert stats.cache_misses == 20, (
+        f"expected 20 embedded chunks, got {stats.cache_misses} -- stale stats "
+        "from a previous batch were counted again")
+    assert stats.indexed == 40, "every record must still be indexed"

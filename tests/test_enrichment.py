@@ -266,3 +266,30 @@ def test_synthetic_hit_carries_its_score_to_an_unretrieved_target(tmp_path):
         "dropped, neutralizing enrichment in exactly the zero-overlap case")
     assert all("::hq" not in r.chunk_id for r in results)
     assert results and results[0].chunk_id == "sources/doc#0"
+
+
+def test_reattach_replays_stored_payloads_without_ever_calling_the_llm(tmp_path):
+    """Rebuilding an index over an already-enriched corpus is pure replay from
+    EnrichmentStore. If that path touches the LLM at all, every reindex silently
+    becomes a network dependency -- and the rebuild cannot run when the gateway is
+    down, which is exactly when you most want to rebuild locally. This is what
+    `alexandria index --reattach-only` relies on."""
+    class ExplodingLLM:
+        def complete(self, *args, **kwargs):
+            raise AssertionError("reattach must not call the LLM")
+
+    recipe = recipe_signature("m", "v1")
+    store = EnrichmentStore(tmp_path / "index")
+
+    first = enrich_docs_for_index(
+        _records("body one"), llm=ScriptedClient([GOOD]), embedder=ScriptedEmbedder(),
+        store=store, recipe=recipe, limit=0, workers=1, progress_every=1000)
+    assert first["enriched"] == 1
+
+    stats = enrich_docs_for_index(
+        _records("body one"), llm=ExplodingLLM(), embedder=ScriptedEmbedder(),
+        store=store, recipe=recipe, limit=0, workers=1, progress_every=1000)
+
+    assert stats["reattached"] == 1
+    assert stats["enriched"] == 0
+    assert stats["failed"] == 0

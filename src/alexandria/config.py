@@ -27,6 +27,14 @@ class AppConfig:
     chunk_tokens: int = 512
     chunk_overlap: float = 0.15
     index_progress_every: int = 250
+    # Commit granularity, deliberately decoupled from embed_batch_size. Every
+    # store write is one LanceDB commit, and a commit rewrites a manifest listing
+    # every existing fragment -- so per-commit cost grows with the number of prior
+    # commits and a full rebuild is O(n^2). Measured on the real corpus at 32:
+    # 3,970 fragments, manifest grown 1.7KB -> 292KB, 561MB of manifest churn
+    # against 683MB of actual data, throughput halved 480 -> 256 chunks/min.
+    # 4096 buys ~130x fewer commits for ~25MB of buffered rows.
+    index_write_batch: int = 4096
     wiki_boost: float = 1.25
     rrf_k: int = 60
 
@@ -64,6 +72,8 @@ def load_config(*, corpus_override: str | Path | None = None,
                                          ("index", "chunk_overlap"), 0.15)),
         index_progress_every=_as_int(_env_or_file("ALEXANDRIA_INDEX_PROGRESS_EVERY", raw,
                                                   ("index", "progress_every"), 250)),
+        index_write_batch=_as_int(_env_or_file("ALEXANDRIA_INDEX_WRITE_BATCH", raw,
+                                               ("index", "write_batch"), 4096)),
         wiki_boost=float(_env_or_file("ALEXANDRIA_SEARCH_WIKI_BOOST", raw,
                                       ("search", "wiki_boost"), 1.25)),
         rrf_k=_as_int(_env_or_file("ALEXANDRIA_SEARCH_RRF_K", raw, ("search", "rrf_k"), 60)),

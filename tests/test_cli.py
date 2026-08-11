@@ -207,3 +207,42 @@ def test_wiki_site_verb_renders(tmp_path, capsys):
 def test_wiki_site_missing_wiki_dir_fails(tmp_path):
     assert app(["--corpus", str(tmp_path), "wiki-site", "--wiki", str(tmp_path / "nope"),
                 "--out", str(tmp_path / "site")]) == 2
+
+
+def test_eval_refuses_to_measure_an_index_left_partial_by_a_rebuild(tmp_path, capsys):
+    """SPEC C6: a measurement must assert its preconditions.
+
+    A killed rebuild once left the table at 90,304 of 124,751 chunks; the eval
+    happily measured it, reported a -4.1% "regression" that was pure artifact,
+    and appended it to eval_runs.jsonl where it became the baseline for every
+    later gate. Refusing is the only safe behaviour: a partial index is not a
+    state the corpus was ever in.
+    """
+    from alexandria.cli import build_parser, cmd_eval, _rebuild_marker
+
+    marker = _rebuild_marker(tmp_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("rebuild of 124751 chunks started\n")
+
+    args = build_parser().parse_args(["--corpus", str(tmp_path), "eval"])
+    assert cmd_eval(args) == 2
+    assert "refusing to measure a partial index" in capsys.readouterr().err
+
+
+def test_allow_partial_index_overrides_the_refusal(tmp_path, capsys):
+    """The guard is a safety catch, not a wall -- deliberate measurement of a
+    partial index stays possible, it just cannot happen by accident."""
+    import contextlib
+    from alexandria.cli import build_parser, cmd_eval, _rebuild_marker
+
+    marker = _rebuild_marker(tmp_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("rebuild in progress\n")
+
+    args = build_parser().parse_args(
+        ["--corpus", str(tmp_path), "eval", "--allow-partial-index"])
+    # It will fail further down for want of a golden set in an empty corpus;
+    # what this asserts is that it got PAST the guard rather than stopping on it.
+    with contextlib.suppress(Exception):
+        cmd_eval(args)
+    assert "refusing to measure a partial index" not in capsys.readouterr().err

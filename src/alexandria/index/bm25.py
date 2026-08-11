@@ -35,11 +35,34 @@ class BM25Index:
         )
         self.connection.commit()
 
-    def index(self, chunks: Iterable[Mapping[str, Any]]) -> None:
+    # chunks_fts declares chunk_id UNINDEXED, so there is no index to resolve
+    # `WHERE chunk_id = ?` -- SQLite scans the whole FTS table for each one.
+    # Measured 2026-08-11 at 40,960 rows: 84.7 ms per lookup, i.e. ~347 s of pure
+    # scanning for a single 4096-row batch, growing with the table. Deleting the
+    # whole batch in one statement turns N scans into one, so the cost per batch
+    # stops depending on the batch size. Chunked because SQLite caps host
+    # parameters per statement.
+    _DELETE_CHUNK = 900
+
+    def index(self, chunks: Iterable[Mapping[str, Any]], *,
+              append_only: bool = False) -> None:
         records = [dict(chunk) for chunk in chunks]
+        if append_only:
+            # A rebuild drops chunks_fts first, so every DELETE below would scan a
+            # table that provably cannot hold the id -- batching the scan makes it
+            # cheap but not free, and it is still O(table) per flush. Skip it.
+            # chunk_metadata's ON CONFLICT keeps re-insertion safe there; chunks_fts
+            # has no key, so the de-duplication the DELETE would have provided is
+            # done here instead (last wins, matching upsert semantics).
+            records = list({chunk["chunk_id"]: chunk for chunk in records}.values())
         with self.connection:
+            ids = [] if append_only else [chunk["chunk_id"] for chunk in records]
+            for start in range(0, len(ids), self._DELETE_CHUNK):
+                batch = ids[start:start + self._DELETE_CHUNK]
+                placeholders = ",".join("?" * len(batch))
+                self.connection.execute(
+                    f"DELETE FROM chunks_fts WHERE chunk_id IN ({placeholders})", batch)
             for chunk in records:
-                self.connection.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk["chunk_id"],))
                 # Index the heading breadcrumb ALONGSIDE the body. The chunker moves
                 # headings out of `text` and into `heading_path`, so indexing text
                 # alone made every document title and section heading unsearchable --

@@ -60,6 +60,33 @@ class VectorStore:
         merger = table.merge_insert("chunk_id")
         merger.when_matched_update_all().when_not_matched_insert_all().execute(records)
 
+    def append(self, chunks: Iterable[Mapping[str, Any]]) -> None:
+        """Insert rows known to be new. Only valid straight after drop().
+
+        merge_insert scans the table for matching chunk_ids on every call, so its
+        cost grows with table size and a full rebuild is O(n^2) in the number of
+        rows. After drop() every row is new by construction and that scan can only
+        ever find nothing, so it is pure waste. Measured on the real 124,751-chunk
+        corpus: throughput decayed 480 -> 256 chunks/min as the table passed 90k
+        rows, with a projected 4h tail.
+
+        The caller owns the precondition that chunk_ids are unique -- append cannot
+        deduplicate the way merge_insert does. cmd_index enforces it once, up front,
+        before the rebuild starts (a per-batch check would not catch a collision
+        between two different batches).
+        """
+        records = [_normalise_record(chunk) for chunk in chunks]
+        if not records:
+            return
+        if self._fallback is not None:
+            self._fallback.upsert(records)
+            return
+        table = self._open_table()  # pragma: no cover - requires optional dependency
+        if table is None:
+            self._db.create_table(self.table_name, data=records)
+            return
+        table.add(records)
+
     def search_vector(self, query_vec: list[float], k: int, where: Mapping[str, Any] | None = None) -> list[dict]:
         if k < 1:
             return []

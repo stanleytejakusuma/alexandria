@@ -203,21 +203,35 @@ def cmd_index(args) -> int:
         print(f"skip: {error}", file=sys.stderr)
     if args.enrich:
         from .enrich import EnrichmentStore, enrich_docs_for_index, recipe_signature
-        from .llm import LLMClient
         store = EnrichmentStore(corpus / ".alexandria" / "index")
-        llm = LLMClient(model=args.enrich_model, base_url=args.base_url,
-                        api_key_env=args.api_key_env)
-        # Preflight: one tiny call so a degraded gateway fails the run in
-        # seconds, not in a 25k-doc retry cascade (observed live 2026-08-10:
-        # gateway queue stall -> every enrichment call timed out -> the whole
-        # run churned ~2h then finished as 100% failed).
-        try:
-            llm.complete("Reply with the single word: ok", "preflight",
-                         temperature=0.1)
-        except Exception as exc:
-            print(f"enrich: preflight failed ({exc}); aborting "
-                  f"--enrich run", file=sys.stderr)
-            return 3
+        if args.reattach_only:
+            # Rebuilding the index over an already-enriched corpus is pure replay
+            # from EnrichmentStore -- requiring a live gateway for it turns every
+            # reindex into a network dependency for work that needs no network.
+            # Any document that genuinely still needs a call is counted as failed
+            # and stays retryable, exactly as a gateway error would leave it.
+            class _NoLLM:
+                def complete(self, *args, **kwargs):
+                    raise RuntimeError(
+                        "--reattach-only: document is not in the enrichment store "
+                        "and no LLM gateway is configured")
+
+            llm = _NoLLM()
+        else:
+            from .llm import LLMClient
+            llm = LLMClient(model=args.enrich_model, base_url=args.base_url,
+                            api_key_env=args.api_key_env)
+            # Preflight: one tiny call so a degraded gateway fails the run in
+            # seconds, not in a 25k-doc retry cascade (observed live 2026-08-10:
+            # gateway queue stall -> every enrichment call timed out -> the whole
+            # run churned ~2h then finished as 100% failed).
+            try:
+                llm.complete("Reply with the single word: ok", "preflight",
+                             temperature=0.1)
+            except Exception as exc:
+                print(f"enrich: preflight failed ({exc}); aborting "
+                      f"--enrich run", file=sys.stderr)
+                return 3
         recipe = recipe_signature(args.enrich_model, args.enrich_prompt_version)
         estats = enrich_docs_for_index(
             records, llm=llm, embedder=_cached_embedder(config, corpus),
@@ -227,14 +241,36 @@ def cmd_index(args) -> int:
     store = VectorStore(corpus / ".alexandria" / "index")
     lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
     if args.rebuild:
+        # SPEC C6: --rebuild drops the table, so from here until the pipeline
+        # finishes the index is partial. The marker makes that state visible to
+        # anything that measures the index; it is deliberately NOT removed on
+        # failure, because a crashed rebuild leaves exactly the partial index
+        # the marker is warning about.
+        marker = _rebuild_marker(corpus)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            f"rebuild of {len(records)} chunks started "
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} (pid {os.getpid()})\n")
         store.drop()
         lexical.drop()
+        # store.append() cannot deduplicate the way merge_insert does, so the
+        # uniqueness it assumes is verified once here rather than trusted. Checking
+        # per batch would miss a collision that spans two batches.
+        ids = [record["chunk_id"] for record in records]
+        if len(ids) != len(set(ids)):
+            from collections import Counter
+            dupes = [cid for cid, n in Counter(ids).most_common(5) if n > 1]
+            raise ValueError(
+                "rebuild set contains duplicate chunk_id(s); append would insert "
+                f"every copy: {dupes}")
     embedder = _cached_embedder(config, corpus)
     started = time.monotonic()
     stats = _run_index_pipeline(records, embedder, store, lexical,
                                 batch_size=config.embed_batch_size,
                                 progress_every=config.index_progress_every,
-                                progress_stream=sys.stdout)
+                                progress_stream=sys.stdout,
+                                write_batch=config.index_write_batch,
+                                append_only=args.rebuild)
     elapsed = time.monotonic() - started
     print(f"index: {len(records)} chunks from {len({record['doc_id'] for record in records})} documents "
           f"in {elapsed:.2f}s (cache {stats.cache_hits} hit/"
@@ -243,6 +279,8 @@ def cmd_index(args) -> int:
     # reindex invalidates stale query/response cache entries.
     gen = write_index_generation(corpus)
     print(f"index: corpus generation {gen} (query/response caches invalidated)")
+    if args.rebuild:
+        _rebuild_marker(corpus).unlink(missing_ok=True)
     return 0
 
 
@@ -254,7 +292,8 @@ class IndexStats:
 
 
 def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_size: int,
-                        progress_every: int, progress_stream) -> IndexStats:
+                        progress_every: int, progress_stream,
+                        write_batch: int = 0, append_only: bool = False) -> IndexStats:
     """Overlap embedding (GPU-bound) with store writes (I/O-bound).
 
     The naive loop -- embed batch, write batch, embed next batch -- leaves the GPU
@@ -294,9 +333,16 @@ def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_
                 if needs_embed:
                     vectors = embedder.embed(
                         [searchable_text(record) for record in needs_embed])
+                    # snapshot NOW, not later
+                    cache_stats = dict(embedder.last_cache_stats)
                 else:
                     vectors = []
-                cache_stats = dict(embedder.last_cache_stats)   # snapshot NOW, not later
+                    # last_cache_stats is only refreshed BY an embed() call, so a
+                    # batch of entirely precomputed vectors would otherwise re-report
+                    # the previous batch's numbers and count them twice. Observed
+                    # 2026-08-11: a 124,751-chunk rebuild reported 89,902 hits/0
+                    # misses when only 38,963 chunks were ever embedded.
+                    cache_stats = {"hits": 0, "misses": 0}
                 dim = getattr(embedder, "dim", None)
                 indexed_records: list[dict] = []
                 it = iter(vectors)
@@ -327,13 +373,29 @@ def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_
     indexed = cache_hits = cache_misses = 0
     next_report = progress_every
     started = time.monotonic()
+
+    # Commit granularity is NOT embed granularity. Each store write is one LanceDB
+    # commit whose manifest lists every prior fragment, so committing per embed
+    # batch (32 rows) makes a rebuild O(n^2). Buffer to write_batch rows first.
+    # write_batch=0 preserves the old commit-per-batch behaviour for callers that
+    # do not set it.
+    write = store.append if append_only else store.upsert
+    pending: list[dict] = []
+
+    def flush() -> None:
+        if pending:
+            write(pending)
+            lexical.index(pending, append_only=append_only)
+            pending.clear()
+
     while True:
         item = work.get()
         if item is SENTINEL:
             break
         indexed_records, cache_stats = item
-        store.upsert(indexed_records)          # I/O overlaps the NEXT batch's embed()
-        lexical.index(indexed_records)
+        pending.extend(indexed_records)
+        if len(pending) >= write_batch:        # I/O overlaps the NEXT batch's embed()
+            flush()
         indexed += len(indexed_records)
         cache_hits += cache_stats["hits"]
         cache_misses += cache_stats["misses"]
@@ -348,6 +410,7 @@ def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_
     producer.join()
     if failure:
         raise failure[0]
+    flush()                                    # never leave a partial buffer unwritten
     return IndexStats(indexed=indexed, cache_hits=cache_hits, cache_misses=cache_misses)
 
 
@@ -502,6 +565,10 @@ def cmd_wiki_site(args) -> int:
     return 0
 
 
+def _rebuild_marker(corpus: Path) -> Path:
+    return corpus / ".alexandria" / "index" / ".rebuild-in-progress"
+
+
 def cmd_eval(args) -> int:
     """Measure current retrieval against the private golden set without changing it."""
     if args.k is not None and args.k < 0:
@@ -509,6 +576,18 @@ def cmd_eval(args) -> int:
         return 2
     config = _config_for(args)
     corpus = config.corpus_path
+    # SPEC C6: a measurement must assert its preconditions. An eval run against a
+    # half-written index measures a state that never coherently existed, and
+    # append_run() then makes it previous[-1] -- corrupting not just that run's
+    # verdict but every future gate comparison. Observed 2026-08-11: a killed
+    # rebuild left the table at 90,304 of 124,751 chunks; the eval reported a
+    # -4.1% recall "regression" that was pure artifact and had to be quarantined.
+    marker = _rebuild_marker(corpus)
+    if marker.exists() and not getattr(args, "allow_partial_index", False):
+        print(f"eval: an index rebuild is in progress or was interrupted "
+              f"({marker}); refusing to measure a partial index. Finish the "
+              f"rebuild, or pass --allow-partial-index to override.", file=sys.stderr)
+        return 2
     golden_path = (Path(args.golden).expanduser() if args.golden else
                    corpus / ".alexandria" / "golden" / "golden-v1.jsonl")
     try:
@@ -754,6 +833,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="threads for the enrichment LLM calls (default 1)")
     index.add_argument("--enrich-prompt-version", default="v1",
                        help="enrichment recipe version; a change forces re-enrichment")
+    index.add_argument("--reattach-only", action="store_true",
+                       help="replay stored enrichment without an LLM gateway "
+                            "(for rebuilding an index over an already-enriched corpus)")
     index.add_argument("--base-url", default="http://127.0.0.1:20128/v1",
                        help="gateway base URL for the enrichment LLM")
     index.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY",
@@ -777,6 +859,9 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--k", type=int, help="override every entry's retrieval depth")
     evaluate.add_argument("--json", action="store_true", help="emit a machine-readable report")
     evaluate.add_argument("--compare-last", action="store_true", help="show transitions from the prior run")
+    evaluate.add_argument("--allow-partial-index", action="store_true",
+                          help="measure even if a rebuild is in progress or was "
+                               "interrupted (the result is not a valid baseline)")
     evaluate.add_argument("--fail-on-regression", action="store_true",
                           help="exit 1 when a prior hit becomes a miss")
     evaluate.set_defaults(func=cmd_eval)
