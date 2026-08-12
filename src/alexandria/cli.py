@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import getpass
 import json
 import os
 import re
@@ -661,7 +662,7 @@ def cmd_search(args) -> int:
     logger = AuditLogger(corpus)
     logger.search(query=args.query, k=args.k,
                   latency_ms=int((time.time() - _t0) * 1000),
-                  hits=len(results), caller=args.caller, user=args.user,
+                  hits=len(results), caller=args.caller, user=cli_identity(),
                   cache_hit=engine.last_cache_hit)
     for result in results:
         print(f"{result.rank}. {result.chunk_id}  score={result.score:.6f}\n"
@@ -779,7 +780,7 @@ def cmd_answer(args) -> int:
         llm_model=args.llm_model, grader_a_model=args.grader_a_model,
         grader_b_model=args.grader_b_model, base_url=args.base_url,
         api_key_env=args.api_key_env, prompt_version=args.prompt_version,
-        save_dir=args.save_dir, caller=args.caller, user=args.user)
+        save_dir=args.save_dir, caller=args.caller, user=cli_identity())
     if outcome.cached:
         print("[cached] " + outcome.text)
         return 0
@@ -920,6 +921,30 @@ def cmd_cache(args) -> int:
     print(f"cache --clear: removed {total} row(s) (embedding cache kept; "
           "it is content-hash keyed and self-invalidating)")
     return 0
+
+
+def cli_identity() -> str:
+    """The identity recorded for a CLI invocation. Derived, never accepted.
+
+    BACKLOG #8: the old `--user` flag (default `ALEXANDRIA_USER` or "local") was
+    written verbatim into the audit trail, so any caller could name themselves
+    anyone. That is worse than recording nothing -- an absent field is obviously
+    absent, while a forged one is a plausible-looking audit trail that reads as
+    evidence. Nothing consumed the flag (not serve, not the extension, not any
+    script), so it was removed rather than validated.
+
+    The OS user is the honest answer on this path: a caller can only "forge" it
+    by actually being that user, at which point it is true. This is the same
+    claim serve makes in §5.3 -- identity equals filesystem access -- reached by
+    the local equivalent of serve's socket ownership.
+
+    `--caller` survives because it labels the invoking *tool*, not a person, and
+    its help text now says it is unverified.
+    """
+    try:
+        return getpass.getuser()
+    except Exception:  # no passwd entry (some containers); never fail a query
+        return "unknown"
 
 
 def _config_for(args) -> AppConfig:
@@ -1070,8 +1095,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--workers", type=int, default=6)
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
-                   help="consumer identity recorded in the audit trail")
-    s.add_argument("--user", default=os.environ.get("ALEXANDRIA_USER", "local"))
+                   help="UNVERIFIED tool label recorded in the audit trail; not an identity")
     s.set_defaults(func=cmd_sync)
 
     remember = sub.add_parser("remember",
@@ -1148,8 +1172,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--layer", choices=["sources", "wiki"])
     search.add_argument("--trace", action="store_true")
     search.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
-                       help="consumer identity recorded in the audit trail")
-    search.add_argument("--user", default=os.environ.get("ALEXANDRIA_USER", "local"))
+                       help="UNVERIFIED tool label recorded in the audit trail; not an identity")
     search.set_defaults(func=cmd_search)
 
     evaluate = sub.add_parser("eval", help="score retrieval against the private golden set")
@@ -1175,8 +1198,7 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("--grader-b-model", default="deepseek-v4-pro")
     answer.add_argument("--prompt-version", default="v1")
     answer.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
-                       help="consumer identity recorded in the audit trail")
-    answer.add_argument("--user", default=os.environ.get("ALEXANDRIA_USER", "local"))
+                       help="UNVERIFIED tool label recorded in the audit trail; not an identity")
     answer.add_argument("--save-dir", default=None,
                         help="emit the page here (default: temp dir, page printed only)")
     answer.set_defaults(func=cmd_answer)
