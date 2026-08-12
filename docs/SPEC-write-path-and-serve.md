@@ -1,18 +1,51 @@
-# Write Path and Serve — Design Spec
+# Package: Concurrent Write Path and `alexandria serve`
 
-**Status:** proposed, awaiting sign-off on the three open decisions in §7.
+**Status:** proposed. Decisions in §11 are settled; the package is ready for adversarial
+review.
 **Date:** 2026-08-12
 **Supersedes:** the ingestion half of the weekly loop introduced in `cf70313`.
 
-**Goal:** make a newly captured fact retrievable in minutes instead of days, without
-adding a database server, without losing exact recall, and without rewriting the corpus.
+**The claim this package makes:** *a fact you record is retrievable in seconds, the
+corpus is safe to write to from more than one process, and a second harness can read it
+over the network without a forgeable audit trail.*
+
+Everything in the package serves that one sentence. Anything that does not is listed in
+§10 with a named re-entry trigger.
+
+---
+
+## 0. Manifest
+
+| in | why it is in |
+|---|---|
+| SQLite WAL + `busy_timeout` (backlog #1) | literal prerequisite for a second writer |
+| Locked generation bump (backlog #2b) | unlocked read-modify-write loses invalidations |
+| `flock` write lock | serialises the promote → index → bump section |
+| `remember` → pending marker → inline promote | the freshness fix itself |
+| Drain (offline fallback) | the CLI must work when the server is down |
+| Liveness on oldest-pending age | the corpus must not be able to freeze silently again |
+| `alexandria serve` — `/health`, `/search`, `/answer`, `/remember` | the unlock |
+| Attribution as a property of the channel (backlog #8) | today's `--user` is forgeable |
+| Backup/restore of `.alexandria` state (backlog #7) | this package *creates* new state |
+| `cache_hit` metric correctness | otherwise the package cannot be honestly measured |
+| Tenancy tripwire (executable) | keeps a latent bug from going live unnoticed |
+
+| out | re-entry trigger |
+|---|---|
+| Tenant column / scope object | first customer requiring intra-org document ACLs |
+| Per-tenant generation counters | same trigger; the global counter is correct for one install |
+| Bearer-token auth | clients become dynamic rather than a fixed small set |
+| Deletion / erasure path | deliberate: needs a policy decision first (see §10.1) |
+| IVF index | flat scan exceeds 250 ms at working k (~150–200k chunks) |
+| HNSW / PQ / distributed ANN | see D2 |
+| Cost ledger, citation linkage, procurement floor | next package |
 
 ---
 
 ## 1. The problem, stated as measurements
 
-Everything below was measured on this machine against the live corpus (45,984 chunks),
-2026-08-12. No estimates.
+Measured on this machine against the live corpus (45,984 chunks), 2026-08-12. No
+estimates.
 
 | operation | measured |
 |---|---|
@@ -31,32 +64,37 @@ The last row is the defect. The work required is ~165 ms; the delay is ~518,000 
 Root cause is not storage and not scale. `alexandria remember` appends a line to
 `inbox/<date>.md` and returns. Promotion to `sources/` and indexing happen **only**
 inside the weekly cron, because that cron is the only caller of `sync` and `index`.
-Three unrelated jobs — recording one fact, distilling sessions, and reconciling the
-whole corpus — were bundled into one schedule, so the cheapest job inherited the
-slowest cadence.
+Three unrelated jobs — recording one fact, distilling sessions, and reconciling the whole
+corpus — were bundled into one schedule, so the cheapest job inherited the slowest
+cadence.
+
+> **On causation.** The concurrency defects in §3 are *not* multi-tenant debt. They exist
+> because the weekly cron was the only writer, which made single-writer-ness true by
+> accident. Adding any second write trigger — which the freshness fix requires — makes
+> both reachable at **one user**. They are siblings of the staleness bug, not scope creep.
 
 ## 2. Decisions locked by measurement
 
 **D1 — Storage stays LanceDB + SQLite FTS5. No vector database server.**
 LanceDB is an embedded library, not a service: the corpus is 2.2 GB of Lance fragments
-plus a 644 MB FTS index, opened in-process. It already supports single-record
-`upsert()` (`merge_insert("chunk_id")`, `index/store.py:38`) with the new row searchable
+plus a 644 MB FTS index, opened in-process. It already supports single-record `upsert()`
+(`merge_insert("chunk_id")`, `index/store.py:38`) with the new row searchable
 immediately. Adding Qdrant/Milvus/Weaviate would replace the 0.076 s component and leave
-the 16.036 s component untouched, while adding a daemon, a network hop, and a second
-copy of a private corpus. Rejected on those grounds, not on principle.
+the 16.036 s component untouched, while adding a daemon, a network hop, and a second copy
+of a private corpus. Rejected on those grounds, not on principle.
 
 **D2 — No ANN index yet. Exact brute-force search is retained.**
 `_indices/` is empty and no `create_index`/IVF/HNSW/PQ call exists anywhere in the source.
-Every query is an exact scan, so recall is 1.0 by construction and there is no index
-that can go stale relative to new rows. HNSW would cut 0.076 s to roughly 0.003 s —
-irrelevant against a cold query dominated by a 16 s model load — in exchange for
-approximate recall, build cost on every change, and reintroducing write-staleness.
+Every query is an exact scan, so recall is 1.0 by construction and there is no index that
+can go stale relative to new rows. HNSW would cut 0.076 s to roughly 0.003 s — irrelevant
+against a cold query dominated by a 16 s model load — in exchange for approximate recall,
+build cost on every change, and reintroducing write-staleness.
 
 > **Re-entry trigger:** build an IVF index when the flat scan exceeds **250 ms at the
 > working k**, i.e. roughly 150k–200k chunks (3–4× current). Prefer IVF over HNSW
 > (additive, `nprobes` is a recall dial). Avoid PQ: it trades recall for memory, and
-> recall is already the weakest surface. Note that sharding per tenant *delays* this
-> threshold, because each tenant index is smaller than one shared index.
+> recall is already the weakest surface. Sharding per tenant *delays* this threshold,
+> because each tenant index is smaller than one shared index.
 
 **D3 — The fixed cost to amortize is the embedding model load, not storage.**
 16.036 s of the write path is `MLXEmbedder._load()`. This single fact determines the
@@ -71,315 +109,377 @@ append-never-edit, collapse at read time). This spec does not change document id
 **D5 — The weekly job is kept, but stops being the ingestion path.** It becomes
 reconciliation, compaction, integrity verification, and eval. Nothing waits on it.
 
-## 3. Architecture
+**D6 — WAL and `serve` are orthogonal; both are required.** WAL + `busy_timeout` is
+correctness under two writers. `serve` amortizes the 16 s model load, kills the 25–33 s
+cold query, and provides the network read path. WAL does not amortize a model load, and
+`serve` does not make SQLite safe. `serve` becoming the primary writer does **not**
+retire the lock, because the CLI must remain fully usable when the server is down — a
+hard constraint, which guarantees the possibility of two writers permanently.
+
+---
+
+## 3. Foundations — reachable-today bugs, fixed first
+
+These land before `serve`, because `serve` makes each of them reachable in normal use.
+
+### 3.1 SQLite concurrency (backlog #1)
+
+`grep -rn busy_timeout src/` returns **zero hits**. `index/bm25.py:28-29` opens with
+`check_same_thread=False` and sets `journal_mode=WAL`, but with no busy timeout a
+concurrent writer fails *immediately* with `database is locked` rather than waiting.
+Set `busy_timeout` on the BM25 and cache connections; verify WAL is actually in force
+rather than assumed.
+
+### 3.2 Generation-counter correctness (backlog #2)
+
+Two halves. The first is **done** (`500cd9e`): `SearchEngine._generation` was captured
+once in `__init__` and keyed every cache entry, so a long-lived server would have served
+pre-reindex results for the life of the process — no error, no cache miss, no signal. It
+is now re-read per access.
+
+The second is **open**. `cache.py:64`:
+
+```python
+gen = read_index_generation(corpus) + 1   # unlocked read-modify-write
+```
+
+Two concurrent bumps both read N and both write N+1, silently losing one invalidation.
+Unreachable today with one scheduled writer; reachable the moment a drain and a server
+coexist. Fix under the same `flock` as §4.2.
+
+### 3.3 `cache_hit` metric correctness
+
+`cache_hit` currently conflates two different events: `retrieval/search.py:123` sets 1
+for a query-cache hit, and the `answer` path also records 1 for a cached *retrieval*
+while the synthesis LLM still runs. Measured consequence: of 1,199 rows flagged
+`cache_hit=1`, only **267 are actually sub-10 ms**; 932 exceed 100 ms. The true fast-path
+rate is **267/2,377 ≈ 11%**, not the 79.7% the flag implies.
+
+This is in the package because `serve` adds a *third* cache dimension (warm in-process vs
+on-disk). Building that telemetry on a flag that already conflates two things makes every
+measurement of this package untrustworthy. Separate the codes; keep `tier` and `client`
+in mind as already-dead discriminators (`tier` is always `map`, `client` always `cli`).
+
+---
+
+## 4. Architecture
 
 Three write classes, three cadences. The whole design is the unbundling.
 
-> **Ordering note.** This section is written drain-first because that is the order the
-> design was reasoned in. Q1 later chose to *build* `serve` (§4) first. The architecture
-> below is unchanged by that choice — with a warm server the same promote → embed →
-> upsert → FTS → bump sequence runs inline on the write instead of on a timer, and
-> §3.2's lock is required either way.
-
 | class | trigger | latency to searchable | cost when idle |
 |---|---|---|---|
-| `remember` — one fact | the CLI call | append is instant; searchable at next drain | — |
-| drain — promote + index pending | timer, every 10 min | ≤ 10 min + 16 s | one `stat` |
-| session distillation — LLM | timer, gated on transcript idle | ≤ idle timeout | one `stat` |
-| reconcile — full walk, compact, eval, verify | weekly | n/a | — |
+| `remember` — one fact | the CLI call or `/remember` | ~165 ms warm | — |
+| session distillation | idle-gated, hourly | one cycle | a `stat` |
+| full reconcile | weekly | n/a — nothing waits on it | scheduled |
 
-```
-remember ──► inbox/<date>.md  +  pending marker        (instant, no model)
-                    │
-              [drain, every 10 min]
-                    │  stat pending → empty? exit 0 immediately
-                    │  non-empty? load model ONCE, then per entry:
-                    ├──► promote to sources/
-                    ├──► embed  (~0.1 s)
-                    ├──► LanceDB upsert  (~0.06 s)
-                    ├──► FTS5 insert
-                    └──► mark promoted, bump generation once per drain
-                    │
-              [weekly] reconcile · compact fragments · verify · eval
-```
+With `serve` running, the promote → embed → upsert → FTS → bump sequence runs **inline on
+the write**. With `serve` down, the same sequence runs on the drain's timer. Identical
+code path, different trigger.
 
-The drain amortizes one 16 s model load across every fact that accumulated. At an idle
-poll it does a `stat` and exits, which is what makes a 10-minute cadence affordable
-where a 10-minute *full reindex* would be absurd.
-
-### 3.1 Why a pending marker rather than scanning the inbox
+### 4.1 Why a pending marker rather than scanning the inbox
 
 The drain must know what is unpromoted without re-reading and re-hashing every inbox
-file. `remember` writes an entry id to a pending list; the drain consumes it and marks
-it promoted. This makes the drain idempotent (a crash mid-drain leaves the entry
-pending, and re-running promotes it exactly once because `upsert` is keyed on
-`chunk_id`) and makes "is anything pending?" a file-existence check rather than a scan.
+file. `remember` writes an entry id to a pending list; promotion consumes it. This makes
+promotion idempotent — a crash mid-promote leaves the entry pending, and re-running
+promotes it exactly once because `upsert` is keyed on `chunk_id` — and makes "is anything
+pending?" a file-existence check rather than a scan. It is also the input to §7's
+liveness signal.
 
-### 3.2 Concurrency — a race the drain creates
+### 4.2 The write lock
 
-There is no write coordination anywhere in the codebase today: no `flock`, no `fcntl`,
-no lock file, no LanceDB commit-conflict retry, and no SQLite `busy_timeout`. This is
-currently safe *by accident* — the weekly cron is the only writer, serialised by being
-the only thing scheduled.
+`fcntl.flock(fd, LOCK_EX | LOCK_NB)` on `.alexandria/index/.write.lock`, held across the
+whole promote → embed → upsert → FTS → generation-bump section.
 
-The drain breaks that assumption. It creates at minimum a second writer, and in practice
-three: the drain, the weekly reconcile, and any manual `alexandria index`. Two concrete
-failure modes follow:
+> **Not an `O_EXCL` sentinel.** An `O_EXCL` lock file survives `SIGKILL` with no owner
+> recorded and no way to distinguish a live holder from a dead one, so one hard kill
+> wedges every future writer silently — and §7's detector would not report it. `flock` is
+> released by the kernel when the holding process dies, by any means.
 
-- **SQLite FTS** (`index/bm25.py:28-29`) sets `journal_mode=WAL` but no `busy_timeout`,
-  so a concurrent writer fails immediately with `database is locked` rather than waiting.
-- **LanceDB** uses optimistic concurrency; the loser of a commit race raises a conflict,
-  and nothing in `index/store.py` retries it.
+The drain **skips its run** rather than blocking when the lock is held: the weekly
+reconcile is the long job, and a skipped drain costs at most one interval of freshness.
 
-This is the tax of embedded storage — a database server would provide write coordination
-as part of what it is. Since D1 keeps storage embedded, the coordination is ours to write:
+### 4.3 Generation and cache
 
-- `fcntl.flock(fd, LOCK_EX | LOCK_NB)` on `.alexandria/index/.write.lock`, held across
-  the whole promote → embed → upsert → FTS → generation-bump section, so exactly one
-  writer mutates the index at a time
+Each promotion cycle that does work bumps the generation once — not once per fact —
+invalidating query and response caches. Given §3.3's real fast-path rate of ~11%, that
+invalidation is cheap against the alternative of answering without a fact recorded
+minutes ago.
 
-> **Not an `O_EXCL` sentinel.** (Red, 2026-08-12; the first draft of this section had it
-> wrong.) An `O_EXCL` lock file survives `SIGKILL` with no owner recorded and no way to
-> distinguish a live holder from a dead one, so a single hard kill wedges every future
-> writer silently — and §5's detector would not report it. `flock` is released by the
-> kernel when the holding process dies, by any means. Stdlib, zero dependencies,
-> strictly better.
-- the drain **skips its run** rather than blocking if the lock is held: the weekly
-  reconcile is the long job, and a skipped drain costs at most one interval of freshness
-- `busy_timeout` set on the BM25 and embedding-cache connections so brief overlaps wait
-  instead of failing
+> Do **not** adopt a "hot buffer" holding new facts outside the index to dodge the bump.
+> The query cache is consulted *before* retrieval and its key includes the generation, so
+> a repeated query would return the cached result and never observe the buffer —
+> reintroducing the same staleness bug with a quieter failure mode.
 
-`serve` (§4) largely dissolves this later by making one long-lived process the sole
-writer, but the lock is still required, because the CLI must remain usable when the
-server is not running.
+---
 
-### 3.3 Generation and cache
+## 5. `alexandria serve`
 
-Each drain that does work bumps the generation counter once — not once per fact —
-which invalidates query and response caches. Measured cost of that invalidation: the
-query cache delivers a genuine sub-10 ms fast path on **267 of 2,377** logged queries
-(11%). Flushing an 11%-effective cache a few times an hour is the correct trade against
-serving an answer that omits a fact the user recorded ten minutes ago.
+Standard-library `http.server`. No framework, no MCP, no new dependency. `README.md:201`
+already promises "anything that can call an HTTP endpoint"; this makes that true for the
+first time.
 
-> Do **not** adopt a "hot buffer" that holds new facts outside the index to dodge the
-> generation bump. The query cache is consulted *before* retrieval and its key includes
-> the generation, so a repeated query would return the cached result and never observe
-> the buffer — reintroducing the same staleness bug with a quieter failure mode.
+### 5.1 Surface
 
-## 4. Phase 1 — `alexandria serve`
+| endpoint | method | notes |
+|---|---|---|
+| `/health` | GET | status, generation, chunk count, uptime, oldest-pending age |
+| `/search` | POST | the hot path; no LLM |
+| `/answer` | POST | the 600 s synthesis pipeline — see §5.4 |
+| `/remember` | POST | write path; requires §4.2's lock |
 
-Built first (Q1). A long-lived process holding the model and index solves four problems
-at once, which is why it is the destination rather than an optional extra:
-
-1. the 16 s load is paid once at startup, so writes become genuinely inline
-2. queries stop paying cold-start, addressing the measured 25–33 s cold path
-3. it gives a remote harness a read path over HTTP — currently the blocking dependency
-   for the second host, which cannot build its own index (a CPU embed of ~45k chunks
-   exhausted that host and hard-rebooted it on 2026-08-11)
-4. it is the prerequisite for per-tenant scoping under the multi-tenant premise
-
-Shape: standard-library `http.server`, no framework, no MCP, no new dependency.
-`README:201` already promises "anything that can call an HTTP endpoint"; this makes that
-true for the first time.
-
-### 4.1 Surface
-
-| endpoint | method | in | out |
-|---|---|---|---|
-| `/health` | GET | — | status, generation, chunk count, uptime |
-| `/search` | POST | `query`, `k`, `filters` | ranked results as JSON |
-
-`/answer` and `/remember` are **deferred, not forgotten**. `/answer` is the 600 s LLM
-pipeline, against which a 16 s model load is rounding error, so it gains almost nothing
-from being warm and drags the whole LLM-client configuration surface across the network
-boundary. `/remember` waits for §3.2's lock to land, because it is the write path and
-must not race the CLI. Ship the read path, prove it end to end, then extend.
-
-### 4.2 Bind policy
+### 5.2 Bind policy
 
 Default `127.0.0.1`. A non-loopback bind is refused unless
-`ALEXANDRIA_SERVE_ALLOW_REMOTE=1` is set explicitly — fail closed, because the failure
-being prevented is a default-open port serving a private corpus with no authentication.
-Remote access is the SSH tunnel of Q2, not a bind-address change. No token scheme is
-built, because building one would be building an alternative to the design already
-chosen.
+`ALEXANDRIA_SERVE_ALLOW_REMOTE=1` is set explicitly — **fail closed**, because the
+failure being prevented is a default-open port serving a private corpus. Remote access is
+an SSH tunnel, not a bind-address change.
 
-### 4.3 Concurrency
+### 5.3 Attribution — identity is a property of the channel
+
+Today's `--user`/`--caller` is worse than absent: a forgeable, plausible-looking audit
+trail (backlog #8).
+
+The deciding constraint is that **over an SSH tunnel every connection arrives as
+`127.0.0.1`**. The server cannot distinguish callers by inspecting the connection, so
+identity must come from *which channel was reached*, never from the request body.
+
+**Decision: one Unix domain socket per client identity.** SSH forwards Unix sockets
+natively; access is enforced by kernel file permissions; there is no secret to store,
+leak, or rotate. Identity is unforgeable because it is not transmitted.
+
+`--user`/`--caller` supplied in a request body may be retained as an unprivileged *hint*
+field, but is never recorded as who did this. Bearer tokens are deferred to the same
+trigger as tenancy: clients becoming dynamic rather than a fixed small set.
+
+### 5.4 Concurrency, timeouts, and the `/answer` problem
 
 `ThreadingHTTPServer` so one slow client cannot block another at the connection level,
-with a single `threading.Lock` around engine use, since the engine holds a LanceDB
-handle and a SQLite connection opened `check_same_thread=False`. This buys request-level
-concurrency without concurrent engine mutation.
+with a single `threading.Lock` around engine use, since the engine holds a LanceDB handle
+and a SQLite connection opened `check_same_thread=False`.
+
+`/answer` runs a pipeline measured at up to **600 s**. It must therefore **not** hold the
+engine lock for its duration — it holds the lock only for its retrieval phase and
+releases it before synthesis. A request timeout bounds the handler so a wedged LLM call
+cannot pin a worker forever.
 
 > `# ponytail: one global engine lock; per-request engines if throughput matters.`
 
-### 4.4 Input validation at the trust boundary
+### 5.5 Input validation at the trust boundary
 
-This is the first time corpus access is reachable over a socket, so request handling
-validates rather than trusts: bounded request body, `k` clamped to a maximum, query
-length capped, filter keys checked against the known-field whitelist, and malformed JSON
-answered with 400 rather than a traceback. None of this is optional laziness-eligible
-surface.
+First time corpus access is reachable over a socket, so requests are validated rather
+than trusted: bounded request body, `k` clamped, query length capped, filter keys checked
+against the known-field whitelist, malformed JSON answered 400 rather than a traceback.
 
-### 4.5 Cache coherence — the failure a warm process introduces
+### 5.6 Cache coherence
 
-Every CLI invocation today builds a fresh engine, so it physically cannot serve a stale
-generation. A long-lived process can, and the codebase was already shaped to let it:
-`retrieval/search.py` captured `self._generation` **once in `__init__`** and used it to
-key every query-cache entry. A running server would therefore have kept answering from
-pre-reindex cache entries for the life of the process — no error, no cache miss, no
-signal. That is this system's characteristic failure mode: reporting healthy while
-serving stale truth.
+Fixed ahead of the server in `500cd9e` (§3.2). Recorded here because it is the
+characteristic failure this system produces: reporting healthy while serving stale truth.
 
-Fixed at the shared property rather than special-cased in the server, so the CLI and
-every future consumer inherit it: `_generation` is now re-read per access. The cost is a
-few hundred bytes of page-cached JSON against a query floor of ~75 ms.
+### 5.7 Lifecycle
 
-launchd can start the server on demand and let it idle out, so this is not a 24/7 daemon
-requirement. The CLI remains fully usable when the server is down — a hard constraint,
-not a nicety.
+launchd may start the server on demand and let it idle out; this is not a 24/7 daemon
+requirement. **The CLI works identically whether or not the server is running.**
 
-## 4A. Phase 2 — the drain
+---
 
-Demoted to the offline fallback by Q3, but still required, because the CLI must work when
-the server is not running and because the weekly reconcile still needs a trigger. Design
-as described in §3; the lock of §3.2 lands with Phase 1, not with this phase.
+## 6. Backup and restore (backlog #7)
 
-## 5. Liveness
+In this package because the package *creates new state that nothing backs up*: the
+pending list and the liveness state file. Total loss today also destroys the accumulated
+query and citation signal — 2,377 logged queries — which is the training input for any
+future learning loop.
 
-The failure mode this system has actually suffered is a step reporting success while
-doing nothing: the weekly loop wrote `>> "$DIGEST"` into a directory that did not exist,
-so every sync aborted on its own redirect while an `--allow-empty` commit manufactured
+Scope: back up `.alexandria` **state** — `queries.sqlite`, audit logs, eval history,
+liveness state, `generation.json` — and explicitly **not** the rebuildable indexes
+(`chunks.lance` 2.2 GB, `fts.sqlite` 644 MB). Restore must be exercised, not assumed;
+an unverified backup is the same class of claim as an unverified cron.
+
+---
+
+## 7. Liveness
+
+The failure this system actually suffered was a step reporting success while doing
+nothing: the weekly loop wrote `>> "$DIGEST"` into a directory that did not exist, so
+every sync aborted on its own redirect while an `--allow-empty` commit manufactured
 evidence of success. It ran zero successful times from `cf70313` until the fix, and
 nothing noticed for three days.
 
 **The primary signal is the age of the oldest unconsumed pending entry** — not a
-`last_success_at` heartbeat. (Red, 2026-08-12; the heartbeat version of this section was
-wrong.) `remember` writes the pending marker and only a successful promotion consumes it,
-so oldest-pending age measures the actual promise the system makes — "searchable within
-one interval" — rather than whether a process reported success.
+`last_success_at` heartbeat. `remember` writes the marker and only a successful promotion
+consumes it, so oldest-pending age measures the actual promise — "searchable within one
+interval" — rather than whether a process reported success.
 
-A heartbeat fails here for exactly the reason the original bug survived three days: a run
-that aborts early never writes `last_success_at` at all, leaving the file missing or
-holding a healthy pre-regression timestamp, and the checker stays silent. Oldest-pending
-age catches all three real failure shapes with one number — the job never launched (bad
-plist), the job ran but promoted nothing, and the job aborted mid-run.
+A heartbeat fails for precisely the reason the original bug survived: a run that aborts
+early never writes it, leaving the file missing or holding a healthy pre-regression
+timestamp, and the checker stays silent. Oldest-pending age catches all three real
+shapes with one number — never launched, ran but promoted nothing, aborted mid-run.
 
 Rules:
 
 - warn when oldest-pending age exceeds **2× the drain interval**
-- **a missing or unparseable state file counts as stale and warns.** Fail closed;
+- **a missing or unparseable state file counts as stale and warns** — fail closed;
   absence of evidence is not evidence of health
-- every `alexandria` invocation performs this check and prints one line to stderr,
-  requiring no new scheduled process — it piggybacks on interactive use
-- `last_success_at`, `promoted_count`, and `generation` are still recorded, demoted to
-  telemetry
+- every `alexandria` invocation performs the check and prints one line to stderr,
+  requiring no new scheduled process; `/health` exposes the same number
+- `last_success_at`, `promoted_count`, `generation` are retained as telemetry only
 
 Separately, to catch a run that promotes successfully but writes *garbage* embeddings:
-after each drain, query one just-promoted fact using its own text and assert its
-`chunk_id` appears in the top-k (~100 ms warm). This automates G2 on every run rather
-than once at acceptance.
+after each promotion cycle, query one just-promoted fact by its own text and assert its
+`chunk_id` appears in the top-k (~100 ms warm).
 
-### 5.1 Tenancy — add the column now, not later
+---
 
-Add a `tenant` scalar column (default `"default"`) to the LanceDB schema and
-`chunk_metadata`, and include tenant in the cache key, **before** the server ships.
+## 8. Tenancy — a tripwire, not a column
 
-The reason is migration cost, not present need. `index/store.py:49-59` already carries a
-guard from an earlier review: a table created before the enrichment columns existed
-*silently drops them on merge*, and the documented fix is `alexandria index --rebuild`.
-The same trap applies to any column added later, and the rebuild cost grows with the
-corpus — 2.2 GB today.
+`BACKLOG.md` #27/#28 defers tenant scope with a named trigger (first customer requiring
+intra-organization document ACLs) and states the global generation counter is correct for
+one install. **That deferral stands.**
 
-Measured mitigation: lancedb 0.36.0 exposes `Table.add_columns()` with SQL-expression
-defaults, so the existing 45,984 rows can gain `tenant='default'` **without** re-embedding.
-The migration is a scalar column append, not a rebuild — cheaper than Red assumed when
-raising it.
+It was briefly overridden on the argument that adding a `tenant` column later would force
+a full 2.2 GB rebuild — `index/store.py:49-59` shows a table created before the
+enrichment columns silently drops them on merge, with `--rebuild` as the documented fix.
+That argument was tested and is **false**: `lancedb` 0.36.0 `Table.add_columns()`
+backfilled `tenant='default'` across a 100-row table with vectors intact and no
+re-embedding. Retrofit is cheap, so there is no cost argument for building it early.
 
-Per-tenant generation counters are explicitly **not** added. A global counter
-over-invalidates across tenants, which is a performance cost only, never a correctness or
-isolation failure. Tenant striping of the cache key is the part that matters, because
-`ResponseCache.key()` currently omits filters entirely — two tenants asking the same
-question would collide on one cache row and one would receive an answer synthesised from
-the other's private documents, with citations.
+What *is* real is a latent bug. `ResponseCache.key()` (`cache.py:172`) composes
+`(schema, "a", question, model, k, prompt_version, generation)` — **no filters**. Today
+that is harmless because `answer` accepts no filter arguments and `gather.py` reads none.
+It becomes a wrong-answer bug the moment `answer` gains filters, and a cross-tenant data
+leak the moment a second tenant exists.
 
-## 6. Deliberately not built
+**Implemented as an executable tripwire, not a prose warning:** a test asserting that
+either `answer` exposes no filter arguments, or `ResponseCache.key()` includes them. A
+prose caveat rots; a failing test does not. Whoever adds `--project` to `answer` gets a
+red test in the same commit.
 
-- ANN index (see D2 trigger)
-- vector database server (see D1)
+---
+
+## 9. Acceptance gates
+
+Each gate is a test, not a claim.
+
+**Foundations**
+- **F1** Two processes writing the FTS index concurrently both succeed; neither raises
+  `database is locked`.
+- **F2** Two concurrent generation bumps produce N+2, not N+1.
+- **F3** `cache_hit` distinguishes query-cache hits from answer-path retrieval hits; a
+  sub-10 ms fast-path hit is separable in the logs.
+
+**Write path**
+- **W1** `remember` returns in under 500 ms and does not load the embedding model.
+- **W2** A fact written moments earlier is returned by `search` — end to end against the
+  real corpus, not a fixture.
+- **W3** A promotion interrupted mid-run leaves the entry pending; re-running promotes it
+  exactly once, verified by `chunk_id` count.
+- **W4** Generation bumps once per cycle, not once per fact.
+- **W5** With the write lock held by another process, a drain exits cleanly without
+  mutating the index and without raising.
+- **W6** A drain and a reconcile started simultaneously produce no `database is locked`
+  and no LanceDB commit conflict; the corpus is intact afterwards.
+- **W7** With the state file artificially aged — and separately, deleted — an ordinary
+  `search` prints the staleness warning to stderr and still returns results.
+
+**Serve**
+- **S1** `/health` returns 200 with a chunk count matching the corpus; default bind is
+  `127.0.0.1`.
+- **S2** A non-loopback bind is refused without `ALEXANDRIA_SERVE_ALLOW_REMOTE=1`.
+- **S3** Warm `/search` p50 under 500 ms versus the measured 25–33 s cold path; the model
+  loads exactly once across N requests.
+- **S4** After an external `alexandria index` bumps the generation, the **running** server
+  returns fresh results rather than a pre-reindex cached page. *(Landed:
+  `tests/test_search.py::test_reindex_invalidates_cache_for_a_long_lived_engine`,
+  mutation-verified.)*
+- **S5** Malformed JSON, oversized body, out-of-range `k`, and unknown filter key each
+  return 4xx, not a traceback.
+- **S6** The CLI works normally while the server runs, and while it does not.
+- **S7** A request arriving on socket A is attributed to A's identity even when the body
+  claims to be someone else.
+- **S8** A slow `/answer` does not block a concurrent `/search`.
+
+**Backup**
+- **B1** A restore from backup reproduces query history, audit log, and liveness state —
+  exercised, not asserted.
+
+**Tenancy**
+- **T1** The tripwire test fails if `answer` gains a filter argument while
+  `ResponseCache.key()` still omits filters.
+
+---
+
+## 10. Deliberately not built
+
+- ANN index (D2 trigger)
+- vector database server (D1)
 - automatic compaction after every write — fragment count is monitored, compaction runs
   weekly; 60 fragments currently, one per index run
 - a separate small embedding model for inserts: mixing models in one vector space makes
   similarity scores incomparable, the same trap as the MLX/torch cache-key split
-- online RL / bandit tuning of retrieval: exploration means deliberately serving worse
-  results to real users
-- deletion UX beyond tombstones — `_deletions/` exists in the store, so this is a
-  product gap, not a storage limitation, and it belongs to the versioning spec
+- online RL / bandit tuning: exploration means deliberately serving worse results to real
+  users
+- bearer tokens, tenant scope object, per-tenant generation counters (§8, backlog #27/#28)
 
-## 7. Decisions — resolved 2026-08-12
+### 10.1 Deletion — deferred pending a policy decision, not effort
 
-**Q1. Order — `serve` first.** Chosen over drain-first because it is the only option that
-unblocks the second harness, and because inline writes through a warm process subsume the
-drain's purpose on the interactive path. Accepted risk: the write path and the network
-boundary get built at the same time rather than sequentially, so §3.2's lock and §5's
-detector must land *with* the server, not after it.
+Kept as a reference point by explicit decision. Recorded here because the *shape* of the
+problem determines whether it is cheap or expensive later.
 
-**Q2. Bind address — localhost by default, remote via SSH tunnel.** `127.0.0.1` is the
-default for every deployment, personal and enterprise alike; a non-loopback bind must be
-explicit and opt-in. The remote harness reaches the server through an SSH tunnel, which
-adds no new authentication surface because the tunnel already authenticates. This keeps
-the single-user case zero-configuration while making the networked case a deliberate,
-auditable step rather than a default-open port holding a private corpus.
+A document currently survives in: `sources/*.md`; `chunks.lance` (2.2 GB, `_deletions/`
+exists so tombstones are supported); `fts.sqlite` (644 MB); `enrichment.sqlite` (26 MB);
+`queries.sqlite` `retrieved_ids` (which is also the learning signal); the corpus **git
+history** (34 commits); `wiki/` pages citing it (13); the response cache; and the
+embedding cache — **whose location is currently unresolved**, since the documented path
+`.alexandria/index/embeddings.sqlite` is 0 B. *You cannot erase from a store you cannot
+locate; finding it is a prerequisite for any erasure work.*
 
-**Q3. Cadence — absorbed by `serve`.** With a warm process the write is inline and the
-fact is retrievable in ~165 ms, so no polling interval governs the interactive path. The
-drain remains only as the offline fallback for when the server is not running, defaulting
-to 10 minutes. It skips rather than queues when the write lock is held, so a long weekly
-reconcile cannot cause drains to pile up.
+Two tensions make this a policy question rather than an engineering one:
 
-## 8. Acceptance gates
+1. **Erasure versus audit.** An immutable, provenance-bearing audit trail is the product
+   differentiator; erasure requires records be destroyable. Both cannot be absolute.
+2. **Git.** Real erasure means history rewriting, which breaks every clone. The standard
+   escape is crypto-shredding — encrypt per subject, delete the key — which
+   `SPEC-versioning-and-supersession.md` names and puts out of scope.
 
-Each gate is a test, not a claim.
+**The decision to make before building anything: does erasure include the audit trail and
+git history, or does it stop at the retrievable surface?** If audit is exempt, deletion
+is a weekend. If it is not, crypto-shredding must be designed in before the corpus grows
+much further — the one item here that genuinely gets more expensive with time.
 
-Phase 1 (`serve`):
+---
 
-- **S1** `/health` returns 200 with a chunk count matching the corpus, and the server
-  binds `127.0.0.1` by default.
-- **S2** A non-loopback bind is refused without `ALEXANDRIA_SERVE_ALLOW_REMOTE=1`.
-- **S3** Warm `/search` p50 is under 500 ms — versus the measured 25–33 s cold path —
-  and the model is loaded exactly once across N requests.
-- **S4** After an external `alexandria index` bumps the generation, the **running**
-  server returns fresh results rather than a pre-reindex cached page. *(Regression test
-  landed ahead of the server:
-  `tests/test_search.py::test_reindex_invalidates_cache_for_a_long_lived_engine`;
-  mutation-verified by pinning `_generation` back to construction time.)*
-- **S5** Malformed JSON, an oversized body, an out-of-range `k`, and an unknown filter
-  key each return 4xx, not a traceback.
-- **S6** The CLI works normally while the server is running, and while it is not.
+## 11. Decisions — resolved 2026-08-12
 
-Phase 2 (drain):
+- **Order:** `serve` first, over drain-first, because it is the only option that unblocks
+  the second harness. Accepted risk: the write path and the network boundary are built
+  together, so §4.2's lock and §7's detector land *with* the server.
+- **Bind:** localhost default; non-loopback fails closed; remote via SSH tunnel.
+- **Cadence:** absorbed by `serve` — inline at ~165 ms. The drain survives only as the
+  offline fallback, defaulting to 10 minutes, skipping rather than queuing under lock.
+- **Endpoints:** `/answer` and `/remember` are **in** v1, which pulls the `flock` and the
+  `/answer` lock-release requirement (§5.4) into scope with them.
+- **Attribution:** one Unix socket per client identity; request-body identity never
+  recorded as authoritative.
+- **Backup:** in the package.
+- **Tenancy:** deferred per backlog; enforced by an executable tripwire (§8).
+- **Golden set:** used as-is, as a **regression guard** ("did we break retrieval?") and
+  explicitly not as a progress measure. This package changes freshness and concurrency,
+  not retrieval quality, so the golden set's known brittleness (63.3% recall, 18 misses
+  against brittle `must_retrieve` ids) is not load-bearing here. No repair work.
+- **Deletion:** out (§10.1).
 
-- **G1** `remember` returns in under 500 ms and does not load the embedding model.
-- **G2** After a drain, a fact written moments earlier is returned by `search` — verified
-  end to end against the real corpus, not a fixture.
-- **G3** A drain with nothing pending exits non-zero-work in under 200 ms and does not
-  load the model.
-- **G4** A drain interrupted mid-run leaves the entry pending; re-running promotes it
-  exactly once (no duplicate chunk, verified by `chunk_id` count).
-- **G5** Generation bumps once per drain, not once per fact.
-- **G6** With the state file artificially aged, an ordinary `search` prints the staleness
-  warning to stderr and still returns results.
-- **G7** The weekly job no longer performs ingestion, and a fact remains retrievable
-  across a full reconcile run.
-- **G8** With the write lock held by another process, a drain exits cleanly without
-  mutating the index and without raising — verified by holding the lock and asserting
-  chunk count is unchanged.
-- **G9** A drain and a reconcile started simultaneously produce no `database is locked`
-  error and no LanceDB commit conflict; the corpus is intact afterwards.
+---
 
-## 9. First test case
+## 12. Acceptance
 
-`inbox/2026-08-11.md` currently holds 12 entries written during the flush, none of them
-promoted or indexed. The Telethon peer-type entry is the designated end-to-end fixture:
-it is real, it is currently unretrievable, and it must become retrievable within one
-drain cycle.
+The package is done when a **fresh Pi session** and **H‍ermes on the second host** both
+answer a question correctly from the same corpus, over the real path, where the answer
+depends on a fact recorded *after* the server started — and neither could have known it
+otherwise.
+
+That is the canary test. It is the finish line, not a separate objective, and it is
+deliberately the last step: it can only be written once this spec is reviewed and built,
+never before.
+
+`inbox/2026-08-11.md` — 12 entries written at 23:50 against a corpus last indexed at
+20:34, still unretrievable hours later — is the designated pre-package measurement of the
+defect.
