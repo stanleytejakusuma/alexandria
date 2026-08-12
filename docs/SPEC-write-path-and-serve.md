@@ -29,9 +29,12 @@ Everything in the package serves that one sentence. Anything that does not is li
 | Backup/restore of `.alexandria` state (backlog #7) | this package *creates* new state |
 | `cache_hit` metric correctness | otherwise the package cannot be honestly measured |
 | Tenancy tripwire (executable) | keeps a latent bug from going live unnoticed |
+| Pi extension routes through `serve` | otherwise the primary write path bypasses the server |
+| Host-portable deployment (§5.8) | the server must not assume the operator's laptop |
 
 | out | re-entry trigger |
 |---|---|
+| Session-distillation idle gate | after this package ships; `remember` freshness is the actual complaint |
 | Tenant column / scope object | first customer requiring intra-org document ACLs |
 | Per-tenant generation counters | same trigger; the global counter is correct for one install |
 | Bearer-token auth | clients become dynamic rather than a fixed small set |
@@ -280,6 +283,45 @@ characteristic failure this system produces: reporting healthy while serving sta
 launchd may start the server on demand and let it idle out; this is not a 24/7 daemon
 requirement. **The CLI works identically whether or not the server is running.**
 
+### 5.8 Deployment topology — default local, remote supported
+
+**Default: the operator's own machine, `127.0.0.1`.** For a single user this is the
+whole story and requires no configuration — the corpus, the model, and the server all sit
+on one host, and nothing is exposed.
+
+**But the server must not assume that host is a laptop.** It must be deployable on an
+always-on machine — a NAS, a spare box, a customer's VM — with clients reaching it over
+an SSH tunnel (§5.2/§5.3). Nothing in the implementation may hard-code the operator's
+machine, a macOS-only path, or launchd as the only supervisor.
+
+> **The binding constraint is the embedding provider, not the network.** The corpus is
+> indexed with exactly one embedding model, and the cache key is
+> `sha256(name + revision + mode + text)` where `name` is the model. MLX uses
+> `mlx-community/Qwen3-Embedding-0.6B-8bit`; torch uses `Qwen/Qwen3-Embedding-0.6B`.
+> These are different vectors in different spaces, and mixing them silently produces
+> incomparable similarity scores. **A host serving an index must embed queries with the
+> same provider that built it.** Since MLX is Apple-Silicon only, moving the server to a
+> Linux host requires the index to have been built with `ALEXANDRIA_EMBED_PROVIDER=local`
+> (torch) — a full re-embed, not a file copy.
+
+This is why remote hosting is a **supported topology rather than a default**: it is a
+one-time re-embed decision made at install, not a runtime switch. The installer should
+ask which host will serve, so the index is built with the right provider the first time.
+
+Second constraint, learned the hard way on 2026-08-11: **serving is not indexing.**
+Embedding one query is ~1/46,000 of the work of building the corpus. A modest
+always-on host can comfortably *serve* an index it could never *build* — a CPU embed of
+45,984 chunks exhausted such a host and hard-rebooted it. Build on a capable machine,
+serve anywhere.
+
+### 5.9 The Pi extension routes through `serve`
+
+The `alexandria-remember` / `alexandria-search` extension tools currently shell out to
+the CLI, which means the primary write path pays the 16 s model load per call and
+bypasses the server entirely. They route through the server when it is reachable, and
+fall back to the CLI when it is not — the same reachability rule as §5.7, so the tools
+never become less reliable than they are today.
+
 ---
 
 ## 6. Backup and restore (backlog #7)
@@ -396,6 +438,11 @@ Each gate is a test, not a claim.
 - **S7** A request arriving on socket A is attributed to A's identity even when the body
   claims to be someone else.
 - **S8** A slow `/answer` does not block a concurrent `/search`.
+- **S9** A server whose embedding provider does not match the one that built the index
+  **refuses to start** with a named error, rather than silently serving vectors from a
+  different model. This is the guard that makes remote hosting safe.
+- **S10** With the server stopped, the Pi extension still answers via the CLI; with it
+  running, the same query does not reload the model.
 
 **Backup**
 - **B1** A restore from backup reproduces query history, audit log, and liveness state —
@@ -465,6 +512,13 @@ much further — the one item here that genuinely gets more expensive with time.
   explicitly not as a progress measure. This package changes freshness and concurrency,
   not retrieval quality, so the golden set's known brittleness (63.3% recall, 18 misses
   against brittle `must_retrieve` ids) is not load-bearing here. No repair work.
+- **Serve host:** default is the operator's own machine; remote hosting on an always-on
+  box is a supported topology, gated on the embedding-provider constraint in §5.8.
+  Building the server is not blocked on choosing a host.
+- **Session distillation:** out of this package; tracked separately.
+- **Extension routing:** in — the extension calls `serve` when reachable, CLI otherwise.
+- **Embedding cache in backup:** out (rebuildable), but it must first be *located* — the
+  documented path is 0 B while a ~4.59 GB cache demonstrably exists. Tracked separately.
 - **Deletion:** out (§10.1).
 
 ---
