@@ -55,9 +55,17 @@ class _LockedEngine:
     """Wraps a SearchEngine so every `.search()` call is serialized through
     the shared engine lock, without holding the lock across the LLM calls
     `run_pipeline` makes between searches (§5.4, gate S8: a slow /answer
-    must not block a concurrent /search). `gather.py` calls `engine.search()`
-    and nothing else on the engine, so wrapping only that method is exact,
-    not an approximation."""
+    must not block a concurrent /search).
+
+    `gather.py` reaches the engine only through `engine.search()`
+    (gather.py:74,83), so the synthesis path itself is fully covered. One
+    other access exists on the /answer route: `run_answer` writes the cost
+    ledger via `engine.logger.log_usage(...)` (cli.py:732), which reaches the
+    real engine through `__getattr__` UNLOCKED. That is safe -- QueryLogger
+    opens a fresh connection per call with busy_timeout set, and holds no
+    shared mutable state -- but it means this wrapper covers `.search()`
+    specifically, not "every engine access". A future caller that mutates
+    engine state through `__getattr__` would bypass the lock silently."""
 
     def __init__(self, engine, lock: threading.Lock) -> None:
         self._engine = engine
@@ -124,12 +132,19 @@ def _source_document_count(corpus: Path) -> int:
     either index. Counts markdown FILES, not chunks: re-chunking here would
     duplicate the cost /health exists to let callers avoid paying, and a
     per-document count is what a distinct-doc_id count from either index
-    can be meaningfully compared against."""
+    can be meaningfully compared against.
+
+    Counts only what the indexer would actually ingest, via the shared
+    predicate -- a walk with its own idea of which files count reports a
+    permanent phantom shortfall and the boolean below is then false forever."""
+    from .index.chunker import INDEX_ROOTS, is_indexable_source
+
     count = 0
-    for sub in ("sources", "wiki"):
+    for sub in INDEX_ROOTS:
         base = corpus / sub
         if base.is_dir():
-            count += sum(1 for _ in base.rglob("*.md"))
+            count += sum(1 for p in base.rglob("*.md")
+                         if is_indexable_source(p.relative_to(corpus)))
     return count
 
 

@@ -245,6 +245,33 @@ def doc_frontmatter_metadata(frontmatter: dict, doc_id: str) -> dict:
     }
 
 
+# The two top-level trees that get indexed, and the parts that are quarantined
+# out of them. `_unparsed/` holds files migrate.py could not parse (no
+# frontmatter) -- documented as deliberately skipped in
+# docs/WORK-ORDER-phase1-retrieval.md.
+INDEX_ROOTS = frozenset({"sources", "wiki"})
+# NB: top-level `inbox/` (the un-promoted staging file) is excluded by the
+# INDEX_ROOTS check alone. It must NOT be listed here -- `sources/inbox/` holds
+# the PROMOTED inbox documents, which are indexed and retrievable.
+QUARANTINED_PARTS = frozenset({".alexandria", "_unparsed"})
+
+
+def is_indexable_source(relative: Path) -> bool:
+    """Whether a corpus-relative path is one the indexer will actually ingest.
+
+    Single source of truth, because anything that COUNTS documents has to agree
+    with what INDEXES them or it reports a permanent phantom shortfall. Serve's
+    /health once walked `sources/`+`wiki/` itself and reported
+    `source_documents_agree: false` forever, because it counted the 25
+    quarantined files in `sources/_unparsed/` that the indexer skips by design.
+    A health signal that is always false is not a signal.
+    """
+    parts = relative.parts
+    if not parts or parts[0] not in INDEX_ROOTS:
+        return False
+    return not (QUARANTINED_PARTS & set(parts))
+
+
 def chunk_doc_records(path: Path, corpus: Path, config: "AppConfig") -> tuple[list[dict], str | None]:
     """Read one document off disk and return its fully-formed chunk records --
     the same dict shape VectorStore.upsert() and BM25Index.index() both expect.

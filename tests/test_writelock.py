@@ -72,6 +72,54 @@ def test_assert_local_filesystem_refuses_a_detected_network_mount(tmp_path, monk
     _checked_local.discard(resolved)
 
 
+def test_a_sibling_mount_with_a_shared_name_prefix_is_not_mistaken_for_it(tmp_path, monkeypatch):
+    """The mount table is matched by longest prefix. Matched without respecting
+    path component boundaries, "/Volumes/Databank" reads as being under the
+    "/Volumes/Data" NFS share, and a perfectly local corpus is refused for a
+    filesystem it is not on. Fail-closed, so this cost availability rather
+    than safety -- but an unexplainable refusal is how a guard gets removed."""
+    _checked_local.clear()
+    corpus = tmp_path / "Databank" / "corpus"
+    corpus.mkdir(parents=True)
+    base = str(tmp_path.resolve())
+
+    def fake_run(args, **kwargs):
+        # "Databank" is an ordinary DIRECTORY on the local disk -- it has no
+        # mount entry of its own. The NFS share's mountpoint is a string prefix
+        # of it and sorts longer than the local disk's, so a boundary-blind
+        # longest-prefix match hands back "nfs" for a path that is not on it.
+        return subprocess.CompletedProcess(args, 0, stderr="", stdout=(
+            f"/dev/disk1s1 on {base} (apfs, local, journaled)\n"
+            f"fileserver:/export on {base}/Data (nfs, nosuid)\n"))
+
+    monkeypatch.setattr("alexandria.writelock.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("alexandria.writelock.subprocess.run", fake_run)
+
+    assert_local_filesystem(corpus)  # must not raise
+    _checked_local.discard(str(corpus.resolve()))
+
+
+def test_a_real_path_actually_on_the_network_mount_is_still_refused(tmp_path, monkeypatch):
+    """The other half of the same fix: narrowing the match must not stop it
+    catching a path genuinely beneath the network mount."""
+    _checked_local.clear()
+    corpus = tmp_path / "Data" / "corpus"
+    corpus.mkdir(parents=True)
+    base = str(tmp_path.resolve())
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stderr="", stdout=(
+            f"/dev/disk1s1 on {base} (apfs, local, journaled)\n"
+            f"fileserver:/export on {base}/Data (nfs, nosuid)\n"))
+
+    monkeypatch.setattr("alexandria.writelock.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("alexandria.writelock.subprocess.run", fake_run)
+
+    with pytest.raises(NotLocalFilesystem):
+        assert_local_filesystem(corpus)
+    _checked_local.discard(str(corpus.resolve()))
+
+
 def test_assert_local_filesystem_check_is_cached_per_path(tmp_path, monkeypatch):
     """The check must not shell out to `mount` on every single write-lock
     acquisition (inline promote on every /remember would make that a
@@ -107,3 +155,65 @@ def test_write_lock_acquire_runs_the_local_filesystem_check(tmp_path, monkeypatc
     with pytest.raises(NotLocalFilesystem):
         lock.acquire()
     _checked_local.discard(resolved)
+
+
+def test_the_lock_is_released_by_the_kernel_when_a_holder_is_sigkilled(tmp_path):
+    """§4.2 chose fcntl.flock over an O_EXCL sentinel file specifically because
+    a sentinel survives SIGKILL with no owner and wedges every future writer
+    silently, which §7's liveness signal would not attribute to a stuck lock.
+
+    That rationale was prose until now. This kills a real holding process with
+    SIGKILL -- no handler, no unwind, no `finally` -- and proves the next
+    acquirer succeeds.
+    """
+    import signal
+    import subprocess as sp
+    import sys
+    import textwrap
+    import time
+    from pathlib import Path
+
+    corpus = tmp_path / "corpus"
+    (corpus / ".alexandria" / "index").mkdir(parents=True)
+    ready = tmp_path / "acquired.flag"
+
+    holder_src = textwrap.dedent(f"""
+        import sys, time
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
+        from alexandria.writelock import write_lock
+        lock = write_lock({str(corpus)!r})
+        assert lock.acquire() is True
+        open({str(ready)!r}, "w").close()
+        time.sleep(120)
+    """)
+    script = tmp_path / "holder.py"
+    script.write_text(holder_src)
+
+    holder = sp.Popen([sys.executable, str(script)], stdout=sp.PIPE, stderr=sp.PIPE)
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists() and time.monotonic() < deadline:
+            if holder.poll() is not None:
+                raise AssertionError(f"holder died early: {holder.communicate()[1].decode()}")
+            time.sleep(0.05)
+        assert ready.exists(), "holder never acquired the lock"
+
+        # Contended while the holder is alive -- proves the lock is real.
+        contender = write_lock(corpus)
+        assert contender.acquire() is False, "lock was not held by the live holder"
+
+        holder.send_signal(signal.SIGKILL)
+        holder.wait(timeout=10)
+
+        # The kernel drops the flock when the process dies, however it died.
+        deadline = time.monotonic() + 10
+        acquired = False
+        while time.monotonic() < deadline and not acquired:
+            acquired = write_lock(corpus).acquire()
+            if not acquired:
+                time.sleep(0.05)
+        assert acquired, "lock was NOT released after the holder was SIGKILLed"
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)

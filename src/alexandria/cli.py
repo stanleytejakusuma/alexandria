@@ -40,7 +40,7 @@ from .eval.history import append_run, compare, load_runs, regressions
 from .eval.metrics import by_overlap_band
 from .eval.runner import EvalReport, run_eval
 from .index.bm25 import BM25Index, searchable_text
-from .index.chunker import chunk_doc_records, chunk_document
+from .index.chunker import chunk_doc_records, chunk_document, is_indexable_source
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
 from .index.manifest import ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest, write_manifest
 from .index.store import VectorStore
@@ -975,10 +975,7 @@ def _cached_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
 def _load_chunk_records(corpus: Path, config: AppConfig, limit: int, workers: int) -> tuple[list[dict], list[str]]:
     paths = []
     for path in sorted(corpus.rglob("*.md")):
-        relative = path.relative_to(corpus)
-        if not relative.parts or relative.parts[0] not in {"sources", "wiki"}:
-            continue
-        if ".alexandria" not in relative.parts and "_unparsed" not in relative.parts:
+        if is_indexable_source(path.relative_to(corpus)):
             paths.append(path)
     if limit:
         paths = paths[:limit]

@@ -254,3 +254,75 @@ def test_w6_a_concurrent_drain_and_reconcile_do_not_corrupt_the_corpus(tmp_path,
     assert len(all_ids) == len(set(all_ids)), "duplicate chunk_ids after concurrent access"
     for chunk_id in all_ids:
         assert store.get(chunk_id) is not None
+
+
+@pytest.mark.parametrize("kill_step", ["embed", "upsert", "fts", "bump", "unlink"])
+def test_w3a_a_real_sigkill_mid_promote_still_reconverges_on_rerun(tmp_path, monkeypatch, kill_step):
+    """The stronger form of W3a.
+
+    The parametrized test above raises an exception between steps, in-process,
+    and the rerun reuses the same live store/FTS/embedder handles. That proves
+    "an exception at a step boundary converges" -- not the claim promote.py
+    makes, which is that a CRASH converges. A real crash kills the process
+    mid-flight: buffers are not flushed, `finally` never runs, the flock is
+    dropped by the kernel, and the rerun must reopen every store cold.
+
+    This kills the promoting process with SIGKILL at each of the five ordering
+    points and then reconverges from a genuinely cold start.
+    """
+    import subprocess as sp
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    corpus = tmp_path / "corpus"
+    entry_id = _remember(tmp_path, monkeypatch, f"Real-crash fact at {kill_step}.")
+    src = str(Path(__file__).resolve().parents[1] / "src")
+
+    script = tmp_path / "crasher.py"
+    script.write_text(textwrap.dedent(f"""
+        import os, signal, sys
+        sys.path.insert(0, {src!r})
+        os.environ["ALEXANDRIA_EMBED_PROVIDER"] = "hash"
+        from pathlib import Path
+        from alexandria.config import AppConfig
+        from alexandria.index.bm25 import BM25Index
+        from alexandria.index.embedder import CachedEmbedder, HashEmbedder
+        from alexandria.index.store import VectorStore
+        from alexandria.promote import promote_pending
+
+        corpus = Path({str(corpus)!r})
+        config = AppConfig(corpus_path=corpus)
+        embedder = CachedEmbedder(HashEmbedder(),
+                                  corpus / ".alexandria" / "cache" / "embeddings.sqlite")
+        store = VectorStore(corpus / ".alexandria" / "index")
+        lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+
+        def hook(step):
+            if step == {kill_step!r}:
+                os.kill(os.getpid(), signal.SIGKILL)   # no unwind, no finally
+
+        promote_pending(corpus, config, embedder, store, lexical, test_hook=hook)
+    """))
+
+    proc = sp.run([sys.executable, str(script)], capture_output=True, timeout=120)
+    assert proc.returncode == -9, (
+        f"expected SIGKILL (-9), got {proc.returncode}: {proc.stderr.decode()[:400]}")
+
+    # Cold reopen -- brand new handles, exactly as a restarted process would.
+    config, embedder, store, lexical = _engine_pieces(corpus)
+    result = promote_pending(corpus, config, embedder, store, lexical)
+
+    assert not is_pending(corpus, entry_id), (
+        f"entry still pending after a rerun following SIGKILL at {kill_step}")
+
+    doc_id_prefix = f"sources/inbox/inbox-{entry_id}"
+    chunk_ids = [row[0] for row in lexical.connection.execute(
+        "SELECT chunk_id FROM chunk_metadata WHERE chunk_id LIKE ?",
+        (f"{doc_id_prefix}%",)).fetchall()]
+    assert chunk_ids, f"nothing indexed after SIGKILL at {kill_step} + rerun"
+    assert len(chunk_ids) == len(set(chunk_ids)), "duplicate chunk_ids after a real crash"
+    for chunk_id in chunk_ids:
+        assert store.get(chunk_id) is not None, (
+            f"{chunk_id} is in FTS5 but missing from the vector store after "
+            f"SIGKILL at {kill_step} -- the two stores diverged across a real crash")

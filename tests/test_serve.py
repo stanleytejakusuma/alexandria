@@ -146,6 +146,29 @@ def test_s1_health_returns_200_with_cross_checked_chunk_counts(tmp_path, monkeyp
         assert body["source_documents_agree"] is True
 
 
+def test_s1_quarantined_files_do_not_create_a_permanent_phantom_shortfall(tmp_path, monkeypatch):
+    """`sources/_unparsed/` holds files migrate.py could not parse; the indexer
+    skips them by design (docs/WORK-ORDER-phase1-retrieval.md). A health walk
+    that counts them reports a shortfall that can never be closed, and
+    `source_documents_agree` is then false forever -- which is what the real
+    production corpus did (25 quarantined files, agree=false permanently).
+    A signal that is always false cannot report a real freeze."""
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    quarantined = corpus / "sources" / "_unparsed" / "sync-conflict-20260801.md"
+    quarantined.parent.mkdir(parents=True, exist_ok=True)
+    quarantined.write_text("no frontmatter, never parseable, never indexed\n")
+
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    with _running(tcp_server, uds_servers):
+        status, body = _request(tcp_server.server_address, "GET", "/health")
+
+    assert status == 200
+    assert body["source_documents_agree"] is True, (
+        f"a quarantined file was counted as a missing document: "
+        f"{body['source_document_count']} walked vs "
+        f"{body['distinct_documents_indexed']} indexed")
+
+
 def test_s1_the_source_document_walk_actually_catches_a_frozen_index(tmp_path, monkeypatch):
     """Proves source_documents_agree is a REAL check, not decoration: add a
     second source document on disk WITHOUT reindexing, and the independent

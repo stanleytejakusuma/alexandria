@@ -47,6 +47,22 @@ class NotLocalFilesystem(Exception):
     """The corpus lives on a filesystem where flock is unreliable or a no-op."""
 
 
+def _is_under(resolved: str, mountpoint: str) -> bool:
+    """True if `resolved` is at or beneath `mountpoint`, respecting path
+    component boundaries.
+
+    A bare startswith() is wrong: "/Volumes/Databank" starts with
+    "/Volumes/Data", so a local disk mounted next to an NFS share inherits the
+    share's filesystem type and the corpus is refused for a network filesystem
+    it isn't on. Fail-closed, so this was an availability bug rather than a
+    safety hole -- but a refusal nobody can explain is how a guard gets
+    disabled wholesale."""
+    if mountpoint == "/":
+        return True
+    mountpoint = mountpoint.rstrip("/")
+    return resolved == mountpoint or resolved.startswith(mountpoint + "/")
+
+
 def _fs_type_macos(path: Path) -> str | None:
     try:
         out = subprocess.run(["mount"], capture_output=True, text=True, timeout=5).stdout
@@ -60,7 +76,7 @@ def _fs_type_macos(path: Path) -> str | None:
         if " on " not in line or "(" not in line:
             continue
         mountpoint = line.split(" on ", 1)[1].split(" (", 1)[0]
-        if resolved.startswith(mountpoint) and len(mountpoint) >= len(best_mount):
+        if _is_under(resolved, mountpoint) and len(mountpoint) >= len(best_mount):
             paren = line[line.index("(") + 1:line.index(")")]
             best_mount, best_type = mountpoint, paren.split(",")[0].strip()
     return best_type
@@ -78,7 +94,7 @@ def _fs_type_linux(path: Path) -> str | None:
         if len(parts) < 3:
             continue
         mountpoint, fstype = parts[1], parts[2]
-        if resolved.startswith(mountpoint) and len(mountpoint) >= len(best_mount):
+        if _is_under(resolved, mountpoint) and len(mountpoint) >= len(best_mount):
             best_mount, best_type = mountpoint, fstype
     return best_type
 
