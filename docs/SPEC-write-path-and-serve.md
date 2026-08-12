@@ -29,6 +29,7 @@ Everything in the package serves that one sentence. Anything that does not is li
 | Backup/restore of `.alexandria` state (backlog #7) | this package *creates* new state |
 | `cache_hit` metric correctness | otherwise the package cannot be honestly measured |
 | Index manifest (provider/model/revision) | today nothing records which model built the index |
+| Cost ledger on `/answer` (backlog #4) | `/answer` ships in v1 and is the only component that spends money |
 | Tenancy tripwire (executable) | keeps a latent bug from going live unnoticed |
 | Pi extension routes through `serve` | otherwise the primary write path bypasses the server |
 | Host-portable deployment (§5.8) | the server must not assume the operator's laptop |
@@ -165,10 +166,19 @@ that still holds MLX vectors, in one column, with no error. The result is silent
 incomparable similarity scores: not a crash, not a visibly wrong answer, just quietly
 degraded ranking.
 
-Fix: write an index manifest at index time recording provider, model name, revision,
-embedding dimension, and creation time. Both the CLI and `serve` verify it on open and
-refuse to proceed on mismatch. This is the precondition for gate S9, and therefore for
-safe remote hosting — without it there is nothing to compare against.
+Fix: write an index manifest at index time recording **provider, model name, revision,
+embedding dimension, normalization, and dtype**, plus creation time. Both the CLI and
+`serve` verify it on open and refuse to proceed on mismatch. This is the precondition for
+gate S9, and therefore for safe remote hosting — without it there is nothing to compare
+against.
+
+> Normalization and dtype are not padding. If one index stores L2-normalized vectors and
+> another stores raw ones, cosine and dot-product rankings silently diverge; if one is
+> float32 and another int8-quantized, distances are computed in different numeric spaces.
+> Both produce plausible-looking results that are quietly wrong — the exact class of
+> failure the manifest exists to prevent, so recording only the model name would leave
+> the door half open. Hardware non-determinism (CPU vs GPU low-bit differences) is *not*
+> recorded: it sits far below the ranking noise floor.
 
 ### 3.4 `cache_hit` metric correctness
 
@@ -182,6 +192,21 @@ This is in the package because `serve` adds a *third* cache dimension (warm in-p
 on-disk). Building that telemetry on a flag that already conflates two things makes every
 measurement of this package untrustworthy. Separate the codes; keep `tier` and `client`
 in mind as already-dead discriminators (`tier` is always `map`, `client` always `cli`).
+
+### 3.5 Cost accounting on `/answer`
+
+`llm.py:167` already parses `last_usage` and nothing ever reads it. Backlog #4 puts the
+fix at roughly 30 lines, and today **not one logged run can be costed**.
+
+This enters the package on a narrow argument, not a grand one: `/answer` is in v1 (§5.1),
+`/answer` is the only component that spends money, and the cost of adding the ledger
+after it ships is strictly higher than adding it alongside — every request served in
+between is unmeasurable forever, because the usage data is discarded at the moment of the
+call and cannot be reconstructed later.
+
+> Scope discipline: this is a **ledger, not a budget**. Record model, tokens in/out, and
+> cost per request against the existing `query_id`. No quotas, no enforcement, no
+> per-tenant accounting — those follow the same trigger as tenancy (§8).
 
 ---
 
@@ -202,7 +227,19 @@ code path, different trigger.
 ### 4.1 Why a pending marker rather than scanning the inbox
 
 The drain must know what is unpromoted without re-reading and re-hashing every inbox
-file. `remember` writes an entry id to a pending list; promotion consumes it. This makes
+file. `remember` writes an entry id to a pending list; promotion consumes it.
+
+**Format and atomicity, specified rather than implied.** The pending list is a
+*directory*, `.alexandria/pending/`, holding one zero-length file per unpromoted entry,
+named by entry id. Create with `O_CREAT | O_EXCL`; consume with `unlink`. Both operations
+are atomic in the kernel, so a drain scanning the directory while `remember` writes
+cannot observe a torn entry, and no lock is needed between them. Oldest-pending age (§7)
+is then the oldest `mtime` in the directory — a single `scandir`, no parsing, nothing to
+corrupt.
+
+A single file holding a list would need its own lock and could be truncated mid-write by
+a crash; a SQLite table would add a second store to keep consistent with the first. The
+directory is the lazy option that is also the correct one. This makes
 promotion idempotent — a crash mid-promote leaves the entry pending, and re-running
 promotes it exactly once because `upsert` is keyed on `chunk_id` — and makes "is anything
 pending?" a file-existence check rather than a scan. It is also the input to §7's
@@ -268,7 +305,21 @@ identity must come from *which channel was reached*, never from the request body
 
 **Decision: one Unix domain socket per client identity.** SSH forwards Unix sockets
 natively; access is enforced by kernel file permissions; there is no secret to store,
-leak, or rotate. Identity is unforgeable because it is not transmitted.
+leak, or rotate.
+
+**Threat model, stated honestly.** This defends against a *remote* caller asserting a
+false identity over the tunnel: the claim cannot be made at all, because identity is
+never transmitted. It does **not** defend against a local attacker who already has shell
+access as a user permitted to open the socket — that party can simply connect to any
+socket its credentials allow, and is indistinguishable from the legitimate client. Two
+clients sharing one host account are likewise indistinguishable, so socket-per-identity
+requires one account per identity to mean anything.
+
+So the accurate claim is *not* "unforgeable": it is **"identity equals filesystem
+access."** That is a real and checkable guarantee, and it is strictly stronger than a
+self-reported string, which is what exists today. Anyone deploying multiple identities on
+one shared host must enforce separation with accounts and permissions, not with this
+mechanism alone.
 
 `--user`/`--caller` supplied in a request body may be retained as an unprivileged *hint*
 field, but is never recorded as who did this. Bearer tokens are deferred to the same
@@ -284,6 +335,19 @@ and a SQLite connection opened `check_same_thread=False`.
 engine lock for its duration — it holds the lock only for its retrieval phase and
 releases it before synthesis. A request timeout bounds the handler so a wedged LLM call
 cannot pin a worker forever.
+
+**The mechanism that makes this safe, stated rather than assumed:** the retrieval phase
+returns **full chunk text**, not chunk ids to be dereferenced later. Synthesis therefore
+operates entirely on an in-memory snapshot and performs **no engine access after the lock
+is released**. A reindex, a generation bump, or a compaction landing mid-synthesis cannot
+affect an answer already in flight.
+
+Citations remain valid across that window because of D4: documents are immutable and
+content-hashed, so a `chunk_id` is never reassigned to different text. An answer may
+therefore cite a chunk that a concurrent reconcile has since superseded — it cites what
+was true when the question was asked, which is the correct semantics for a
+provenance-bearing system, and is exactly what `--as-of` in
+`SPEC-versioning-and-supersession.md` is for.
 
 > `# ponytail: one global engine lock; per-request engines if throughput matters.`
 
@@ -325,8 +389,12 @@ machine, a macOS-only path, or launchd as the only supervisor.
 > (torch) — a full re-embed, not a file copy.
 
 This is why remote hosting is a **supported topology rather than a default**: it is a
-one-time re-embed decision made at install, not a runtime switch. The installer should
-ask which host will serve, so the index is built with the right provider the first time.
+one-time re-embed decision made at install, not a runtime switch.
+
+> No installer work is in this package. Guiding provider choice at install time is the
+> obvious follow-on, but there is no installer task in the manifest or the gates, so it
+> is named here as a future item rather than an implied deliverable. Gate S9 is what
+> makes a wrong choice *loud* rather than silent, which is the part that belongs here.
 
 Second constraint, learned the hard way on 2026-08-11: **serving is not indexing.**
 Embedding one query is ~1/46,000 of the work of building the corpus. A modest
@@ -385,6 +453,30 @@ Rules:
   requiring no new scheduled process; `/health` exposes the same number
 - `last_success_at`, `promoted_count`, `generation` are retained as telemetry only
 
+### 7.1 The gap oldest-pending-age does not close
+
+Oldest-pending-age assumes the marker exists. If `remember` appends to
+`inbox/<date>.md` but fails to write the pending file — crash between the two writes,
+full disk, permission error on `.alexandria/pending/` — then **nothing is pending, the
+system reports perfect health, and the fact is stranded forever.** That is the original
+three-day outage wearing a new hat: a healthy signal that is healthy *because* the work
+never got recorded.
+
+Two mitigations, and the second is the load-bearing one:
+
+1. **Ordering.** `remember` writes the pending marker **before** returning success. An
+   entry that reaches the inbox but not the pending directory means `remember` reports
+   failure to its caller, so the fact is never silently accepted.
+2. **An independent observer that does not trust the marker.** The weekly reconcile
+   compares *inbox entries against promoted documents directly* — not against the pending
+   list. The invariant is "every entry in `inbox/*.md` has a corresponding document in
+   `sources/inbox/`," which is checkable from the two sources of truth alone. Any entry
+   failing it is re-queued and reported, whatever the pending directory says.
+
+Mitigation 1 narrows the window; only mitigation 2 can detect a fact lost inside it,
+because it derives health from the artifacts rather than from the bookkeeping. A liveness
+signal that shares a failure mode with the thing it monitors is not a liveness signal.
+
 Separately, to catch a run that promotes successfully but writes *garbage* embeddings:
 after each promotion cycle, query one just-promoted fact by its own text and assert its
 `chunk_id` appears in the top-k (~100 ms warm).
@@ -427,9 +519,14 @@ Each gate is a test, not a claim.
 - **F2** Two concurrent generation bumps produce N+2, not N+1.
 - **F3** `cache_hit` distinguishes query-cache hits from answer-path retrieval hits; a
   sub-10 ms fast-path hit is separable in the logs.
-- **F4** An index carries a manifest naming its embedding provider, model, revision, and
-  dimension; opening it with a different provider fails loudly instead of mixing vector
-  spaces in one column.
+- **F4** An index carries a manifest naming its embedding provider, model, revision,
+  dimension, normalization, and dtype; opening it with a mismatch on any of them fails
+  loudly instead of mixing vector spaces in one column.
+- **F5** Every `/answer` request records model, tokens in/out, and cost against its
+  `query_id`; a day of traffic can be costed from the log alone.
+- **F6** A `remember` that writes the inbox entry but fails to write the pending marker
+  reports failure to its caller; and the reconcile detects an inbox entry with no
+  promoted document **without consulting the pending list**.
 
 **Write path**
 - **W1** `remember` returns in under 500 ms and does not load the embedding model.
