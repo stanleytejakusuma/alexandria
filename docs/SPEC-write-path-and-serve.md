@@ -740,6 +740,12 @@ much further — the one item here that genuinely gets more expensive with time.
 - **Bind:** localhost default; non-loopback fails closed; remote via SSH tunnel.
 - **Cadence:** absorbed by `serve` — inline at ~165 ms. The drain survives only as the
   offline fallback, defaulting to 10 minutes, skipping rather than queuing under lock.
+  **Stated honestly, the guarantee is seconds warm, minutes cold, never days:** a write
+  arriving after the server has idled out (§5.7) pays the 16.036 s model load, and a CLI
+  write with no server running waits for the drain — up to 10 minutes. Since the
+  CLI-fallback guarantee makes the cold case routine rather than exotic, claiming
+  "seconds" unconditionally would be the same species of overclaim this package exists to
+  retire.
 - **Endpoints:** `/answer` and `/remember` are **in** v1, which pulls the `flock` and the
   `/answer` lock-release requirement (§5.4) into scope with them.
 - **Attribution:** one Unix socket per client identity; request-body identity never
