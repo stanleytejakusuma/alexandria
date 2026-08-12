@@ -162,22 +162,93 @@ def test_searching_a_corpus_that_was_never_indexed_fails_loudly(tmp_path):
         "the guard must refuse BEFORE the store materialises an empty index"
 
 
+def test_searching_a_real_index_that_predates_manifests_fails_loudly_with_backfill_hint(tmp_path, monkeypatch):
+    """Gate F4: a real `index` run before this session's own manifest column
+    existed is exactly the state of the shipped 2.2GB index -- must refuse,
+    not silently treat 'absent' as 'compatible'."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "pi" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        "---\ntype: observation\ntitle: Retry\nproject: core\nsource: pi\ntags: []\n"
+        "entities: []\ngenerated:\n  at: '2026-08-01T00:00:00Z'\n---\n# Retry\n\ntext\n"
+    )
+    assert app(["--corpus", str(corpus), "index", "--limit", "1"]) == 0
+    (corpus / ".alexandria" / "index" / "manifest.json").unlink()
+
+    with pytest.raises(SystemExit) as exc:
+        app(["--corpus", str(corpus), "search", "anything"])
+    assert "no manifest" in str(exc.value)
+    assert "--backfill-manifest" in str(exc.value)
+
+
+def test_backfill_manifest_writes_a_manifest_without_reindexing(tmp_path, monkeypatch, capsys):
+    import json
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    (corpus / ".alexandria" / "index" / "chunks.lance").mkdir(parents=True)
+
+    assert app(["--corpus", str(corpus), "index", "--backfill-manifest"]) == 0
+    out = capsys.readouterr().out
+    assert "manifest backfilled" in out
+    manifest = json.loads((corpus / ".alexandria" / "index" / "manifest.json").read_text())
+    assert manifest["provider"] == "hash"
+    assert manifest["normalized"] is True
+
+
+def test_switching_embed_provider_between_index_runs_fails_loudly_instead_of_mixing_vectors(tmp_path, monkeypatch):
+    """The exact bug the spec names in §3.3: flipping ALEXANDRIA_EMBED_PROVIDER
+    between an indexed corpus and a later query must not silently proceed --
+    that would mix incomparable vector spaces in one column."""
+    import json
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "pi" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        "---\ntype: observation\ntitle: Retry\nproject: core\nsource: pi\ntags: []\n"
+        "entities: []\ngenerated:\n  at: '2026-08-01T00:00:00Z'\n---\n# Retry\n\ntext\n"
+    )
+    assert app(["--corpus", str(corpus), "index", "--limit", "1"]) == 0
+    manifest_path = corpus / ".alexandria" / "index" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["provider"] = "mlx"  # simulate a run that used a different provider
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(SystemExit) as exc:
+        app(["--corpus", str(corpus), "search", "anything"])
+    assert "provider" in str(exc.value)
+    assert "index --rebuild" in str(exc.value)
+
+
 def _stub_index(corpus):
-    """Satisfy the "corpus was actually indexed" precondition.
+    """Satisfy the "corpus was actually indexed" precondition, including a
+    matching manifest (gate F4 -- see index/manifest.py).
 
     These tests stub `run_pipeline`, so the engine is never used for retrieval --
-    but building it still asserts an index exists. Before that check, an
-    unindexed corpus silently produced an EMPTY index and zero hits, which is
-    why the assertion exists; faking the artifact here keeps these tests about
-    answer rendering rather than about indexing.
+    but building it still asserts an index AND a manifest exist. Before the
+    index assertion existed, an unindexed corpus silently produced an EMPTY
+    index and zero hits; the manifest assertion closes the same class of gap
+    for embedding-model identity. Callers must also set
+    ALEXANDRIA_EMBED_PROVIDER=hash (matching the manifest written here) so
+    _build_search_engine's own embedder construction doesn't try to load a
+    real local/MLX model just to verify.
     """
+    from alexandria.index.embedder import CachedEmbedder, HashEmbedder
+    from alexandria.index.manifest import write_manifest
     (corpus / ".alexandria" / "index" / "chunks.lance").mkdir(parents=True, exist_ok=True)
+    embedder = CachedEmbedder(HashEmbedder(), corpus / ".alexandria" / "cache" / "embeddings.sqlite")
+    write_manifest(corpus, embedder, "hash")
 
 
 def test_answer_prints_the_emitted_page(tmp_path, monkeypatch, capsys):
     from pathlib import Path
     import alexandria.synthesis.pipeline as synth_pipeline
 
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
     _stub_index(tmp_path)
     page = tmp_path / "emitted" / "what-happened.md"
     page.parent.mkdir()
@@ -201,6 +272,7 @@ def test_answer_prints_the_emitted_page(tmp_path, monkeypatch, capsys):
 
 
 def test_answer_failure_exits_one_with_failed_claims(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
     _stub_index(tmp_path)
     import alexandria.synthesis.pipeline as synth_pipeline
 

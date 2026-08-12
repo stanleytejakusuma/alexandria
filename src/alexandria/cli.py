@@ -41,6 +41,7 @@ from .eval.runner import EvalReport, run_eval
 from .index.bm25 import BM25Index, searchable_text
 from .index.chunker import chunk_document
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
+from .index.manifest import ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest, write_manifest
 from .index.store import VectorStore
 from .llm import LLMClient
 from .migrate import migrate_kg_sync
@@ -222,6 +223,18 @@ def cmd_index(args) -> int:
     """Chunk, embed, and persist the corpus in deterministic batches."""
     config = _config_for(args)
     corpus = config.corpus_path
+    if getattr(args, "backfill_manifest", False):
+        # SPEC F4 one-time backfill: an index built before manifests existed
+        # has no way to (re)derive which model produced its vectors from the
+        # vectors themselves, so this trusts the operator's assertion that
+        # --embed-provider matches what was actually used, without paying to
+        # re-embed the whole corpus.
+        embedder = _cached_embedder(config, corpus)
+        manifest = write_manifest(corpus, embedder, config.embed_provider)
+        print(f"index: manifest backfilled -> provider={manifest['provider']} "
+              f"model={manifest['model']} dim={manifest['dim']} "
+              f"normalized={manifest['normalized']} dtype={manifest['dtype']}")
+        return 0
     records, errors = _load_chunk_records(corpus, config, args.limit, args.workers)
     for error in errors:
         print(f"skip: {error}", file=sys.stderr)
@@ -303,6 +316,7 @@ def cmd_index(args) -> int:
     # reindex invalidates stale query/response cache entries.
     gen = write_index_generation(corpus)
     print(f"index: corpus generation {gen} (query/response caches invalidated)")
+    write_manifest(corpus, embedder, config.embed_provider)
     if args.rebuild:
         _rebuild_marker(corpus).unlink(missing_ok=True)
     return 0
@@ -710,8 +724,13 @@ def _require_index(corpus: Path) -> None:
 def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True,
                          corpus_root: Path | None = None, client: str = "cli") -> SearchEngine:
     _require_index(corpus)
+    embedder = _cached_embedder(config, corpus)
+    try:
+        verify_manifest(corpus, embedder, config.embed_provider)
+    except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
+        raise SystemExit(f"alexandria: {exc}") from exc
     return SearchEngine(
-        _cached_embedder(config, corpus),
+        embedder,
         VectorStore(corpus / ".alexandria" / "index"),
         BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite"),
         CrossEncoderReranker(config.rerank_model),
@@ -878,6 +897,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     index = sub.add_parser("index", help="chunk, embed, and index the corpus")
     index.add_argument("--rebuild", action="store_true", help="recreate index tables (retain embedding cache)")
+    index.add_argument("--backfill-manifest", action="store_true",
+                       help="write only the index manifest for the current --embed-provider "
+                            "config, without re-indexing (one-time fix for an index built "
+                            "before manifests existed; see gate F4)")
     index.add_argument("--limit", type=int, default=0, help="maximum documents to index")
     index.add_argument("--workers", type=int, default=1, help="parallel document chunking workers")
     index.add_argument("--enrich", action="store_true",
