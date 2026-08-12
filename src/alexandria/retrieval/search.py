@@ -75,10 +75,24 @@ class SearchEngine:
         self.query_cache = query_cache
         self.last_trace: dict[str, Any] = {}
         self.last_cache_hit = 0
-        # Corpus generation counter: cache keys are bound to it (Red
-        # release change 1) so any reindex invalidates cached results.
-        self._generation = (read_index_generation(corpus_root)
-                            if corpus_root is not None else 0)
+        self._corpus_root = corpus_root
+
+    @property
+    def _generation(self) -> int:
+        """Corpus generation counter: cache keys are bound to it (Red release
+        change 1) so any reindex invalidates cached results.
+
+        Re-read per access rather than captured in ``__init__``. A long-lived
+        process -- ``alexandria serve``, which exists precisely so the model and
+        index stay warm -- would otherwise keep answering with the generation
+        that was current when it booted, ignoring every reindex for the life of
+        the process and serving stale results from a cache it believes is valid.
+        The read is a few hundred bytes of page-cached JSON against a query
+        floor of ~75 ms, so the cost is noise.
+        """
+        if self._corpus_root is None:
+            return 0
+        return read_index_generation(self._corpus_root)
 
     def search(self, query: str, *, k: int | None = None, filters: Mapping[str, Any] | None = None,
                tier: str = "map") -> list[SearchResult]:

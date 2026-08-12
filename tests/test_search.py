@@ -208,3 +208,36 @@ def test_normalise_record_never_stores_none_in_new_columns():
     assert enriched["kind"] == "synthetic"
     assert enriched["enrichment"] == '{"s":1}'
     assert enriched["target_chunk"] == "c"
+
+
+def test_reindex_invalidates_cache_for_a_long_lived_engine(tmp_path: Path):
+    """A warm `alexandria serve` process must notice a reindex.
+
+    The generation counter keys every query-cache entry. When it was captured
+    in ``__init__`` the CLI was unaffected -- each invocation built a fresh
+    engine -- but a long-lived server would keep serving pre-reindex cached
+    results for the life of the process, with no error and no cache miss.
+    Mutation check: pin ``_generation`` back to a construction-time attribute
+    and this test fails on the final assertion.
+    """
+    from alexandria.cache import QueryCache, write_index_generation
+
+    engine = build_engine(tmp_path)
+    engine.query_cache = QueryCache(tmp_path)
+    engine._corpus_root = tmp_path
+
+    gen_before = engine._generation
+    engine.search("sweep page fails lint")
+    assert engine.last_cache_hit == 0, "first query must be a miss"
+
+    engine.search("sweep page fails lint")
+    assert engine.last_cache_hit == 1, "premise: identical query must hit the cache"
+
+    # A reindex happened underneath the running process.
+    write_index_generation(tmp_path)
+    assert engine._generation > gen_before, "engine must observe the new generation"
+
+    engine.search("sweep page fails lint")
+    assert engine.last_cache_hit == 0, (
+        "after a reindex the warm engine served a stale cached result"
+    )
