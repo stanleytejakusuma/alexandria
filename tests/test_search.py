@@ -288,3 +288,32 @@ def test_client_attribution_distinguishes_search_from_answer_retrieval(tmp_path:
         "a SearchEngine built with client='answer' must attribute every logged "
         "query to 'answer', not the old dead-default 'cli'"
     )
+
+
+def test_a_corrupt_generation_file_disables_caching_but_does_not_crash_search(tmp_path: Path, capsys):
+    """SPEC F2: a corrupt generation.json must degrade retrieval (no cache
+    read/write for this call, results still returned), never crash search().
+    Mutation check: let the GenerationFileCorrupt propagate uncaught out of
+    search() and this test fails with an unhandled exception instead of
+    reaching the assertions.
+    """
+    from alexandria.cache import QueryCache
+
+    engine = build_engine(tmp_path)
+    engine.query_cache = QueryCache(tmp_path)
+    engine._corpus_root = tmp_path
+    gen_path = tmp_path / ".alexandria" / "index" / "generation.json"
+    gen_path.parent.mkdir(parents=True, exist_ok=True)
+    gen_path.write_text("{not valid json")
+
+    results = engine.search("sweep page fails lint")
+
+    assert {r.chunk_id for r in results} == {"sources/a", "wiki/a"}, (
+        "retrieval must still work despite the corrupt generation file"
+    )
+    assert "corrupt" in capsys.readouterr().err.lower()
+
+    # A second identical call must also skip the cache (not silently start
+    # hitting a cache keyed by some fallback generation value).
+    results2 = engine.search("sweep page fails lint")
+    assert engine.last_cache_hit == 0

@@ -3,7 +3,10 @@
 import json
 import time
 
+import pytest
+
 from alexandria.cache import (
+    GenerationFileCorrupt,
     QueryCache,
     ResponseCache,
     canonical,
@@ -129,6 +132,67 @@ def test_index_generation_roundtrip(tmp_path):
     assert write_index_generation(tmp_path) == 1
     assert write_index_generation(tmp_path) == 2
     assert read_index_generation(tmp_path) == 2
+
+
+def test_write_index_generation_is_atomic_not_a_bare_write_text(tmp_path):
+    """SPEC F2/W3b: a crash mid-write must never leave a truncated/partial
+    generation.json -- the old bare path.write_text() could, and the old
+    read_index_generation silently reset that to 0 (the resurrection bug).
+    No temp file may survive a successful write."""
+    write_index_generation(tmp_path)
+    gen_path = tmp_path / ".alexandria" / "index" / "generation.json"
+    assert gen_path.exists()
+    leftovers = list(gen_path.parent.glob("generation.json.tmp*"))
+    assert leftovers == [], f"temp file(s) left behind: {leftovers}"
+
+
+def test_read_index_generation_fails_loud_on_a_corrupt_but_present_file(tmp_path):
+    """A corrupt file is NOT the same as a missing one. Falling back to 0
+    silently would let the next write_index_generation() call write 1,
+    resurrecting every cache entry keyed to the real past generations 1..N.
+    Mutation check: revert read_index_generation to `except: return 0` and
+    this test fails (no exception raised)."""
+    gen_path = tmp_path / ".alexandria" / "index" / "generation.json"
+    gen_path.parent.mkdir(parents=True)
+    gen_path.write_text("{not valid json")
+
+    with pytest.raises(GenerationFileCorrupt):
+        read_index_generation(tmp_path)
+
+
+def test_write_index_generation_refuses_to_guess_past_a_corrupt_file(tmp_path):
+    """The write side must not silently restart the counter at 1 when the
+    existing file is corrupt -- that is precisely how the resurrection bug
+    would resurface even with read-side fail-loud in place."""
+    gen_path = tmp_path / ".alexandria" / "index" / "generation.json"
+    gen_path.parent.mkdir(parents=True)
+    gen_path.write_text("{not valid json")
+
+    with pytest.raises(GenerationFileCorrupt):
+        write_index_generation(tmp_path)
+
+
+def test_write_index_generation_serializes_concurrent_writers(tmp_path):
+    """SPEC W3b: two concurrent bumpers must not race the read-modify-write
+    into losing an increment (e.g. both reading gen=0 and both writing 1)."""
+    import threading
+
+    write_index_generation(tmp_path)  # seed: gen=1
+    results = []
+
+    def bump():
+        results.append(write_index_generation(tmp_path))
+
+    threads = [threading.Thread(target=bump) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(results) == list(range(2, 10)), (
+        "every concurrent bump must observe a distinct, gapless next value"
+    )
+    assert read_index_generation(tmp_path) == 9
 
 
 def test_embedder_cache_mode_separation(tmp_path):

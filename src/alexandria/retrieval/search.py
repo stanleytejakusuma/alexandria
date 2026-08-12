@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..cache import QueryCache, normalize_query, read_index_generation
+from ..cache import GenerationFileCorrupt, QueryCache, normalize_query, read_index_generation
 from ..index.bm25 import BM25Index, searchable_text
 from ..index.embedder import Embedder
 from ..index.filtering import normalize_filters
@@ -118,12 +119,26 @@ class SearchEngine:
         # corpus drift (reindex changes embeddings, but 24h is a deliberate
         # ponytail ceiling: invalidation-by-index-sha is the upgrade path if
         # stale hits ever show up in the query-log review).
+        # Shadow self.query_cache with a call-local variable: if the
+        # generation file is corrupt, caching is disabled for THIS call only
+        # (retrieval still runs) rather than crashing search() or silently
+        # resuming from a resurrected generation 0 (see GenerationFileCorrupt).
+        query_cache = self.query_cache
+        generation = None
+        if query_cache is not None:
+            try:
+                generation = self._generation
+            except GenerationFileCorrupt as exc:
+                print(f"alexandria: index generation file is corrupt, caching "
+                      f"disabled for this query ({exc})", file=sys.stderr)
+                query_cache = None
+
         cached: list[SearchResult] | None = None
-        if self.query_cache is not None:
-            ckey = self.query_cache.key(
+        if query_cache is not None:
+            ckey = query_cache.key(
                 query, limit, self.config, metadata_filter,
-                generation=self._generation)
-            payload = self.query_cache.get(ckey)
+                generation=generation)
+            payload = query_cache.get(ckey)
             if payload is not None:
                 cached = [
                     SearchResult(
@@ -315,8 +330,8 @@ class SearchEngine:
         cacheable = bool(results) and not trace.get("reranker", {}).get("degraded")
         if lexical_error is not None or dense_error is not None:
             cacheable = False
-        if self.query_cache is not None and cacheable:
-            self.query_cache.put(ckey, [{
+        if query_cache is not None and cacheable:
+            query_cache.put(ckey, [{
                 "chunk_id": r.chunk_id, "doc_id": r.doc_id, "text": r.text,
                 "heading_path": r.heading_path, "layer": r.layer, "score": r.score,
             } for r in results])

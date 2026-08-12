@@ -8,8 +8,10 @@ Both are sqlite keyed by sha256, append-only stats, never raise.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -49,26 +51,66 @@ def canonical(obj) -> str:
     return json.dumps(_norm(obj), sort_keys=True, separators=(",", ":"))
 
 
+class GenerationFileCorrupt(Exception):
+    """The generation file exists but could not be parsed.
+
+    Deliberately distinct from "never indexed" (missing file -> generation 0,
+    unchanged below). SPEC-write-path-and-serve.md F2: silently falling back
+    to 0 on a corrupt-but-present file is a resurrection bug, not a safe
+    default -- the next write_index_generation() call would then write 1, and
+    every cache entry keyed to the real past generations 1..N becomes valid
+    again. Stale answers resurface instead of staying invalidated, and a
+    rerun entrenches the problem rather than repairing it. Callers on the hot
+    read path (SearchEngine._generation) catch this and disable caching for
+    that call rather than crash retrieval; write_index_generation refuses to
+    guess and lets this propagate, because guessing here is exactly the bug.
+    """
+
+
 def read_index_generation(corpus: str | Path) -> int:
     """Corpus generation counter written atomically after each successful
     index build. Caches keyed with it are invalidated on any reindex."""
-    try:
-        data = json.loads((Path(corpus).expanduser() / GENERATION_FILE).read_text())
-        return int(data.get("generation", 0))
-    except (OSError, ValueError, TypeError):
+    path = Path(corpus).expanduser() / GENERATION_FILE
+    if not path.exists():
         return 0
+    try:
+        data = json.loads(path.read_text())
+        return int(data["generation"])
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise GenerationFileCorrupt(f"{path} exists but could not be parsed: {exc}") from exc
 
 
 def write_index_generation(corpus: str | Path) -> int:
-    """Bump and persist the generation counter; returns the new value."""
-    gen = read_index_generation(corpus) + 1
+    """Bump and persist the generation counter; returns the new value.
+
+    Locked and atomic end to end (SPEC F2/W3b):
+    - fcntl.flock (POSIX; this project targets macOS/Linux, same as the mlx
+      embedder path) serializes the read-modify-write across processes, so a
+      concurrent index build and a concurrent promote can't race each other
+      into writing the same next generation number or losing an increment.
+    - the new value is written to a sibling temp file and moved into place
+      with os.replace(), which is an atomic rename on POSIX. The previous bare
+      path.write_text() could leave a truncated/partial file on a crash
+      mid-write; read_index_generation's old behaviour then silently reset
+      that to generation 0 -- the exact resurrection bug GenerationFileCorrupt
+      now refuses to paper over.
+    """
     path = Path(corpus).expanduser() / GENERATION_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "generation": gen,
-        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }, sort_keys=True) + "\n", encoding="utf-8")
-    return gen
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            gen = read_index_generation(corpus) + 1
+            tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+            tmp.write_text(json.dumps({
+                "generation": gen,
+                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+            return gen
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def _db(corpus: str | Path, name: str) -> sqlite3.Connection:
