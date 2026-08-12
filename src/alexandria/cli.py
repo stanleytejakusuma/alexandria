@@ -10,6 +10,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import re
 import sys
 import shutil
 import tempfile
@@ -32,7 +33,7 @@ from .corpus import Doc
 from .connectors.inbox import INBOX_META_RE, InboxConnector, InboxEntry, parse_inbox_file
 from .connectors.journal import JournalConnector
 from .connectors.knowledge_graph import KnowledgeGraphConnector
-from .connectors.md_memory import SEPARATOR, MarkdownMemoryConnector
+from .connectors.md_memory import META_RE, SEPARATOR, MarkdownMemoryConnector
 from .connectors.pi_sessions import PiSessionsConnector
 from .eval.golden import load_golden, verify_targets
 from .eval.history import append_run, compare, load_runs, regressions
@@ -196,9 +197,43 @@ class RememberResult:
     /remember handler (§5), so the §7.1 write-ordering contract (marker
     written BEFORE success is reported) is implemented exactly once."""
     entry: InboxEntry | None
-    status: str  # "written" | "duplicate" | "empty" | "marker_failed"
+    status: str  # "written" | "duplicate" | "empty" | "marker_failed" | "invalid"
     path: Path | None = None
     error: str | None = None
+
+
+# Inbox entries carry their structure in-band: entries are separated by a line
+# containing SEPARATOR, and each one's identity lives in a trailing HTML comment
+# that the parser finds with INBOX_META_RE.search() -- i.e. the FIRST match in
+# the chunk, while the genuine comment is appended LAST. Unescaped, a payload
+# could therefore (a) emit its own separator line and forge additional entries,
+# and (b) emit its own metadata comment that outranks the real one, choosing its
+# own `from=` -- and an omitted `from=` defaults to "pi", the trusted identity.
+# Reached from BOTH the CLI and serve's unauthenticated /remember, and the
+# corpus has no deletion path, so a forged entry is permanent.
+#
+# The guard rejects rather than escapes: escaping would change the on-disk
+# format that already-written entries are parsed with. It uses the real parser
+# regexes as its oracle so it cannot drift from what the parser will honour --
+# an ordinary `<!-- TODO -->` stays legal, only a metadata-shaped comment is
+# refused.
+_META_FIELD_RE = re.compile(r"^[\w.-]+$")
+
+
+def _reject_inbox_injection(text: str, *, session: str | None,
+                            corrects: str | None) -> str | None:
+    """Return a reason string if this entry could forge inbox structure, else None."""
+    if f"\n{SEPARATOR}\n" in f"\n{text}\n":
+        return (f"text contains a line consisting solely of {SEPARATOR!r}, which is the "
+                f"inbox entry separator -- it would be read back as multiple entries")
+    if INBOX_META_RE.search(text) or META_RE.search(text):
+        return ("text contains an inbox metadata comment (<!-- created=..., last=... -->), "
+                "which would override this entry's own recorded identity")
+    for name, value in (("session", session), ("corrects", corrects)):
+        if value and not _META_FIELD_RE.match(value):
+            return (f"{name}={value!r} contains characters that are not permitted in a "
+                    f"metadata field (allowed: letters, digits, '.', '-', '_')")
+    return None
 
 
 def append_inbox_entry(corpus: Path, text: str, *, from_: str | None = None,
@@ -208,6 +243,9 @@ def append_inbox_entry(corpus: Path, text: str, *, from_: str | None = None,
     text = text.strip()
     if not text:
         return RememberResult(None, "empty")
+    injection = _reject_inbox_injection(text, session=session, corrects=corrects)
+    if injection:
+        return RememberResult(None, "invalid", error=injection)
     inbox_dir = corpus / "inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
     today = _dt.date.today().isoformat()
@@ -247,6 +285,9 @@ def cmd_remember(args) -> int:
                                 corrects=args.corrects)
     if result.status == "empty":
         print("remember: empty text", file=sys.stderr)
+        return 2
+    if result.status == "invalid":
+        print(f"remember: refused -- {result.error}", file=sys.stderr)
         return 2
     if result.status == "duplicate":
         print("already in inbox; nothing appended")

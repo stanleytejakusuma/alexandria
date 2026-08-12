@@ -20,14 +20,33 @@ from alexandria.cache import ResponseCache
 from alexandria.cli import build_parser, run_answer
 
 
-def _answer_parser_has_a_filter_argument() -> bool:
+# Every argument `answer` accepts TODAY. The tripwire fires on anything not on
+# this list, rather than on a name containing "filter" -- the spec's own worked
+# example of the dangerous change is `--project` (SPEC §8), whose dest contains
+# no "filter" substring at all, so a substring match would sleep through the
+# exact scenario the gate is named for. Scoping can be spelled --project,
+# --tenant, --org, --collection, --namespace or anything else; what it cannot do
+# is arrive without a human deleting a line here.
+_ANSWER_ARGS_TODAY = frozenset({
+    "help", "question", "k", "save_dir", "llm_model", "grader_a_model",
+    "grader_b_model", "base_url", "api_key_env", "prompt_version", "caller",
+    "user", "func",
+})
+
+
+def _answer_parser_new_arguments() -> set[str]:
+    """Arguments on `answer` that did not exist when T1 was written."""
     parser = build_parser()
     # argparse doesn't expose subparsers by name directly; walk the
     # top-level subparsers action to find "answer".
     subparsers_action = next(a for a in parser._actions
                              if getattr(a, "choices", None) and "answer" in a.choices)
     answer_parser = subparsers_action.choices["answer"]
-    return any("filter" in (action.dest or "").lower() for action in answer_parser._actions)
+    return {a.dest for a in answer_parser._actions if a.dest} - _ANSWER_ARGS_TODAY
+
+
+def _answer_parser_has_a_filter_argument() -> bool:
+    return bool(_answer_parser_new_arguments())
 
 
 def _run_answer_accepts_filters() -> bool:
@@ -56,6 +75,28 @@ def test_t1_todays_real_code_cannot_leak_across_tenants(tmp_path):
         "answer gained a filter argument while ResponseCache.key() still omits "
         "filters -- this is a live cross-tenant cache leak (BACKLOG #27/#28's "
         "deferred tenancy work must land alongside this, not after it)")
+
+
+def test_t1_the_detector_sees_a_scoping_argument_whatever_it_is_called():
+    """The detector, not just the predicate. A substring match on "filter" is
+    blind to `--project` -- the spec's own example -- so prove the real
+    detector notices a new argument under names that carry no "filter" in
+    them. Simulated by adding the argument to a real parser object."""
+    for spelling in ("--project", "--tenant", "--namespace", "--collection"):
+        parser = build_parser()
+        subparsers_action = next(a for a in parser._actions
+                                 if getattr(a, "choices", None) and "answer" in a.choices)
+        subparsers_action.choices["answer"].add_argument(spelling, default=None)
+        answer_parser = subparsers_action.choices["answer"]
+        new = {a.dest for a in answer_parser._actions if a.dest} - _ANSWER_ARGS_TODAY
+        assert new, f"detector missed a scoping argument spelled {spelling}"
+
+
+def test_t1_the_allowlist_matches_the_shipped_parser_exactly():
+    """Keeps the allowlist honest in the other direction: if an argument is
+    REMOVED, this fails and forces the list to be re-derived rather than
+    quietly over-permitting a future re-addition under the same name."""
+    assert _answer_parser_new_arguments() == set()
 
 
 def test_t1_the_predicate_itself_actually_catches_the_dangerous_combination():

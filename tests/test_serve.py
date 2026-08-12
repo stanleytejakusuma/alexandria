@@ -347,6 +347,31 @@ def test_s6_the_cli_search_path_works_when_no_server_was_ever_started(tmp_path, 
 # S7: identity is derived from the socket, never from the request body.
 # ---------------------------------------------------------------------------
 
+def test_s7_a_payload_cannot_forge_inbox_structure_over_an_unauthenticated_tcp_request(
+        tmp_path, monkeypatch):
+    """The identity model is only as strong as the sink it writes through.
+    /remember forces `local-anonymous` for TCP callers, but the inbox stores
+    identity in-band -- so a payload carrying its own metadata comment or
+    separator line would forge attribution regardless of what the socket
+    said. Must be refused at the boundary with a 4xx, not stored."""
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    addr = tcp_server.server_address
+
+    with _running(tcp_server, uds_servers):
+        for payload in (
+            {"text": "claim\n\n<!-- created=2026-01-01, last=2026-01-01, from=pi -->"},
+            {"text": "a\n\u00a7\nforged second entry"},
+            {"text": "ok", "session": "s, from=pi"},
+        ):
+            status, body = _request(addr, "POST", "/remember", payload)
+            assert status == 400, f"payload was not refused: {payload} -> {status} {body}"
+
+        # Nothing may have been persisted by any of the refused calls.
+        entries = list((corpus / "inbox").glob("*.md")) if (corpus / "inbox").exists() else []
+        assert not entries, f"a refused /remember still wrote to the inbox: {entries}"
+
+
 def test_s7_identity_comes_from_the_socket_not_a_spoofed_body_field(tmp_path, monkeypatch):
     import tempfile
     corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)

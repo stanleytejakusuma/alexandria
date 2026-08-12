@@ -129,12 +129,10 @@ def test_w3a_a_crash_at_each_of_the_five_write_order_points_converges_on_rerun(
     # regardless of which step failed).
     result = promote_pending(corpus, config, embedder, store, lexical)
 
-    if crash_step == "unlink":
-        # The marker survives even a fully-completed promote if unlink itself
-        # was the injected failure point -- rerunning consumes it on the next
-        # pass because unlink is itself idempotent (FileNotFoundError-safe).
-        assert not is_pending(corpus, entry_id) or promote_pending(
-            corpus, config, embedder, store, lexical).promoted == [entry_id] or True
+    # (A previous revision guarded the crash_step == "unlink" case with an
+    # `assert ... or ... or True`, which can never fail and was therefore not a
+    # check at all. The unconditional assertion below is the real one: unlink is
+    # idempotent, so one rerun consumes the marker no matter which step failed.)
     assert not is_pending(corpus, entry_id), f"entry still pending after rerun (crash={crash_step})"
 
     doc_id_prefix = f"sources/inbox/inbox-{entry_id}"
@@ -149,6 +147,33 @@ def test_w3a_a_crash_at_each_of_the_five_write_order_points_converges_on_rerun(
 
     gen_after = read_index_generation(corpus)
     assert gen_after > gen_before, "the generation must have bumped at least once across the run"
+
+
+def test_w4_the_generation_bump_lands_after_both_stores_are_written(tmp_path, monkeypatch):
+    """§4.2.1 step 4, the ordering itself -- not merely that a bump happened.
+
+    Bumped BEFORE the writes land, a concurrent reader can retrieve pre-promote
+    results and cache them under the NEW generation, where nothing will ever
+    invalidate them (the generation is the only cache epoch). Counting bumps
+    cannot see that: moving `write_index_generation` above `store.upsert` leaves
+    every count-based assertion green. This pins the position by reading the
+    on-disk generation at each step boundary."""
+    corpus = tmp_path / "corpus"
+    _remember(tmp_path, monkeypatch, "Ordering fact for W4.")
+    config, embedder, store, lexical = _engine_pieces(corpus)
+    gen_before = read_index_generation(corpus)
+    seen: dict[str, int] = {}
+
+    promote_pending(corpus, config, embedder, store, lexical,
+                    test_hook=lambda step: seen.__setitem__(step, read_index_generation(corpus)))
+
+    assert seen["embed"] == gen_before, "generation bumped before anything was written"
+    assert seen["upsert"] == gen_before, (
+        "generation bumped before/with the vector write -- a reader between the "
+        "bump and the FTS write caches a partial index under the new epoch")
+    assert seen["fts"] == gen_before, "generation bumped before the FTS write landed"
+    assert seen["bump"] == gen_before + 1, "generation did not bump at step 4"
+    assert seen["unlink"] == gen_before + 1, "generation moved again after step 4"
 
 
 def test_w4_generation_bumps_once_per_cycle_not_once_per_fact(tmp_path, monkeypatch):

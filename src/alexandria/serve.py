@@ -262,8 +262,14 @@ def _handle_remember(ctx: ServeContext, identity: str, payload: dict) -> tuple[i
     text, err = _validate_text(payload, "text")
     if err:
         return _json_error(400, err)
+    # §5.3: identity comes from the socket (`identity`), never the body. The
+    # remaining body fields are still attacker-controlled and land in the
+    # inbox's in-band metadata, so append_inbox_entry validates them and can
+    # refuse -- a refusal is the caller's fault, hence 400 not 500.
     result = append_inbox_entry(ctx.corpus, text, from_=identity,
                                 session=payload.get("session"), corrects=payload.get("corrects"))
+    if result.status == "invalid":
+        return _json_error(400, result.error)
     if result.status == "duplicate":
         return _json_ok(200, {"status": "duplicate"})
     if result.status == "marker_failed":
