@@ -1,8 +1,16 @@
 # SPEC — data model and ambient capture
 
-Status: draft, pre-review. Supersedes nothing; extends
-`SPEC-write-path-and-serve.md` (shipped) and absorbs
+Status: revised after adversarial review (round 1 of 2). Supersedes nothing;
+extends `SPEC-write-path-and-serve.md` (shipped) and absorbs
 `SPEC-versioning-and-supersession.md` (written, unbuilt) as its §3.2.
+
+Round 1 found three defects that changed the design, all now fixed and recorded
+in place rather than quietly corrected: the write-ordering justification was
+factually false (D4b), the deduplication mechanism could not catch its own
+motivating example (§3.4), and the headline acceptance gate passed by
+construction (R4). Six further gates were vacuous as written. Where a first-draft
+claim was wrong, the correction says so explicitly — a spec that hides its own
+revisions teaches the next reader nothing.
 
 The write-path package made Alexandria *fast and safe to write to*. It did not
 make anything *use* it. This package targets the two gaps that remain: a data
@@ -50,8 +58,23 @@ failures:
    `git log` — the same data Alexandria indexes. Any agent with filesystem
    access will beat the index for local facts, and should.
 
-**Consequence for this spec:** ambient capture is not a convenience feature. It
-is the product. Confirmed empirically, on the author, at maximum motivation.
+**What this does and does not establish.** It is one adverse day, n=1, and the
+sample is *maximally unfavourable to Alexandria*: the session was **building
+Alexandria**, where grepping the repo genuinely is the correct tool (cause 4),
+against a corpus that had been **frozen since 2026-08-08** (cause 2 artificially
+maximal). A fairer week would show a higher number. Calling this "confirmed
+empirically" — as the first draft did — overstates it.
+
+What it does establish is narrower and still decisive: **invocation-dependent
+memory does not get invoked**, even by its author, even under a standing
+instruction, even on the day he is most motivated. That supports making capture
+automatic. It does *not* by itself prove capture is more valuable than a faster
+read path — causes 1 and 2 argue for the read path, and Phase 4 is where they
+are answered.
+
+The honest summary: four causes, jointly sufficient to justify the direction of
+Phases 3 and 4, not sufficient to declare either one "the product" in advance of
+R4 measuring it.
 
 ### 1.2 The data model is measurably poorer than the one it replaced
 
@@ -136,10 +159,13 @@ giving up anything, because we already run four SQLite files.
 
 What LanceDB buys that Chroma would cost us:
 
-- **`prefilter=True`** — metadata filtering executes *before* the vector scan in
-  the same columnar engine. It is the one piece of the reference RAG
-  architecture we implement correctly, and it exists only because filterable
-  scalars are colocated with vectors.
+- **`prefilter=True`** — metadata filtering executes *before* the vector scan.
+  Worth keeping, but the first draft oversold it: with `_indices/` empty every
+  query is already an exact scan, so prefilter saves distance computation on
+  filtered-out rows, not an index traversal. Bounded by the measurements in
+  §1.3, the ceiling is ~180ms (257.5ms at k=200 versus 75.7ms at k=10). Its
+  durable value is guaranteeing k results under a selective filter without
+  over-fetch heuristics — convenience, not the decisive argument.
 - **Native deletion (`_deletions/`)** and **native versioning (`_versions/`)** —
   §3.2 and §7 both depend on these.
 - **`add_columns()`** (verified on lancedb 0.37.1) — scalar columns backfill
@@ -200,30 +226,88 @@ Without enforcement the vocabulary drifts to `bug`/`bugfix`/`bug-fix`/`fix` and
 the filter silently stops meaning anything — a drift already observable in the
 graph projection, where `discovery` became `insight`.
 
-### D4 — Append-only versioning. Never mutate a record in place.
+### D4 — Append-only versioning, with revision state in frontmatter
 
-Adopt the *shape* of the predecessor's `sync_entity_heads`:
+The versioning fields live in the **document's own frontmatter**, and
+`corpus.sqlite` is a rebuildable index over them (see D4a). Adapted from the
+predecessor's `sync_entity_heads`:
 
 ```sql
+-- a PROJECTION of sources/*.md frontmatter, not a source of truth
 CREATE TABLE entity_heads (
   entity_id        TEXT PRIMARY KEY,
   kind             TEXT NOT NULL CHECK (kind IN ('observation','summary','prompt','inbox')),
-  entity_rev       INTEGER NOT NULL,
-  operation_sha256 TEXT NOT NULL,
+  entity_rev       INTEGER NOT NULL,   -- deliberate change: predecessor's is TEXT
+  supersedes       TEXT,               -- entity_id#rev this revision replaces
   deleted          INTEGER NOT NULL CHECK (deleted IN (0,1)),
   updated_at_epoch INTEGER NOT NULL
 );
 ```
 
-**With an explicit caveat that must not be lost: this schema is unproven.** In
-the source system all three sync tables hold **0 rows**, and **12,437 of 12,444
-observations never left `entity_rev=1`**. Zero tombstones were ever written. It
-is a validated *design*, not a validated *implementation*. We copy the shape and
-do our own proving.
+Two deliberate departures from the predecessor's schema, stated because the
+first draft made one of them silently:
+
+- `entity_rev` is `INTEGER`; the predecessor's is `TEXT NOT NULL`. We order and
+  compare revisions, so the type should permit it.
+- `operation_sha256` is **dropped**. The first draft copied it with no producer
+  and no consumer defined anywhere in this spec — which is cargo cult, not
+  design. If a content digest is wanted later it is `content_hash` (§3.4),
+  which has a stated purpose.
+
+**The caveat that must not be lost: this schema is unproven upstream.** All three
+of the predecessor's sync tables hold **0 rows**, **12,437 of 12,444 records
+never left rev 1**, and zero tombstones were ever written. It is a validated
+*design*, not a validated *implementation*. Copying the shape is only defensible
+because gates D4/D5/D10 exercise precisely what was never exercised there.
 
 Rejected: in-place mutation. It destroys the record of what the system believed
 at a past moment, which is the actual audit question — *"what did Alexandria
 tell the person who made that decision?"*
+
+### D4a — `corpus.sqlite` is a projection, never authoritative
+
+**This is the decision the first draft hid in one line, and getting it wrong is
+expensive.** The question: does the revision graph live in the database, or in
+the documents?
+
+It lives in the **documents**. `entity_id`, `entity_rev` and `supersedes` are
+frontmatter fields on the markdown in `sources/`; `corpus.sqlite` is an index
+built from them, rebuildable at any time by re-walking the corpus — exactly as
+LanceDB and FTS5 already are.
+
+Three things fall out, and each fixes a real defect in the first draft:
+
+1. **It leaves the write-ordering contract entirely.** A projection cannot be
+   "out of sync" in a way that loses data; it can only be stale, and stale is
+   repaired by rebuilding. §4.2.1 stays a four-store contract. The first draft
+   proposed a fifth store on a justification that is factually false (D4b).
+2. **Revision assignment becomes content-derived, not read-modify-write.**
+   `entity_rev` is written into the document at authoring time, so replaying the
+   pending marker after a crash re-reads the same value. The first draft's
+   "append rev+1" was a read-modify-write against the head row: a replay landing
+   after the database write would compute rev+1 a second time and produce rev+2
+   for identical content. Idempotency under replay is what makes the existing
+   crash-recovery contract work, and it was about to be broken.
+3. **`backup.py`'s scope is unchanged.** §6 of the shipped spec backs up state
+   and explicitly not rebuildable indexes. A projection is a rebuildable index.
+   Had it been authoritative, its loss would destroy the revision graph and the
+   backup scope would have had to grow to cover it.
+
+### D4b — The generation counter gates caches only
+
+Recorded because the first draft asserted the opposite and built on it.
+
+The claim was that `corpus.sqlite` must be written before the generation bump
+because it "must be present before any reader can observe the new generation."
+**That is false.** In `retrieval/search.py`, `generation` is read once (line 130)
+and used once (line 140), in the query-cache key. An **uncached** query never
+consults it at all — it reads LanceDB and FTS5 live.
+
+So ordering a store relative to the bump protects nothing about that store's
+visibility. The bump's real and only job is cache invalidation, which is why
+§4.2.1 places it after the two stores whose contents a cached answer could
+otherwise misrepresent. D4a removes the need for this ordering question to have
+an answer at all.
 
 ### D5 — Resolution happens at read time, reusing machinery that exists
 
@@ -299,23 +383,54 @@ Absorbs `SPEC-versioning-and-supersession.md`.
 - `--as-of <date>` answers "what did we believe then", using the already-indexed
   `generated_at`.
 
-### 3.3 The SQLite relational store
+### 3.3 The SQLite projection
 
 New `corpus.sqlite` alongside the existing four. WAL, `busy_timeout`, one
 connection helper, same pattern as `bm25.py` and `monitor.py`.
 
-**This extends §4.2.1's write-ordering contract from four stores to five.** That
-is the real cost of this phase and it is not small: the ordering argument is what
-holds the write path together, and every crash-recovery test (`test_w3a`, five
-SIGKILL points) gains a step. Proposed position — after FTS5, before the
-generation bump, on the same grounds as FTS5: it is derived state that must be
-present before any reader can observe the new generation.
+Per **D4a it is a projection of frontmatter, so it does NOT join §4.2.1's
+write-ordering contract.** It is rebuilt from `sources/` on divergence, like any
+other derived index. The write path stays a four-store contract and `test_w3a`
+keeps its five SIGKILL points rather than gaining a sixth.
 
-### 3.4 Deduplication
+One consequence to design for rather than discover: **resolution must batch its
+lookups.** D5 collapses by `entity_id`, and those keys live in a different store
+from the vectors. `retrieval/search.py:218` and `index/store.py:119` both carry
+the same warning from a measured regression — per-candidate lookups cost
+"~494ms of pure overhead per query (up to 40 full table scans)", fixed by
+batching. Resolution issues **one** keyed query per search, never one per
+candidate.
 
-`content_hash` on every record, `UNIQUE` where the source guarantees it.
-Ingestion checks the hash before writing. Targets the measured §1.4 duplicate
-and the ambient-capture amplification of it.
+### 3.4 Deduplication — at the source, not only at the hash
+
+The first draft specified `content_hash` alone and claimed it "targets the
+measured §1.4 duplicate." **It does not, and §1.4's own evidence shows why:**
+those two documents have different slugs, different sources and different scores,
+meaning different text — therefore different hashes. Exact-hash dedup catches
+zero instances of that class. The predecessor's "0 duplicate `content_hash`
+across 12,444 rows" proves only that it never wrote identical bytes twice; the
+first draft quoted it as though it proved dedup worked.
+
+Ambient capture makes the gap worse, because distillation is a nondeterministic
+LLM call. The **same burst** distilled twice — two sessions ending together, a
+retried failure, a crash-replayed marker — produces different wording each time
+and sails past any hash.
+
+So deduplication is enforced where it is decidable:
+
+1. **Source-level idempotency (primary).** Each burst has a stable id derived
+   from its session and boundaries. A burst is distilled **at most once**;
+   consumption is recorded before the observations are written. This is the only
+   mechanism that catches the nondeterministic-redistillation case, because it
+   never invokes the model a second time.
+2. **`content_hash` (supplement).** Cheap, `UNIQUE` where a source guarantees
+   it, and genuinely useful for byte-identical re-ingestion — the
+   re-running-a-connector case. Retained, but no longer load-bearing.
+3. **Semantic near-duplicates across connectors** (the literal §1.4 pair) are
+   **not** solved here and this spec does not claim to solve them. Detecting
+   them requires a similarity threshold, and a wrong threshold silently discards
+   real knowledge in a corpus with no deletion path. Deferred, deliberately, and
+   recorded in §8.
 
 ### 3.5 Field-weighted lexical search
 
@@ -330,9 +445,38 @@ typed model.
 `connectors/predecessor.py`, read-only over the predecessor's store.
 Recovers the fields §1.2 shows were lost. Reconciles against the 14,498
 already-present graph-projected documents by `content_hash` + `source_id`, upgrading
-them in place as new revisions rather than creating a second copy of the same
+them as new revisions rather than creating a second copy of the same
 knowledge — which would be a 12,444-document instance of the §1.4 defect,
 introduced by the very phase meant to fix it.
+
+#### 3.6.1 This migration is itself the hazard §11 warns about
+
+**Stated plainly because the first draft did not notice it.** §11 orders the
+phases to avoid machine-speed irreversible writes to a corpus with no deletion
+path — and then puts a **14,498-document bulk write inside Phase 1**, before
+Phase 2's hygiene work, with no dry-run and no rollback. The argument
+contradicted itself.
+
+The migration therefore runs under its own protocol, and none of it is optional:
+
+1. **Dry-run first, and it is the default.** `--dry-run` reports counts and a
+   sample of proposed mappings and writes nothing. The real run is opt-in.
+2. **Measure the mapping's error rate before trusting it, on a sample big enough
+   to mean something.** Gate D9 checks one known observation — that proves the
+   connector *can* map, not that it maps *correctly at volume*. Hand-check a
+   random sample of 100 reconciliations and record the observed precision in the
+   commit. A wrong `content_hash` + `source_id` match silently attaches a
+   revision to the wrong document, which is worse than a duplicate: a duplicate
+   is visible, a misattached revision looks like history.
+3. **Corpus git commit immediately before the run**, so the document layer is
+   recoverable by `git revert` even though the corpus has no deletion path. This
+   is the only rollback that exists today, and it works because D4a keeps the
+   revision graph in the documents.
+4. **Batch, with the write lock, resumable.** Reuses the pending-marker
+   mechanism: a batch that dies mid-run is replayed, not restarted.
+5. **Phase 2 hygiene runs before this, not after.** Adding ~14.5k revisions to a
+   store with 74 uncompacted fragments and no retention policy is how the
+   §1.3 growth curve becomes a problem. See the amended ordering in §11.
 
 ---
 
@@ -374,6 +518,29 @@ all built and tested. The gap is the trigger.
 
 `session_shutdown` → detached `alexandria sync pi-sessions && alexandria promote`.
 Never blocking, never holding the session open, failures logged not raised.
+
+### 5.1.1 The shutdown hook is not sufficient on its own
+
+**A hook that only fires on clean shutdown captures nothing from the sessions
+most worth capturing.** SIGKILL, a kernel panic, a battery dying, or a laptop
+sleeping and never waking the process all end a session with no
+`session_shutdown` — and this runs on a laptop. The precedent at
+`kg-sync-trigger.ts.disabled` is shutdown-only too, so it inherits the same hole
+rather than solving it.
+
+The hook is therefore an **optimisation for the common case**, not the mechanism.
+The mechanism is a **periodic catch-up sweep** that distils any burst which is
+idle past the §5.2 threshold and not yet consumed, regardless of how its session
+ended. It is the same code the hook invokes, on a timer.
+
+Which process runs it must be named, not implied: **a launchd timer**, not
+`serve`. `serve` is explicitly not required to be a 24/7 daemon (§5.7 of the
+shipped spec), so hanging capture off it would make capture depend on a
+liveness property that spec declines to promise. The sweep takes the §4.2 write
+lock and skips cleanly when held, exactly as the drain does.
+
+Gate A6 covers this: a session killed with SIGKILL, leaving no shutdown hook, is
+still captured by the next sweep.
 
 ### 5.2 The idle gate
 
@@ -443,6 +610,12 @@ them, and git history means rewriting or crypto-shredding.
 - Automatic supersession detection. A model deciding which prior belief a new
   statement invalidates is a correctness risk with no undo, and there is no
   deletion path to recover from a wrong call.
+- **Semantic near-duplicate collapse across connectors** — the literal §1.4 pair,
+  one fact worded twice by a human and a distiller. §3.4 handles byte-identical
+  and same-burst cases; this needs a similarity threshold, and a wrong threshold
+  silently discards real knowledge in a corpus with no deletion path. Re-entry
+  when a measured duplicate rate justifies the risk, and not before erasure
+  exists to undo a bad call.
 - Merge/branch CRDT semantics for concurrent revisions.
 
 ---
@@ -463,6 +636,13 @@ them, and git history means rewriting or crypto-shredding.
 - **Q4 — does ambient capture cover subagent sessions?** `pi.events.on("subagents:*")`
   exists and subagents do substantial work, but their transcripts are numerous
   and often narrow. Defaulting to no.
+- **Q5 — what is the relevance floor, and can it be specified at all?** §6 asks
+  for one and **the assets to set it do not currently exist**: RRF scores are
+  rank-derived constants rather than calibrated relevance, cross-encoder logits
+  are uncalibrated, and the golden set has zero negative cases (BACKLOG #21), so
+  there is nothing to validate a threshold against. Either the golden set gains
+  negative cases first, or Phase 4 ships with injection off by default and the
+  floor is set from observed data. Gate R3 is blocked until this resolves.
 
 ---
 
@@ -475,30 +655,51 @@ vacuous tests in the write-path package.
 **Data model**
 - **D1** A LanceDB table created with an all-empty column and later written with
   values does not raise; the explicit schema holds the declared type.
-- **D2** A field classified as SQLite-side is absent from `SCALAR_FIELDS`; a
-  filterable field is present in both, and a filtered query still uses
-  `prefilter=True`.
+- **D2** A filtered search over a corpus where the filter excludes most
+  documents returns **only** matching documents and returns the full requested
+  `k` when that many exist. Behavioural: asserting the shape of a config list or
+  that a kwarg equals `prefilter=True` passes against a mock and proves nothing.
 - **D3** An observation with `type="bug"` is rejected at write with a
   diagnosable error and nothing is persisted.
 - **D4** A correction creates `rev=2`; `rev=1` remains on disk and is retrievable
   via `--as-of` a date before the correction.
 - **D5** A tombstoned document is absent from search, absent from FTS5, absent
   from synthesis, and its head row and audit rows still exist.
-- **D6** Read-time resolution returns exactly one revision per `entity_id` and
-  measurably does not regress p50 on the real corpus.
-- **D7** Ingesting the same fact twice via two connectors produces one record.
+- **D6** Read-time resolution returns exactly one revision per `entity_id`, and
+  adds **no more than 50ms to p50** on the real corpus measured over ≥100
+  queries. A threshold, because "measurably does not regress" is satisfied by
+  any measurement whatsoever.
+- **D6a** Resolution issues **one** store query per search regardless of
+  candidate count — asserted by counting calls, not by timing. The §3.3 batching
+  requirement, and the ~494ms regression it exists to prevent, is invisible to a
+  latency assertion on a small fixture.
+- **D7** The **same burst** distilled twice produces one set of observations,
+  proven with a distiller stubbed to return *different wording* on its second
+  call. A hash-based implementation fails this, which is the point: the first
+  draft's mechanism could not catch its own motivating example (§3.4).
+- **D7a** A byte-identical document re-ingested by re-running a connector
+  produces one record. This is what `content_hash` genuinely covers.
 - **D8** A title match outranks an equally-scoring body match.
 - **D9** The predecessor connector recovers `type`, `files_read`,
   `files_modified`, `prompt_number` for a known observation, and upgrades the
   existing graph-projected document rather than creating a duplicate.
-- **D10** Crash injection at each of the now-five write-ordering steps
-  reconverges from a cold reopen, with all five stores agreeing.
+- **D10** SIGKILL at each of the four write-ordering steps reconverges from a
+  cold reopen with all four stores agreeing, **and** `entity_rev` is identical
+  after replay to what it was before the crash. The rev assertion is the load
+  bearing half: a read-modify-write implementation produces rev+2 on replay and
+  passes every other part of this gate (D4a).
+- **D10a** Deleting `corpus.sqlite` entirely and rebuilding it from `sources/`
+  frontmatter reproduces it exactly — the executable statement of D4a. If this
+  fails, the projection is secretly authoritative and the backup scope is wrong.
 
 **Storage**
 - **H1** Compaction reduces fragment count and leaves every chunk retrievable.
 - **H2** `--as-of` inside the retention window resolves; outside it, fails loudly
-  rather than answering wrongly.
-- **H3** `/health` reports fragment count, version count, and on-disk size.
+  rather than answering wrongly. **Blocked on Q3** — until the window is chosen
+  this is a claim, not a gate, and is marked as such rather than counted green.
+- **H3** `/health`'s fragment count, version count and on-disk size **match
+  values obtained independently** from the filesystem. Asserting only that the
+  fields are present passes against a hardcoded `fragment_count: 1`.
 
 **Ambient write**
 - **A1** A session ending produces indexed, retrievable observations with **no
@@ -509,15 +710,28 @@ vacuous tests in the write-path package.
 - **A4** Every distillation writes a ledger row attributable to the bulk model.
 - **A5** Exceeding the daily token bound skips distillation and leaves work
   pending; it never fails a session or drops a burst.
+- **A6** A session terminated by **SIGKILL** — no shutdown hook, no clean exit —
+  is still captured by the next periodic sweep (§5.1.1). A1 tests the happy path;
+  this tests the case the hook cannot see.
+- **A7** Two sessions ending simultaneously produce one set of observations per
+  burst, not two. Exercises §5.1.1's sweep against §3.4's burst-level
+  idempotency under genuine concurrency.
 
 **Ambient read**
 - **R1** With `serve` down, a session starts normally — no error, no added
   latency beyond the probe timeout, no injected context.
 - **R2** With `serve` up, relevant context is injected and recorded under a
   distinct `client`.
-- **R3** Below the relevance floor, nothing is injected.
-- **R4** Re-running the §1.1 audit after a week shows a non-zero, attributable
-  in-session query count.
+- **R3** Below the relevance floor, nothing is injected. **Blocked on Q5** — the
+  floor is not yet specifiable (§9 Q5), so this gate cannot be written until it
+  is, and is marked blocked rather than assumed passable.
+- **R4** Re-running the §1.1 audit after a week shows a non-zero count of
+  **agent-initiated** in-session queries, **excluding `client=injection`**.
+  The exclusion is the whole gate: §6 has the session-start hook issue a query
+  every session, so a count that includes injections is non-zero by construction
+  and would pass against an implementation whose injected context is never read.
+  Reported alongside n (sessions observed) and the injection count, so a
+  one-week n=1 result is not mistaken for more than it is.
 
 ---
 
@@ -533,16 +747,36 @@ tombstone ever written** — with ambient capture running the entire time, and t
 deletion machinery already built. Our position would be worse: the capture
 without even the machinery.
 
-1. **Phase 1 — data model.** Types, `entity_id`/`entity_rev`/`deleted`, the
-   SQLite split, read-time resolution, dedup, field-weighted FTS5. Validated
-   against the predecessor corpus (§3.6): 12,444 real typed observations.
-2. **Phase 2 — storage hygiene.** Compaction, retention, observability. Must
-   precede any increase in write volume.
-3. **Phase 3 — ambient write.** The `session_shutdown` trigger, idle gate, cost
-   measurement week, then the bound.
-4. **Phase 4 — ambient read.** `serve` under launchd, optional degradable
-   injection, then re-run the §1.1 audit as the real acceptance test.
-5. **Phase 5 — erasure.** Blocked on Q1.
+**Amended after review:** the first draft's ordering was *half* right and
+overstated. Phase 1 lands tombstones, so putting it before capture genuinely
+protects the **retrieval surface** — a bad ambient capture can be hidden. It does
+**not** protect *existence*: bytes in `sources/`, git history, and the embedding
+cache persist through Phases 1-4 regardless of ordering, and only Q1/Phase 5
+addresses that. "A corpus we cannot clean" was binary rhetoric for a partial
+mitigation. The ordering stands; the claim for it is narrower.
 
-Each phase is independently shippable and safe to stop at. Reversing 1 and 3
-produces a corpus we cannot clean.
+Hygiene also moves **before** the predecessor migration, since §3.6.1 adds ~14.5k
+revisions and doing that to an uncompacted store is how §1.3's growth curve
+becomes a problem.
+
+1. **Phase 1 — data model** (§3, excluding the migration). Types,
+   `entity_id`/`entity_rev`/`deleted` in frontmatter, the SQLite projection,
+   batched read-time resolution, burst-level idempotency, field-weighted FTS5.
+2. **Phase 2 — storage hygiene** (§4). Compaction, retention, observability.
+   Required before any increase in write volume — which now explicitly includes
+   the migration below, not just ambient capture.
+3. **Then the predecessor migration** (§3.6 under §3.6.1's protocol): dry-run
+   default, sampled precision measurement, git commit as rollback, resumable
+   batches. Deliberately **after** Phase 2 rather than inside Phase 1, because it
+   is a ~14.5k-revision bulk write. It is the volume validation for Phase 1 —
+   the first real evidence the data model holds at scale.
+4. **Phase 3 — ambient write** (§5). The periodic sweep (§5.1.1) as the
+   mechanism, `session_shutdown` as its fast path, idle gate, one week of cost
+   measurement, then the bound.
+5. **Phase 4 — ambient read** (§6). `serve` under launchd, optional degradable
+   injection, then re-run the §1.1 audit as R4 — excluding injections.
+6. **Phase 5 — erasure** (§7). Blocked on Q1.
+
+Each phase is independently shippable and safe to stop at. Reversing the data
+model and ambient write would leave bad captures unhideable, since tombstones
+are what Phase 1a buys.
