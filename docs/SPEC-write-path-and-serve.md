@@ -28,6 +28,7 @@ Everything in the package serves that one sentence. Anything that does not is li
 | Attribution as a property of the channel (backlog #8) | today's `--user` is forgeable |
 | Backup/restore of `.alexandria` state (backlog #7) | this package *creates* new state |
 | `cache_hit` metric correctness | otherwise the package cannot be honestly measured |
+| Index manifest (provider/model/revision) | today nothing records which model built the index |
 | Tenancy tripwire (executable) | keeps a latent bug from going live unnoticed |
 | Pi extension routes through `serve` | otherwise the primary write path bypasses the server |
 | Host-portable deployment (§5.8) | the server must not assume the operator's laptop |
@@ -150,7 +151,26 @@ Two concurrent bumps both read N and both write N+1, silently losing one invalid
 Unreachable today with one scheduled writer; reachable the moment a drain and a server
 coexist. Fix under the same `flock` as §4.2.
 
-### 3.3 `cache_hit` metric correctness
+### 3.3 The index does not record which model built it
+
+`.alexandria/index/generation.json` contains only `{"finished_at", "generation"}`, and
+`index/store.py` has no provider, model-name, or revision field anywhere. **The index has
+no idea which embedding model produced its vectors.**
+
+This is a live bug today, not merely a remote-hosting concern. The embedding *cache* key
+is `sha256(name + revision + mode + text)`, so flipping `ALEXANDRIA_EMBED_PROVIDER`
+correctly invalidates the cache — but the *index* is a different store. A subsequent
+incremental `index` run (`upsert`, not `--rebuild`) writes torch vectors into a table
+that still holds MLX vectors, in one column, with no error. The result is silently
+incomparable similarity scores: not a crash, not a visibly wrong answer, just quietly
+degraded ranking.
+
+Fix: write an index manifest at index time recording provider, model name, revision,
+embedding dimension, and creation time. Both the CLI and `serve` verify it on open and
+refuse to proceed on mismatch. This is the precondition for gate S9, and therefore for
+safe remote hosting — without it there is nothing to compare against.
+
+### 3.4 `cache_hit` metric correctness
 
 `cache_hit` currently conflates two different events: `retrieval/search.py:123` sets 1
 for a query-cache hit, and the `answer` path also records 1 for a cached *retrieval*
@@ -407,6 +427,9 @@ Each gate is a test, not a claim.
 - **F2** Two concurrent generation bumps produce N+2, not N+1.
 - **F3** `cache_hit` distinguishes query-cache hits from answer-path retrieval hits; a
   sub-10 ms fast-path hit is separable in the logs.
+- **F4** An index carries a manifest naming its embedding provider, model, revision, and
+  dimension; opening it with a different provider fails loudly instead of mixing vector
+  spaces in one column.
 
 **Write path**
 - **W1** `remember` returns in under 500 ms and does not load the embedding model.
@@ -438,9 +461,9 @@ Each gate is a test, not a claim.
 - **S7** A request arriving on socket A is attributed to A's identity even when the body
   claims to be someone else.
 - **S8** A slow `/answer` does not block a concurrent `/search`.
-- **S9** A server whose embedding provider does not match the one that built the index
+- **S9** A server whose embedding provider does not match the index manifest (§3.3)
   **refuses to start** with a named error, rather than silently serving vectors from a
-  different model. This is the guard that makes remote hosting safe.
+  different model. Depends on F4.
 - **S10** With the server stopped, the Pi extension still answers via the CLI; with it
   running, the same query does not reload the model.
 
