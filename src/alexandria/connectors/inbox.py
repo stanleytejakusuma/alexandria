@@ -76,7 +76,7 @@ def parse_inbox_file(path: Path) -> list[InboxEntry]:
             corrects = m.group(5) or ""
         else:
             m2 = META_RE.search(text)  # plain markdown-memory meta is accepted
-            created, last = m2.group(1), m2.group(2) if m2 else ("", "")
+            created, last = (m2.group(1), m2.group(2)) if m2 else ("", "")
             harness, session, corrects = "pi", "", ""
         body = (INBOX_META_RE.sub("", text)).strip()
         if body:

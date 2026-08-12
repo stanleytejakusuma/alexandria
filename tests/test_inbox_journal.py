@@ -108,3 +108,29 @@ def test_journal_same_date_sections_do_not_collide(tmp_path):
     for item in items:
         docs.extend(c.normalize(item))
     assert len({d.path for d in docs}) == 2
+
+
+def test_inbox_entry_without_any_meta_comment_parses_instead_of_crashing(tmp_path):
+    """An entry carrying no meta comment at all must parse to empty dates.
+
+    Regression: the fallback branch read ``m2.group(1), m2.group(2) if m2 else ("", "")``,
+    which binds the conditional to the second element only -- so ``m2.group(1)`` was
+    evaluated unconditionally and raised AttributeError whenever the plain
+    markdown-memory meta was also absent. Any hand-written or truncated inbox entry
+    crashed the whole file's parse, taking every sibling entry with it.
+    """
+    path = tmp_path / "2026-08-11.md"
+    path.write_text(
+        "A fact with no meta comment whatsoever.\n"
+        f"\n{SEPARATOR}\n"
+        "A second fact, so we prove one bad entry does not sink the file.\n"
+        "<!-- created=2026-08-11, last=2026-08-11, from=pi -->\n",
+        encoding="utf-8",
+    )
+
+    entries = parse_inbox_file(path)
+
+    assert len(entries) == 2, "a meta-less entry must not abort the parse of the file"
+    assert entries[0].created == "" and entries[0].last == ""
+    assert entries[0].text.startswith("A fact with no meta")
+    assert entries[1].created == "2026-08-11"

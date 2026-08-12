@@ -152,6 +152,24 @@ Two concurrent bumps both read N and both write N+1, silently losing one invalid
 Unreachable today with one scheduled writer; reachable the moment a drain and a server
 coexist. Fix under the same `flock` as §4.2.
 
+**And a third defect, worse than either, which the code hides behind its own docstring.**
+`cache.py:52-54` states the generation file is "written atomically." It is not:
+`cache.py:67-70` is a bare `path.write_text()` — truncate then write, no temp file, no
+`rename`, no `fsync`. A crash mid-write leaves truncated JSON. `read_index_generation`
+then catches the parse error and **silently returns 0**.
+
+The consequence is not a lost bump — it is the counter running **backwards**. Generation
+reads 0, the next bump writes 1, and every response- and query-cache entry keyed on
+generations 1, 2, … 14 becomes valid again. Ancient answers resurface as fresh, and a
+rerun does not repair it: it entrenches it. This is the only crash point in the whole
+write path that is *not* self-healing under §4.2.1's ordering.
+
+Fix: write via temp file + `fsync` + `rename`, and treat a **missing or unparseable
+generation file as fail-loud, never as 0** — caches disabled rather than silently
+reusable. The docstring claiming atomicity while the code lacks it is itself the house
+failure mode, expressed in prose: the success report and the broken thing, shipped
+together.
+
 ### 3.3 The index does not record which model built it
 
 `.alexandria/index/generation.json` contains only `{"finished_at", "generation"}`, and
@@ -258,6 +276,40 @@ whole promote → embed → upsert → FTS → generation-bump section.
 The drain **skips its run** rather than blocking when the lock is held: the weekly
 reconcile is the long job, and a skipped drain costs at most one interval of freshness.
 
+**`flock` requires a local filesystem.** It is advisory, and on NFS/SMB mounts it is
+unreliable to the point of being a no-op. Since §5.8 explicitly endorses NAS deployment,
+the server and the CLI **verify at startup that the corpus is on a local filesystem** and
+refuse otherwise. Without that check, a corpus mounted over the network has no write lock
+at all and nothing says so — the house failure mode with a filesystem underneath it.
+
+### 4.2.1 Write ordering — the contract that makes crashes self-healing
+
+Four stores mutate inside the lock and there is no spanning transaction across them.
+Order is therefore load-bearing, not incidental:
+
+1. **Embedding cache** — `embedder.py:284-291`, `ON CONFLICT DO UPDATE` in its own SQLite
+   transaction. Idempotent.
+2. **LanceDB** — `store.py:60`, `merge_insert("chunk_id")`. Idempotent because
+   `chunk_id = f"{doc_id}#{sha256(doc_id\n{ordinal}\n{heading_path}\n{text})[:10]}"`
+   (`chunker.py:213-215`) is fully content-deterministic across reruns.
+3. **FTS5** — `bm25.py:58-64`, DELETE-batch plus INSERT inside one `with self.connection:`
+   transaction under WAL. Atomic and idempotent on rerun.
+4. **Generation bump** — **must come after 2 and 3.** Bumped *before*, a concurrent reader
+   can cache a pre-promote answer under the *new* generation, and that entry never
+   invalidates: cache poisoning with no expiry. Bumped after, the worst crash leaves
+   fresh indexes with stale caches for one interval, healed on the next run.
+5. **Unlink the pending marker — strictly last.** The marker *is* the redo log. Crash
+   anywhere before the unlink leaves the marker in place, so a rerun converges by the
+   idempotency of 1–3 and then bumps. Crash after the unlink means everything was already
+   durable.
+
+With this order, `chunk_id`-keyed idempotency is sufficient at every crash point.
+
+> **Idempotency holds only on the `merge_insert` path.** The `append_only=True` rebuild
+> path uses `table.add()` (`store.py:88`), which is a pure append and is **not**
+> idempotent. Gate W3 must exercise the upsert path and must not accidentally certify the
+> append path.
+
 ### 4.3 Generation and cache
 
 Each promotion cycle that does work bumps the generation once — not once per fact —
@@ -293,6 +345,16 @@ Default `127.0.0.1`. A non-loopback bind is refused unless
 `ALEXANDRIA_SERVE_ALLOW_REMOTE=1` is set explicitly — **fail closed**, because the
 failure being prevented is a default-open port serving a private corpus. Remote access is
 an SSH tunnel, not a bind-address change.
+
+**Resolving the TCP/socket inconsistency.** §5.3 derives identity from *which Unix socket*
+a caller reached, but a TCP listener on `127.0.0.1` has no such property — a local
+process connecting over TCP would carry no identity at all, leaving a blank audit trail
+that looks like a clean one. Two coherent options, and only these: TCP connections are
+recorded under a fixed, reserved identity such as `local-anonymous` that is never
+conflatable with a socket identity; **or** the TCP listener is disabled entirely whenever
+per-client sockets are configured. Default to the first, because it keeps the
+zero-configuration single-user path working while making the weaker channel visibly
+weaker in the log.
 
 ### 5.3 Attribution — identity is a property of the channel
 
@@ -333,8 +395,14 @@ and a SQLite connection opened `check_same_thread=False`.
 
 `/answer` runs a pipeline measured at up to **600 s**. It must therefore **not** hold the
 engine lock for its duration — it holds the lock only for its retrieval phase and
-releases it before synthesis. A request timeout bounds the handler so a wedged LLM call
-cannot pin a worker forever.
+releases it before synthesis.
+
+**On "a request timeout bounds the handler": that is not implementable as stated.** A
+Python thread cannot be killed from outside, so no handler-level timeout can reclaim a
+worker blocked in a synthesis call. The bound must be applied where the blocking actually
+happens — a socket/read timeout on the LLM client itself, plus a bounded worker pool so
+that wedged requests degrade throughput instead of the process. Specifying a timeout that
+cannot fire would be a control that reports protection it does not provide.
 
 **The mechanism that makes this safe, stated rather than assumed:** the retrieval phase
 returns **full chunk text**, not chunk ids to be dereferenced later. Synthesis therefore
@@ -477,6 +545,35 @@ Mitigation 1 narrows the window; only mitigation 2 can detect a fact lost inside
 because it derives health from the artifacts rather than from the bookkeeping. A liveness
 signal that shares a failure mode with the thing it monitors is not a liveness signal.
 
+**The reconcile must not inherit the parser's blindness.** `parse_inbox_file`
+(`connectors/inbox.py:62-65`) swallows `OSError` and `UnicodeDecodeError` and returns
+`[]`. An unreadable inbox file therefore yields zero entries, the invariant "every inbox
+entry has a promoted document" is **vacuously satisfied**, and the reconcile reports
+health while facts sit stranded — the same flaw §7.1 exists to close, reintroduced one
+level down through a shared parser. The reconcile must therefore count **files** as well
+as entries, and treat *any* parse failure as a hard error rather than an empty result.
+
+> Related live defect on that same read path: `connectors/inbox.py:79` reads
+> `created, last = m2.group(1), m2.group(2) if m2 else ("", "")`. Python binds the
+> conditional to the second element only, so `m2.group(1)` is evaluated unconditionally
+> and raises `AttributeError` whenever `m2` is `None`. Confirmed by execution, not by
+> reading.
+
+**The inverse case — a marker with no inbox entry.** Nothing guarantees the inbox append
+is durable before the marker is created. A crash between them leaves a marker pointing at
+nothing. The drain must **report this loudly and leave the marker in place**, never unlink
+it silently: a marker that vanishes without a promotion is indistinguishable from work
+completed, which is precisely the signal §7 depends on.
+
+### 7.2 Who actually reads the warning
+
+§7's stderr line assumes a human at a terminal. Under §5, the writer is a **long-lived
+server whose stderr nobody reads**, so the primary consumer of the liveness signal cannot
+be stderr. It must be exposed where something can act on it: `/health` returns
+oldest-pending age and a degraded status, the value is logged as structured output rather
+than prose, and a non-healthy `/health` is what the operator alerts on. The stderr line
+remains for CLI use, where it is genuinely the right channel.
+
 Separately, to catch a run that promotes successfully but writes *garbage* embeddings:
 after each promotion cycle, query one just-promoted fact by its own text and assert its
 `chunk_id` appears in the top-k (~100 ms warm).
@@ -521,7 +618,10 @@ Each gate is a test, not a claim.
   sub-10 ms fast-path hit is separable in the logs.
 - **F4** An index carries a manifest naming its embedding provider, model, revision,
   dimension, normalization, and dtype; opening it with a mismatch on any of them fails
-  loudly instead of mixing vector spaces in one column.
+  loudly instead of mixing vector spaces in one column. **A missing manifest — which is
+  the state of the existing 2.2 GB index today — must also refuse**, with a one-time
+  backfill command provided; otherwise "absent" silently reads as "compatible" and the
+  guard is inert exactly where it is first needed.
 - **F5** Every `/answer` request records model, tokens in/out, and cost against its
   `query_id`; a day of traffic can be costed from the log alone.
 - **F6** A `remember` that writes the inbox entry but fails to write the pending marker
@@ -531,9 +631,20 @@ Each gate is a test, not a claim.
 **Write path**
 - **W1** `remember` returns in under 500 ms and does not load the embedding model.
 - **W2** A fact written moments earlier is returned by `search` — end to end against the
-  real corpus, not a fixture.
+  real corpus, not a fixture, **reached through the automatic promote path with a bounded
+  wall-clock delay**. A test that writes, hand-runs a drain in its own body, then searches
+  would pass this gate while the automatic path was dead.
 - **W3** A promotion interrupted mid-run leaves the entry pending; re-running promotes it
-  exactly once, verified by `chunk_id` count.
+  exactly once, verified by `chunk_id` count **in both LanceDB and FTS5 independently** —
+  a count in one store alone cannot detect the two disagreeing, which is the failure this
+  gate exists to catch. Exercises the `merge_insert` path, never `append_only`.
+- **W3a** *(the ordering contract, tested rather than asserted)* Crash injected at each
+  of the five points in §4.2.1 — after the embedding cache, after LanceDB, after FTS5,
+  after the generation bump, after the unlink — converges to identical state on rerun,
+  with no duplicate chunks and no store disagreeing with another. Without this gate the
+  ordering is a claim; with it, it is a property.
+- **W3b** A truncated `generation.json` causes a **loud failure**, not a silent `0`, and
+  the counter never decreases across the sequence write → truncate → read → bump.
 - **W4** Generation bumps once per cycle, not once per fact.
 - **W5** With the write lock held by another process, a drain exits cleanly without
   mutating the index and without raising.
@@ -543,11 +654,17 @@ Each gate is a test, not a claim.
   `search` prints the staleness warning to stderr and still returns results.
 
 **Serve**
-- **S1** `/health` returns 200 with a chunk count matching the corpus; default bind is
-  `127.0.0.1`.
+- **S0** *(the headline claim, end to end)* A fact submitted to `/remember` is returned by
+  `/search` in under 5 s, measured through the HTTP surface — not through internal calls.
+  No other gate tests the sentence this package exists to deliver.
+- **S1** `/health` returns 200 and default bind is `127.0.0.1`; its chunk count is
+  cross-checked against **an independent source-document walk and the FTS row count**,
+  not merely echoed from the same LanceDB handle that would be wrong in the failure case.
 - **S2** A non-loopback bind is refused without `ALEXANDRIA_SERVE_ALLOW_REMOTE=1`.
 - **S3** Warm `/search` p50 under 500 ms versus the measured 25–33 s cold path; the model
-  loads exactly once across N requests.
+  loads **exactly once across N requests, observed by counting loader invocations** — not
+  inferred from latency, which would also look fine if a second model were loaded and
+  cached.
 - **S4** After an external `alexandria index` bumps the generation, the **running** server
   returns fresh results rather than a pre-reindex cached page. *(Landed:
   `tests/test_search.py::test_reindex_invalidates_cache_for_a_long_lived_engine`,
@@ -556,7 +673,8 @@ Each gate is a test, not a claim.
   return 4xx, not a traceback.
 - **S6** The CLI works normally while the server runs, and while it does not.
 - **S7** A request arriving on socket A is attributed to A's identity even when the body
-  claims to be someone else.
+  claims to be someone else — **and** a request arriving over TCP is recorded under the
+  reserved `local-anonymous` identity rather than blank or inherited (§5.2).
 - **S8** A slow `/answer` does not block a concurrent `/search`.
 - **S9** A server whose embedding provider does not match the index manifest (§3.3)
   **refuses to start** with a named error, rather than silently serving vectors from a
