@@ -91,8 +91,13 @@ def test_an_unreadable_inbox_file_is_a_hard_error_never_swallowed_into_health(tm
     assert len(report.unreadable_files) == 1
     assert bad_file.name in report.unreadable_files[0]
     # A file-level read failure must not be silently reinterpreted as "no
-    # entries" -- the previously-known entry must not be reported healthy.
-    assert entry_id not in report.requeued or True  # entry itself is unreachable, file-level error dominates
+    # entries". The entry inside the corrupted file is unreachable BY
+    # DEFINITION -- it cannot be parsed, so it cannot be requeued -- and the
+    # load-bearing assertion is that the failure surfaces as unhealthy above,
+    # not as an empty-but-healthy report.
+    # (This line previously read `assert ... or True`, which can never fail.)
+    assert report.stranded == [], "a file that could not be READ must not be reported as stranded entries"
+    assert report.total_entries == 0, "an unreadable file must contribute no parsed entries"
 
 
 def test_no_inbox_directory_is_healthy_with_zero_counts(tmp_path):

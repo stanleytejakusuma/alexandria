@@ -93,3 +93,25 @@ Audit sources: `/tmp/alx/audit/FINAL-GAP-PASS.md` (pass 1, 29 findings),
 
 - ~~Log the full retrieved set with ranks~~ — **already implemented**, 2,030/2,030 rows populated.
 - ~~Add untrusted-data framing to `write.py`/`gather.py`/`repair.py`~~ — **already present** since 2026-08-05/07. The gap is `enrich.py` only (#5).
+
+---
+
+## Status of the Top 10 after the write-path package (2026-08-12)
+
+The write-path/serve package (`docs/SPEC-write-path-and-serve.md`, commits
+`d8f9589`…`18bfad2`) closed or moved several critical-path items. The table
+above is **not** self-updating — this is the corrected status, verified against
+code by two independent audits.
+
+| # | Item | Status now |
+|---|---|---|
+| 1 | SQLite WAL + `busy_timeout` | **Partial.** WAL + explicit pragma on every writer (bm25, cache, embedder, monitor, sqlite store). But measured: CPython's `sqlite3.connect()` already defaults `busy_timeout` to 5000ms, so the pragma is redundant with the stdlib default and is belt-and-braces, not the mechanism. Narrow first-write race documented at `index/bm25.py`; unreachable on the promote path because §4.2's flock serialises it. |
+| 2 | Generation-counter correctness | **Closed.** Re-read per access (`500cd9e`), locked bump + atomic write + fail-loud on corruption (`87f12df`). |
+| 3 | `alexandria serve`, single-tenant | **Closed.** `src/alexandria/serve.py`, gates S0–S10. Also closes #43 (`README.md:201`'s promised HTTP endpoint now exists). |
+| 4 | Cost ledger | **Partial.** `usage` table records model + prompt/completion/total tokens + cache_read per `answer_id` (`d8f9589`). Deliberately **no dollar figure** — no pricing table exists in the repo and inventing one would fabricate a number nobody measured. §9's F5 says "tokens and cost"; only tokens ship. |
+| 5 | Enrichment injection framing | **Untouched.** Still open. |
+| 6 | Deletion / erasure path | **Untouched.** Explicitly out of scope (§10.1) pending a policy decision: does erasure include the audit trail and git history, or stop at the retrievable surface? |
+| 7 | Backup/restore of `.alexandria` state | **Closed.** `src/alexandria/backup.py`, gate B1. State only, never the rebuildable indexes; restore is allowlisted and traversal-safe. |
+| 8 | Real attribution, structurally verified | **Advanced, still open.** `serve` now derives identity from the socket (one Unix socket per identity; TCP → reserved `local-anonymous`) and never from the request body, and the inbox sink rejects payloads that could forge entry structure or attribution (`1386c46`, extended to `from_`). What remains: `--user`/`--caller` are still unverified passthrough hints on the CLI path, which is the "worse than absent" trail this item names. |
+| 9 | Citation-linkage build-out | **Untouched.** Still open. |
+| 10 | Procurement floor | **Untouched.** Still open. |

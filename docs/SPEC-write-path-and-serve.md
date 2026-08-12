@@ -622,8 +622,14 @@ Each gate is a test, not a claim.
   the state of the existing 2.2 GB index today — must also refuse**, with a one-time
   backfill command provided; otherwise "absent" silently reads as "compatible" and the
   guard is inert exactly where it is first needed.
-- **F5** Every `/answer` request records model, tokens in/out, and cost against its
-  `query_id`; a day of traffic can be costed from the log alone.
+- **F5** Every `/answer` request records model and tokens in/out against its
+  `query_id`; a day of traffic can be costed from the log alone **given a rate
+  card**. Amended 2026-08-12: no dollar figure is stored. No pricing table
+  exists anywhere in the repo, and deriving cost from an invented rate would
+  fabricate a number nobody measured; tokens are the irrecoverable fact, a rate
+  card can be applied later. A ledger row is written for both emitted and
+  failed syntheses (a failed run still spent tokens) and never for a
+  response-cache hit (no LLM call, nothing to cost).
 - **F6** A `remember` that writes the inbox entry but fails to write the pending marker
   reports failure to its caller; and the reconcile detects an inbox entry with no
   promoted document **without consulting the pending list**.

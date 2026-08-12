@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import shutil
+import tarfile
 import tempfile
 import threading
 import time
@@ -220,16 +221,23 @@ class RememberResult:
 _META_FIELD_RE = re.compile(r"^[\w.-]+$")
 
 
-def _reject_inbox_injection(text: str, *, session: str | None,
+def _reject_inbox_injection(text: str, *, from_: str | None, session: str | None,
                             corrects: str | None) -> str | None:
-    """Return a reason string if this entry could forge inbox structure, else None."""
+    """Return a reason string if this entry could forge inbox structure, else None.
+
+    EVERY field that reaches the metadata comment is validated, including
+    `from_`. An earlier revision exempted it on the reasoning that serve always
+    computes it from the socket -- true of serve, but `--from` is a plain CLI
+    flag, and a guard that holds only while every caller behaves is not a
+    guard. Validate at the sink; trust no caller's discipline.
+    """
     if f"\n{SEPARATOR}\n" in f"\n{text}\n":
         return (f"text contains a line consisting solely of {SEPARATOR!r}, which is the "
                 f"inbox entry separator -- it would be read back as multiple entries")
     if INBOX_META_RE.search(text) or META_RE.search(text):
         return ("text contains an inbox metadata comment (<!-- created=..., last=... -->), "
                 "which would override this entry's own recorded identity")
-    for name, value in (("session", session), ("corrects", corrects)):
+    for name, value in (("from", from_), ("session", session), ("corrects", corrects)):
         if value and not _META_FIELD_RE.match(value):
             return (f"{name}={value!r} contains characters that are not permitted in a "
                     f"metadata field (allowed: letters, digits, '.', '-', '_')")
@@ -243,7 +251,7 @@ def append_inbox_entry(corpus: Path, text: str, *, from_: str | None = None,
     text = text.strip()
     if not text:
         return RememberResult(None, "empty")
-    injection = _reject_inbox_injection(text, session=session, corrects=corrects)
+    injection = _reject_inbox_injection(text, from_=from_, session=session, corrects=corrects)
     if injection:
         return RememberResult(None, "invalid", error=injection)
     inbox_dir = corpus / "inbox"
@@ -391,7 +399,14 @@ def cmd_restore(args) -> int:
     Overwrites in place unless --dry-run. Refuses to touch anything outside
     the fixed STATE_PATHS allowlist regardless of what the archive contains."""
     corpus = _config_for(args).corpus_path
-    result = restore_state(corpus, Path(args.archive), dry_run=args.dry_run)
+    try:
+        result = restore_state(corpus, Path(args.archive), dry_run=args.dry_run)
+    except (tarfile.TarError, OSError) as exc:
+        # A hostile or corrupt archive must be a diagnosable refusal, not a
+        # traceback -- tarfile's data filter raises for symlink/hardlink/
+        # absolute-path escapes, and those reach here as-is otherwise.
+        print(f"restore: refused {args.archive}: {exc}", file=sys.stderr)
+        return 1
     verb = "would restore" if args.dry_run else "restored"
     print(f"restore: {verb} {len(result.restored)} paths from {args.archive}")
     for name in result.restored:

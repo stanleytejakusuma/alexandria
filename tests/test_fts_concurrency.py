@@ -69,3 +69,63 @@ def test_f1_two_processes_writing_fts_concurrently_both_succeed(tmp_path):
     count = index.connection.execute("SELECT COUNT(*) FROM chunk_metadata").fetchone()[0]
     assert count == 100, f"expected 50+50=100 rows from both processes, got {count}"
     assert index.wal_active is True
+
+
+def test_f1_a_writer_waits_for_a_held_write_lock_instead_of_failing_instantly(tmp_path):
+    """The gate's actual subject: `busy_timeout`.
+
+    The two-process test above pre-creates the database so the racing writers
+    contend on an EXISTING index -- which is the production shape, but it also
+    means it passes with or without `busy_timeout` most of the time. This one
+    pins the pragma itself: another connection holds a write transaction, and a
+    BM25Index write must BLOCK and then succeed once it is released. Without
+    `busy_timeout` set, sqlite raises `database is locked` immediately and this
+    fails.
+    """
+    import sqlite3
+    import threading
+    import time
+
+    from alexandria.index.bm25 import BM25Index
+
+    db = tmp_path / "fts.sqlite"
+    index = BM25Index(db)          # establishes schema + WAL
+    assert index.wal_active is True
+    # NB: CPython's sqlite3.connect() already defaults busy_timeout to 5000ms,
+    # so this asserts the guarantee HOLDS, not that the explicit pragma is what
+    # provides it (commenting the pragma out changes nothing -- measured). It
+    # would catch a future caller passing timeout=0, which disables waiting.
+    assert index.connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+    holder = sqlite3.connect(db)
+    holder.execute("BEGIN IMMEDIATE")   # takes the write lock and holds it
+
+    outcome: dict[str, object] = {}
+
+    def writer():
+        started = time.monotonic()
+        try:
+            BM25Index(db).index([{
+                "chunk_id": "waiter#1", "doc_id": "waiter", "text": "waited for the lock",
+                "heading_path": "", "type": "note", "project": "", "status": "stable",
+                "source": "test", "tags": [], "entities": [], "layer": "", "generated_at": "",
+            }])
+            outcome["ok"] = True
+        except sqlite3.OperationalError as exc:
+            outcome["ok"] = False
+            outcome["error"] = str(exc)
+        outcome["waited"] = time.monotonic() - started
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    time.sleep(0.4)                      # long enough that an instant failure is visible
+    holder.commit()                      # release the write lock
+    holder.close()
+    thread.join(timeout=15)
+
+    assert outcome.get("ok") is True, (
+        f"the second writer did not wait for the lock: {outcome.get('error')} -- "
+        f"busy_timeout is not in effect")
+    assert outcome["waited"] >= 0.3, (
+        f"the write returned in {outcome['waited']:.3f}s, faster than the lock was "
+        f"held -- it cannot have contended for it, so this proves nothing")

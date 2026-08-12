@@ -22,6 +22,7 @@ want a dry run pass dry_run=True and get the file list without writing.
 
 from __future__ import annotations
 
+import posixpath
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +78,25 @@ def backup_state(corpus: Path, archive_path: Path) -> BackupResult:
     return result
 
 
+def _is_allowed_member(name: str, allowed_prefixes: tuple[str, ...]) -> bool:
+    """Whether a tar member name may be written, judged on its NORMALISED form.
+
+    Matching the raw name is not enough: `.alexandria/pending/../../../etc/x`
+    starts with an allowlisted prefix and would pass, while resolving to a path
+    outside the corpus entirely. Normalising first collapses the `..` before the
+    prefix is tested, so traversal THROUGH a permitted prefix is rejected by the
+    allowlist itself rather than relying on tarfile's `filter="data"` to catch
+    it downstream. Defence in depth means each layer holds alone.
+    """
+    if name.startswith("/") or (len(name) > 1 and name[1] == ":"):
+        return False  # absolute (posix) or drive-qualified (windows)
+    normalised = posixpath.normpath(name)
+    if normalised.startswith("../") or normalised == ".." or normalised.startswith("/"):
+        return False
+    return any(normalised == prefix or normalised.startswith(prefix + "/")
+               for prefix in allowed_prefixes)
+
+
 def restore_state(corpus: Path, archive_path: Path, *, dry_run: bool = False) -> RestoreResult:
     """Extract a backup_state() archive back into `corpus`, overwriting.
 
@@ -93,10 +113,12 @@ def restore_state(corpus: Path, archive_path: Path, *, dry_run: bool = False) ->
     allowed_prefixes = tuple(STATE_PATHS)
     with tarfile.open(archive_path, "r:gz") as tar:
         for member in tar.getmembers():
-            name = member.name
-            if not any(name == prefix or name.startswith(prefix + "/") for prefix in allowed_prefixes):
+            if not _is_allowed_member(member.name, allowed_prefixes):
                 continue
-            result.restored.append(name)
+            result.restored.append(member.name)
             if not dry_run:
+                # filter="data" is a second, independent line of defence
+                # (symlink/hardlink/absolute-path escapes); the allowlist above
+                # is the first and must stand on its own.
                 tar.extract(member, path=corpus, filter="data")
     return result

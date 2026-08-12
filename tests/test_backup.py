@@ -165,3 +165,70 @@ def test_b1_via_the_real_cli_subcommands(tmp_path, monkeypatch, capsys):
     assert (corpus / ".alexandria" / "queries.sqlite").exists()
     out = capsys.readouterr().out
     assert "restored" in out.lower()
+
+
+def test_b1_traversal_through_an_allowlisted_prefix_is_rejected_by_the_allowlist_itself(tmp_path):
+    """The case the original allowlist test missed.
+
+    `../../etc/passwd` and `.alexandria/index/chunks.lance/x` are both rejected
+    trivially by a prefix check. The interesting input is traversal THROUGH a
+    permitted prefix -- `.alexandria/pending/../../../../tmp/pwned` starts with
+    an allowlisted prefix and resolves outside the corpus entirely. That passed
+    the raw-name check, leaving tarfile's `filter="data"` as the only thing
+    standing between a hostile archive and an arbitrary write. Defence in depth
+    means the allowlist has to hold on its own.
+    """
+    import tarfile
+    from pathlib import Path
+
+    corpus = tmp_path / "corpus"
+    (corpus / ".alexandria").mkdir(parents=True)
+    payload = tmp_path / "payload.txt"
+    payload.write_text("pwned")
+
+    archive = tmp_path / "hostile.tar.gz"
+    hostile_names = [
+        ".alexandria/pending/../../../../tmp/pwned-traversal",
+        ".alexandria/audit/../../../escaped.txt",
+        ".alexandria/./queries.sqlite/../../../../also-escaped",
+        "/etc/absolute-path",
+        ".alexandria/../../relative-escape",
+    ]
+    with tarfile.open(archive, "w:gz") as tar:
+        for name in hostile_names:
+            tar.add(payload, arcname=name)
+
+    result = restore_state(corpus, archive)
+
+    assert result.restored == [], (
+        f"the allowlist admitted a traversal member on its own: {result.restored}")
+    for probe in (Path("/tmp/pwned-traversal"), tmp_path / "escaped.txt",
+                  tmp_path / "also-escaped", tmp_path / "relative-escape"):
+        assert not probe.exists(), f"a hostile member escaped the corpus: {probe}"
+
+
+def test_b1_a_legitimate_nested_state_path_still_restores(tmp_path):
+    """The rejection above must not be so broad it refuses real nested members
+    -- `.alexandria/audit/answers.jsonl` and `.alexandria/index/generation.json`
+    are both legitimately nested under allowlisted prefixes."""
+    import tarfile
+
+    corpus = tmp_path / "corpus"
+    (corpus / ".alexandria").mkdir(parents=True)
+    payload = tmp_path / "p.txt"
+    payload.write_text("{}")
+
+    archive = tmp_path / "ok.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(payload, arcname=".alexandria/audit/answers.jsonl")
+        tar.add(payload, arcname=".alexandria/index/generation.json")
+        tar.add(payload, arcname=".alexandria/liveness.json")
+
+    result = restore_state(corpus, archive)
+
+    assert sorted(result.restored) == [
+        ".alexandria/audit/answers.jsonl",
+        ".alexandria/index/generation.json",
+        ".alexandria/liveness.json",
+    ]
+    assert (corpus / ".alexandria" / "audit" / "answers.jsonl").exists()

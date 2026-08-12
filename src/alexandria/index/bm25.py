@@ -28,7 +28,17 @@ class BM25Index:
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
         # busy_timeout makes a concurrent writer WAIT for the lock instead of
         # raising "database is locked" immediately -- the literal prerequisite
-        # for a second writer (SPEC-write-path-and-serve.md §3.1). journal_mode
+        # for a second writer (SPEC-write-path-and-serve.md §3.1).
+        #
+        # Honest accounting (measured, gate F1): CPython's sqlite3.connect()
+        # ALREADY defaults to a 5000ms busy timeout, so this pragma is exactly
+        # redundant with the stdlib default and commenting it out changes no
+        # behaviour. It is kept because the guarantee then does not depend on a
+        # stdlib default staying what it is, and because any future caller that
+        # passes an explicit `timeout=` (0 disables waiting entirely) would
+        # otherwise silently lose it. The protection is real; this line is not
+        # what uniquely provides it.
+        # journal_mode
         # is verified, not assumed: WAL can silently fail to engage on some
         # filesystems (e.g. certain network mounts), and a caller depending on
         # concurrent readers-during-write needs to know if it didn't.
