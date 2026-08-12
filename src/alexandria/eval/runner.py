@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,7 @@ from typing import Any
 from .golden import GoldenEntry
 from .metrics import EvalResult, EvalSummary, recall_at_k, reciprocal_rank, summarize
 
-__all__ = ["EvalReport", "run_eval"]
+__all__ = ["EvalReport", "document_id", "run_eval", "score_of"]
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,11 @@ class EvalReport:
     corpus_chunks: int | None
     timestamp: str
     git_sha: str
+    negatives: list[EvalResult] = field(default_factory=list)
+    """Results for queries the corpus cannot answer (BACKLOG #21). Optional so the
+    ~1MB of history predating negative cases stays loadable."""
+    separation: dict[str, Any] | None = None
+    """SeparationReport.to_dict() when negatives ran, else None."""
 
     @property
     def config_fingerprint(self) -> dict[str, Any]:
@@ -37,6 +42,8 @@ class EvalReport:
             "corpus_chunks": self.corpus_chunks,
             "timestamp": self.timestamp,
             "git_sha": self.git_sha,
+            "negatives": [result.to_dict() for result in self.negatives],
+            "separation": self.separation,
         }
 
     @classmethod
@@ -48,6 +55,8 @@ class EvalReport:
             corpus_chunks=raw.get("corpus_chunks"),
             timestamp=str(raw["timestamp"]),
             git_sha=str(raw["git_sha"]),
+            negatives=[EvalResult.from_dict(value) for value in raw.get("negatives", [])],
+            separation=raw.get("separation"),
         )
 
 
@@ -59,18 +68,20 @@ def run_eval(engine, entries: list[GoldenEntry], *, k_override: int | None = Non
         started = time.perf_counter()
         try:
             raw_results = engine.search(entry.query, k=k)
-            retrieved_ids = [_document_id(result) for result in raw_results][:k] if k > 0 else []
+            retrieved_ids = [document_id(result) for result in raw_results][:k] if k > 0 else []
+            scores = tuple(score_of(result) for result in raw_results)[:k] if k > 0 else ()
             hit = recall_at_k(retrieved_ids, entry.must_retrieve, k)
             rank = _rank_at_k(retrieved_ids, entry.must_retrieve, k) if hit else 0
             error = None
         except Exception as exc:  # an eval must show a failed query, never drop it
             retrieved_ids = []
+            scores = ()
             hit = False
             rank = 0
             error = f"{type(exc).__name__}: {exc}"
         latency_ms = round((time.perf_counter() - started) * 1000, 3)
         results.append(EvalResult(entry.id, entry.query, hit, rank, retrieved_ids, latency_ms, error,
-                                  overlap_band=entry.overlap_band))
+                                  overlap_band=entry.overlap_band, scores=scores))
 
     return EvalReport(
         results=results,
@@ -82,7 +93,7 @@ def run_eval(engine, entries: list[GoldenEntry], *, k_override: int | None = Non
     )
 
 
-def _document_id(result: object) -> str:
+def document_id(result: object) -> str:
     """SearchResult carries doc_id; accepting strings keeps fake engines minimal."""
     if isinstance(result, str):
         return result
@@ -90,6 +101,18 @@ def _document_id(result: object) -> str:
     if value is None:
         raise TypeError("evaluation engine result is missing doc_id")
     return str(value)
+
+
+def score_of(result: object) -> float:
+    """Mirror of document_id for scores; a bare-string fake engine scores 0.0.
+
+    Deliberately not raising when the attribute is absent: every existing fake
+    engine in the suite yields strings, and forcing them all to grow a score would
+    be a large diff in service of a field those tests do not exercise.
+    """
+    if isinstance(result, str):
+        return 0.0
+    return float(getattr(result, "score", 0.0))
 
 
 def _rank_at_k(retrieved_ids: list[str], wanted_ids: tuple[str, ...], k: int) -> int:

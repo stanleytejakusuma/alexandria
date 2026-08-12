@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 __all__ = ["EvalResult", "EvalSummary", "by_overlap_band", "mrr", "recall_at_k",
           "reciprocal_rank", "summarize"]
@@ -20,6 +20,15 @@ class EvalResult:
     error: str | None = None
     target_error: bool = False
     overlap_band: str | None = None
+    scores: tuple[float, ...] = ()
+    """Retrieval scores, positionally aligned with retrieved_ids.
+
+    Recorded because rank alone cannot say whether the engine was *confident*.
+    Precision work (BACKLOG #21) and the relevance-floor question
+    (SPEC-data-model-and-ambient-capture Q5) both need the score distribution, and
+    an eval that discards it can only be re-run, never re-analysed. Defaults empty
+    so the ~1MB of history written before this field stays loadable.
+    """
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -36,6 +45,7 @@ class EvalResult:
             error=raw.get("error"),
             target_error=bool(raw.get("target_error", False)),
             overlap_band=raw.get("overlap_band"),
+            scores=tuple(float(value) for value in raw.get("scores", ())),
         )
 
 

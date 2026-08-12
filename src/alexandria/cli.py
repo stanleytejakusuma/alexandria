@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .auditlog import AuditLogger, audit_summary
@@ -38,6 +38,7 @@ from .connectors.knowledge_graph import KnowledgeGraphConnector
 from .connectors.md_memory import META_RE, SEPARATOR, MarkdownMemoryConnector
 from .connectors.pi_sessions import PiSessionsConnector
 from .eval.golden import load_golden, verify_targets
+from .eval.negative import load_negative, run_negative, separation
 from .eval.history import append_run, compare, load_runs, regressions
 from .eval.metrics import by_overlap_band
 from .eval.runner import EvalReport, run_eval
@@ -877,7 +878,29 @@ def cmd_eval(args) -> int:
                   + ", ".join(target_errors), file=sys.stderr)
         return 2
 
-    report = run_eval(_build_search_engine(config, corpus), entries, k_override=args.k)
+    engine = _build_search_engine(config, corpus)
+    report = run_eval(engine, entries, k_override=args.k)
+
+    # Negative cases (BACKLOG #21): queries the corpus cannot answer. Without
+    # them the gate is recall-only and an engine that grows confidently wrong
+    # scores exactly as well as one that stays right. Run when the set exists so
+    # a corpus without one still evaluates, rather than failing on absence.
+    negative_path = (Path(args.negative).expanduser() if args.negative else
+                     corpus / ".alexandria" / "golden" / "negative-v1.jsonl")
+    if negative_path.exists():
+        try:
+            negative_entries = load_negative(negative_path)
+        except ValueError as exc:
+            _print_eval_error(str(exc), as_json=args.json)
+            return 2
+        negative_rows = run_negative(engine, negative_entries, k=args.k or 5)
+        try:
+            separation_report = separation(report.results, negative_rows).to_dict()
+        except ValueError:
+            # Nothing scored on one side; record the rows, claim no separation.
+            separation_report = None
+        report = replace(report, negatives=negative_rows, separation=separation_report)
+
     history_path = corpus / ".alexandria" / "eval_runs.jsonl"
     previous = load_runs(history_path)
     delta = compare(previous[-1], report) if previous and (args.compare_last or args.fail_on_regression) else None
@@ -1060,8 +1083,21 @@ def _print_eval_report(report: EvalReport, delta) -> None:
             if band in bands:
                 b = bands[band]
                 print(f"{band:<12} {b.n:>4} {b.recall_at_k:>9.1%} {b.mrr:>7.3f}")
+    if report.separation:
+        sep = report.separation
+        print(f"\nprecision (negative set, n={sep['n_negative']}):")
+        print(f"  positive top-1 median {sep['positive_top1_median']:.4f}  "
+              f"negative top-1 median {sep['negative_top1_median']:.4f}")
+        print(f"  clean floor {sep['clean_floor']:.4f} retains "
+              f"{sep['clean_floor_recall']:.1%} of answerable queries"
+              f"{'' if sep['separable'] else '  [NOT SEPARABLE]'}")
+    elif report.negatives:
+        print(f"\nprecision: {len(report.negatives)} negatives ran, separation not computable")
     if delta is not None:
         print(f"\nvs previous: recall {delta.recall_at_k:+.1%}, MRR {delta.mrr:+.3f}")
+        if delta.negative_confidence_rose:
+            print("PRECISION REGRESSION -- more confident on unanswerable queries: "
+                  + ", ".join(delta.negative_confidence_rose))
         if delta.hit_to_miss:
             print("HIT->MISS: " + ", ".join(delta.hit_to_miss))
         if delta.miss_to_hit:
@@ -1177,6 +1213,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     evaluate = sub.add_parser("eval", help="score retrieval against the private golden set")
     evaluate.add_argument("--golden", help="path to the private golden JSONL file")
+    evaluate.add_argument("--negative", help="path to the negative (unanswerable-query) JSONL file")
     evaluate.add_argument("--k", type=int, help="override every entry's retrieval depth")
     evaluate.add_argument("--json", action="store_true", help="emit a machine-readable report")
     evaluate.add_argument("--compare-last", action="store_true", help="show transitions from the prior run")

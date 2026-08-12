@@ -636,13 +636,43 @@ them, and git history means rewriting or crypto-shredding.
 - **Q4 — does ambient capture cover subagent sessions?** `pi.events.on("subagents:*")`
   exists and subagents do substantial work, but their transcripts are numerous
   and often narrow. Defaulting to no.
-- **Q5 — what is the relevance floor, and can it be specified at all?** §6 asks
-  for one and **the assets to set it do not currently exist**: RRF scores are
-  rank-derived constants rather than calibrated relevance, cross-encoder logits
-  are uncalibrated, and the golden set has zero negative cases (BACKLOG #21), so
-  there is nothing to validate a threshold against. Either the golden set gains
-  negative cases first, or Phase 4 ships with injection off by default and the
-  floor is set from observed data. Gate R3 is blocked until this resolves.
+- **Q5 — what is the relevance floor? RESOLVED 2026-08-13, measured.** The
+  blocker was that nothing existed to validate a threshold against. A negative
+  set now does: 22 hand-verified queries the corpus cannot answer
+  (`.alexandria/golden/negative-v1.jsonl`), measured against the 49-entry golden
+  set at 46,021 chunks.
+
+  | | positive (31 hits) | negative (22) |
+  |---|---|---|
+  | top-1 median | 0.9819 | 0.0238 |
+  | top-1 min / max | 0.1190 / 0.9985 | 0.0031 / 0.4409 |
+
+  The distributions separate: a floor at **0.4409** (just above the best
+  unanswerable query) admits zero known-bad results and retains **87.1%** of
+  answerable ones.
+
+  **But the 12.9% it costs is not a random sample.** All four positives falling
+  below that floor are `overlap_band: zero` — queries sharing no vocabulary with
+  their target, which is precisely the class semantic retrieval exists to serve
+  and grep cannot. A floor set for cleanliness taxes the capability the system is
+  built on.
+
+  **Decision:** floor at **0.12**, just under the weakest positive hit. It
+  retains 100% of answerable queries and admits 2 of 22 negatives
+  (`stripe-webhook-idempotency` 0.4409, `mongodb-aggregation` 0.3374). For
+  ambient injection this is the right side of the trade: injected context is
+  advisory and the agent can disregard a bad chunk, whereas a dropped chunk is
+  invisible and unrecoverable. The 0.4409 floor is the correct choice for any
+  future surface where a wrong result is *acted on* rather than read.
+
+  Both numbers are conventions over one measurement, not constants. Gate R3 is
+  unblocked and specifies 0.12.
+
+  **Known decay:** a negative case asserts absence, and absence expires as the
+  corpus grows — including from this session being distilled into it, which will
+  add documents containing every term above. `verified_against` records the chunk
+  count at verification time so staleness is visible; re-verification belongs
+  with each golden-set review.
 
 ---
 
@@ -722,9 +752,10 @@ vacuous tests in the write-path package.
   latency beyond the probe timeout, no injected context.
 - **R2** With `serve` up, relevant context is injected and recorded under a
   distinct `client`.
-- **R3** Below the relevance floor, nothing is injected. **Blocked on Q5** — the
-  floor is not yet specifiable (§9 Q5), so this gate cannot be written until it
-  is, and is marked blocked rather than assumed passable.
+- **R3** Below the relevance floor of **0.12** (§9 Q5, measured), nothing is
+  injected. Asserted against the negative set: no `negative-v1.jsonl` query
+  produces injected context at or below the floor, and every golden-set hit
+  clears it.
 - **R4** Re-running the §1.1 audit after a week shows a non-zero count of
   **agent-initiated** in-session queries, **excluding `client=injection`**.
   The exclusion is the whole gate: §6 has the session-start hook issue a query

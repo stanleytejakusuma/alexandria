@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .runner import EvalReport
@@ -17,6 +17,16 @@ class Delta:
     mrr: float
     hit_to_miss: list[str]
     miss_to_hit: list[str]
+    negative_confidence_rose: list[str] = field(default_factory=list)
+    """Unanswerable queries the engine became materially more confident about.
+
+    The precision counterpart to hit_to_miss, at the same query-level granularity:
+    an aggregate score can absorb one query going badly wrong, a named query
+    cannot. Empty when either run carried no negatives.
+    """
+    clean_floor_recall: float = 0.0
+    """Change in the fraction of answerable queries clearing the no-false-positive
+    floor. Reported for visibility; the gate fires on the named list above."""
 
     @property
     def recall_delta(self) -> float:
@@ -66,8 +76,44 @@ def compare(previous: EvalReport, current: EvalReport) -> Delta:
             result.id for result in current.results
             if previous_hits.get(result.id) is False and current_hits.get(result.id) is True
         ],
+        negative_confidence_rose=_negative_confidence_rose(previous, current),
+        clean_floor_recall=_clean_floor_recall(current) - _clean_floor_recall(previous),
     )
 
 
+# A negative rising by more than this much is treated as a real precision
+# regression rather than run-to-run noise. Stated as a convention so a future
+# reader argues with a number they can see; scores are bounded in [0, 1] and the
+# measured negative median is 0.024, so 0.10 is several times typical spread.
+CONFIDENCE_RISE_THRESHOLD = 0.10
+
+
+def _top_score(result) -> float:
+    return result.scores[0] if result.scores else 0.0
+
+
+def _negative_confidence_rose(previous: EvalReport, current: EvalReport) -> list[str]:
+    before = {result.id: _top_score(result) for result in previous.negatives}
+    return sorted(
+        result.id for result in current.negatives
+        if result.id in before
+        and _top_score(result) - before[result.id] > CONFIDENCE_RISE_THRESHOLD
+    )
+
+
+def _clean_floor_recall(report: EvalReport) -> float:
+    if not report.separation:
+        return 0.0
+    return float(report.separation.get("clean_floor_recall", 0.0))
+
+
 def regressions(delta: Delta) -> list[str]:
-    return list(delta.hit_to_miss)
+    """Named queries that got worse: recall losses and precision losses alike.
+
+    Precision entries are prefixed so a failing gate says which kind of damage it
+    found -- "recall dropped" and "the engine grew confident about a question the
+    corpus cannot answer" call for different responses.
+    """
+    return list(delta.hit_to_miss) + [
+        f"negative:{entry_id}" for entry_id in delta.negative_confidence_rose
+    ]

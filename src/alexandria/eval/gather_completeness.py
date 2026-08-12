@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .contradiction_golden import ContradictionPairEntry
-from .runner import _corpus_chunks, _document_id, _fingerprint, _git_sha
+from .runner import _corpus_chunks, _fingerprint, _git_sha, document_id
 
 __all__ = ["GatherResult", "GatherSummary", "GatherReport", "run_gather_completeness", "passes_gate"]
 
@@ -75,7 +75,7 @@ def run_gather_completeness(engine, entries: list[ContradictionPairEntry], *,
         started = time.perf_counter()
         try:
             raw_results = engine.search(entry.query, k=k)
-            retrieved_ids = [_document_id(r) for r in raw_results][:k]
+            retrieved_ids = [document_id(r) for r in raw_results][:k]
             claim_a_found = any(c in retrieved_ids for c in entry.claim_a)
             claim_b_found = any(c in retrieved_ids for c in entry.claim_b)
             both_found = claim_a_found and claim_b_found
