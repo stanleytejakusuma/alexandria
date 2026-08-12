@@ -44,7 +44,7 @@ class VectorStore:
             return
         table = self._open_table()  # pragma: no cover - requires optional dependency
         if table is None:
-            self._db.create_table(self.table_name, data=records)
+            self._db.create_table(self.table_name, data=records, schema=_lance_schema(records))
             return
         # Red 2026-08-09: detect old LanceDB schemas before issuing field
         # projections. A table created before the enrichment columns existed
@@ -83,7 +83,7 @@ class VectorStore:
             return
         table = self._open_table()  # pragma: no cover - requires optional dependency
         if table is None:
-            self._db.create_table(self.table_name, data=records)
+            self._db.create_table(self.table_name, data=records, schema=_lance_schema(records))
             return
         table.add(records)
 
@@ -244,20 +244,55 @@ def _normalise_record(chunk: Mapping[str, Any]) -> dict:
         raise ValueError(f"chunk record is missing: {', '.join(sorted(missing))}")
     doc_id = str(record["doc_id"])
     record["layer"] = "wiki" if doc_id.startswith("wiki/") else "sources"
-    for field in ("type", "project", "status", "source", "generated_at"):
-        record[field] = record.get(field)
     for field in ("tags", "entities"):
         value = record.get(field) or []
         record[field] = [str(item) for item in value]
     record["vector"] = [float(value) for value in record["vector"]]
-    for field in ("enrichment", "kind", "parent_doc", "target_chunk"):
-        # LanceDB (pinned by a live repro): a table created with NULL in these
-        # columns crashes any later merge_insert touching them ("Spill has
-        # sent an error"). Empty string is the safe neutral value; routing
-        # code checks truthiness, so "" behaves as absent.
+    # LanceDB (pinned by a live repro, originally found for enrichment/kind/
+    # parent_doc/target_chunk, and reproduced again for type/project/status/
+    # generated_at/source below): a table whose FIRST-EVER batch has every
+    # value None for a nullable scalar column gets that column typed as
+    # Arrow `null` (no inferable type), not nullable-string. The instant any
+    # later batch supplies a real string for that column, merge_insert's
+    # schema unification chokes and raises an opaque "Spill has sent an
+    # error" instead of a real type error. Empty string is the safe neutral
+    # value for every nullable text field here; routing code checks
+    # truthiness, so "" behaves as absent exactly like None did.
+    for field in ("type", "project", "status", "source", "generated_at",
+                  "enrichment", "kind", "parent_doc", "target_chunk"):
         value = record.get(field)
         record[field] = value if value is not None else ""
     return {field: record.get(field) for field in ALL_FIELDS}
+
+
+def _lance_schema(records: list[dict]):
+    """Explicit PyArrow schema for a brand-new table.
+
+    Do NOT rely on `create_table(data=records)`'s automatic type inference:
+    when every value in the FIRST-EVER batch for a nullable text field is
+    None, or every list is empty, PyArrow cannot infer a real type and picks
+    Arrow's `null` type for that column (or `list<item: null>`). The column
+    silently keeps that type for the table's lifetime. The instant a LATER
+    batch supplies a real string/list value for it, merge_insert's schema
+    unification chokes and lancedb raises an opaque "Spill has sent an
+    error" instead of a real type error -- reproduced live via a plain
+    single-document corpus (no frontmatter tags/type/project/status) indexed
+    once, then a second unrelated fact remembered and promoted through
+    `alexandria.promote.promote_pending`. Declaring the schema up front
+    means every table starts with the type it will always need, regardless
+    of what the first batch happens to contain.
+    """
+    import pyarrow as pa
+
+    dim = len(records[0]["vector"]) if records else 0
+    text_fields = ("chunk_id", "doc_id", "text", "heading_path", "type", "project",
+                   "status", "source", "layer", "generated_at", "enrichment", "kind",
+                   "parent_doc", "target_chunk")
+    fields = [pa.field(name, pa.string()) for name in text_fields]
+    fields.append(pa.field("vector", pa.list_(pa.float32(), dim)))
+    fields.append(pa.field("tags", pa.list_(pa.string())))
+    fields.append(pa.field("entities", pa.list_(pa.string())))
+    return pa.schema(fields)
 
 
 def _try_lancedb():

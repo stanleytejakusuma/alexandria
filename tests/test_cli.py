@@ -237,11 +237,13 @@ def _stub_index(corpus):
     _build_search_engine's own embedder construction doesn't try to load a
     real local/MLX model just to verify.
     """
+    from alexandria import liveness
     from alexandria.index.embedder import CachedEmbedder, HashEmbedder
     from alexandria.index.manifest import write_manifest
     (corpus / ".alexandria" / "index" / "chunks.lance").mkdir(parents=True, exist_ok=True)
     embedder = CachedEmbedder(HashEmbedder(), corpus / ".alexandria" / "cache" / "embeddings.sqlite")
     write_manifest(corpus, embedder, "hash")
+    liveness.record_success(corpus, promoted_count=0, generation=0)
 
 
 def test_answer_prints_the_emitted_page(tmp_path, monkeypatch, capsys):

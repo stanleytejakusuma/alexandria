@@ -8,6 +8,29 @@ from alexandria.connectors.journal import JournalConnector, parse_journal
 from alexandria.connectors.md_memory import SEPARATOR
 
 
+def test_from_field_accepts_hyphens_like_session_and_corrects_already_do(tmp_path):
+    """Regression for a real bug found via serve.py's /remember round trip
+    (SPEC §5 gate S0): `from=(\\w+)` didn't allow hyphens, so the reserved
+    identity `local-anonymous` (§5.2) failed the WHOLE optional-groups tail
+    of INBOX_META_RE, silently dropping `created` to "" on reparse and
+    changing entry_id (sha256(created+text)) out from under an entry that
+    was already written and marked pending -- promote_pending then reported
+    "no matching inbox entry" for a fact that plainly existed."""
+    p = tmp_path / "2026-08-12.md"
+    text = "The vault key rotates every 90 days."
+    p.write_text(
+        f"{text}\n\n"
+        "<!-- created=2026-08-12, last=2026-08-12, from=local-anonymous -->\n",
+        encoding="utf-8",
+    )
+    entries = parse_inbox_file(p)
+    assert len(entries) == 1
+    assert entries[0].harness == "local-anonymous"
+    assert entries[0].created == "2026-08-12"
+    assert entries[0].entry_id == hashlib.sha256(
+        f"2026-08-12\n{text}".encode()).hexdigest()[:12]
+
+
 def test_parse_inbox_file_roundtrip(tmp_path):
     p = tmp_path / "2026-08-08.md"
     p.write_text(

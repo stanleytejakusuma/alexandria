@@ -2,10 +2,31 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 __all__ = ["CrossEncoderReranker", "IdentityReranker", "RerankCandidate", "Reranker"]
+
+# Keyed by (model_name, half_precision): the underlying torch CrossEncoder,
+# shared across every CrossEncoderReranker instance in the process. Loading
+# is what's expensive (multi-second cold start); constructing a wrapper
+# instance is not, and any code path that builds a second SearchEngine in
+# one process (§5.8's "the server can rebuild in place", or simply several
+# tests in one pytest run) must not pay the load cost -- or repeat it at
+# all. Repeated same-process load/discard of the torch model was observed
+# to destabilize the MPS backend (a segfault) under back-to-back test runs
+# each constructing their own CrossEncoderReranker.
+_MODEL_CACHE: dict[tuple[str, bool], object] = {}
+# Sharing one torch model across ServeContext instances (each with its own
+# engine_lock) means the engine_lock no longer serializes every caller of
+# that model -- two different SearchEngines, or leftover daemon threads
+# from a prior request, can invoke it concurrently. PyTorch's MPS backend
+# is not safe against concurrent kernel launches from multiple Python
+# threads (observed as a segfault under back-to-back test runs); this lock
+# guards the actual model, at the resource, independent of how many
+# engines/callers reference it.
+_MODEL_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -59,7 +80,8 @@ class CrossEncoderReranker:
     def rerank(self, query: str, candidates: list[RerankCandidate], k: int) -> list[RerankCandidate]:
         if not candidates or k < 1:
             return []
-        scores = self._load().predict([(query, candidate.text) for candidate in candidates])
+        with _MODEL_LOCK:
+            scores = self._load().predict([(query, candidate.text) for candidate in candidates])
         ranked = [
             RerankCandidate(candidate.chunk_id, candidate.text, float(score))
             for candidate, score in zip(candidates, scores, strict=True)
@@ -69,6 +91,11 @@ class CrossEncoderReranker:
 
     def _load(self):
         if self._model is not None:
+            return self._model
+        cache_key = (self.model_name, self.half_precision)
+        cached = _MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            self._model = cached
             return self._model
         try:
             from sentence_transformers import CrossEncoder
@@ -81,4 +108,5 @@ class CrossEncoderReranker:
             except Exception:  # pragma: no cover - fp16 unsupported on this backend
                 pass           # fp32 is correct, just slower -- never fail a query
         self._model = model
+        _MODEL_CACHE[cache_key] = model
         return self._model

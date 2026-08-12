@@ -20,8 +20,16 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-__all__ = ["Chunk", "Section", "chunk_document", "count_tokens", "split_headings"]
+from ..corpus import Doc
+
+if TYPE_CHECKING:
+    from ..config import AppConfig
+
+__all__ = ["Chunk", "Section", "chunk_document", "chunk_doc_records",
+           "doc_frontmatter_metadata", "count_tokens", "split_headings"]
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
@@ -215,3 +223,49 @@ def _make(doc_id: str, heading_path: str, units: list[str], ordinal: int,
     return Chunk(doc_id=doc_id, chunk_id=f"{doc_id}#{digest}", text=text,
                  heading_path=heading_path, heading_paths=list(heading_paths or []),
                  ordinal=ordinal)
+
+
+def doc_frontmatter_metadata(frontmatter: dict, doc_id: str) -> dict:
+    """Flatten a document's frontmatter into the scalar fields every chunk record
+    carries (see index/store.py SCALAR_FIELDS and index/bm25.py METADATA_COLUMNS --
+    this is the one place both indexes' shared metadata shape is derived)."""
+    generated = frontmatter.get("generated")
+    generated_at = frontmatter.get("generated_at")
+    if generated_at is None and isinstance(generated, dict):
+        generated_at = generated.get("at")
+    return {
+        "type": frontmatter.get("type"),
+        "project": frontmatter.get("project"),
+        "status": frontmatter.get("status"),
+        "source": frontmatter.get("source"),
+        "tags": list(frontmatter.get("tags") or []),
+        "entities": list(frontmatter.get("entities") or []),
+        "layer": "wiki" if doc_id.startswith("wiki/") else "sources",
+        "generated_at": generated_at,
+    }
+
+
+def chunk_doc_records(path: Path, corpus: Path, config: "AppConfig") -> tuple[list[dict], str | None]:
+    """Read one document off disk and return its fully-formed chunk records --
+    the same dict shape VectorStore.upsert() and BM25Index.index() both expect.
+
+    Shared by cli.py's whole-corpus `_load_chunk_records` walk and promote.py's
+    single-document promotion path, so the two can never drift on how a chunk
+    record is built (moved out of cli.py 2026-08-12 for exactly that reason --
+    promote.py must not import from cli.py, which would invert the module
+    layering cli.py sits above).
+    """
+    try:
+        document = Doc.read(path, root=corpus)
+        markdown = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return [], f"{path.relative_to(corpus)}: {exc}"
+    metadata = doc_frontmatter_metadata(document.frontmatter, document.doc_id)
+    chunks = chunk_document(document.doc_id, markdown, config.chunk_tokens, config.chunk_overlap)
+    return [{
+        "chunk_id": chunk.chunk_id,
+        "doc_id": chunk.doc_id,
+        "text": chunk.text,
+        "heading_path": chunk.heading_path,
+        **metadata,
+    } for chunk in chunks], None

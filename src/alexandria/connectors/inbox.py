@@ -27,12 +27,19 @@ from ..corpus import Doc, slugify, source_filename
 from .base import NoStateMixin, RawItem
 from .md_memory import META_RE, SEPARATOR, Entry
 
-__all__ = ["InboxConnector", "parse_inbox_file", "INBOX_META_RE"]
+__all__ = ["InboxConnector", "parse_inbox_file", "read_inbox_file_strict", "INBOX_META_RE"]
 
 # extended meta: created, last, from (harness), session (optional), corrects (optional)
 INBOX_META_RE = re.compile(
     r"<!--\s*created=([0-9-]+),\s*last=([0-9-]+)"
-    r"(?:,\s*from=(\w+))?(?:,\s*session=([\w.-]+))?(?:,\s*corrects=([\w-]+))?\s*-->"
+    # `from` must accept hyphens like `session`/`corrects` already do --
+    # \w+ silently failed to match reserved identity names such as
+    # `local-anonymous` (SPEC §5.2), which made the WHOLE optional-groups
+    # tail fail to match, dropping `created` to "" on reparse and changing
+    # entry_id (sha256(created+text)) out from under an entry already
+    # written and marked pending -- found via serve.py's real /remember
+    # round trip (test_serve.py's S0 test), not a synthetic case.
+    r"(?:,\s*from=([\w.-]+))?(?:,\s*session=([\w.-]+))?(?:,\s*corrects=([\w-]+))?\s*-->"
 )
 
 
@@ -58,10 +65,27 @@ class InboxEntry:
 
 
 def parse_inbox_file(path: Path) -> list[InboxEntry]:
+    """Best-effort read: an unreadable/undecodable file returns [] rather than
+    raising. Used by the discover/promote paths, where "skip what can't be
+    read this cycle" is the right behaviour. The §7.1 reconcile invariant
+    must NOT use this -- it needs read_inbox_file_strict below, because
+    swallowing here would make an unreadable file's entries vacuously
+    'satisfy' the has-a-promoted-document check while sitting stranded.
+    """
     try:
-        raw = path.read_text(encoding="utf-8")
+        return read_inbox_file_strict(path)
     except (OSError, UnicodeDecodeError):
         return []
+
+
+def read_inbox_file_strict(path: Path) -> list[InboxEntry]:
+    """Same parse as parse_inbox_file, but a read/decode failure raises
+    instead of returning []. The one entry point the §7.1 reconcile may use."""
+    raw = path.read_text(encoding="utf-8")
+    return _parse_inbox_text(raw)
+
+
+def _parse_inbox_text(raw: str) -> list[InboxEntry]:
     out = []
     chunks = raw.split(f"\n{SEPARATOR}\n") if f"\n{SEPARATOR}\n" in raw else [raw]
     for chunk in chunks:

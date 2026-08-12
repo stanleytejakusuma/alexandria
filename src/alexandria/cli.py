@@ -29,7 +29,7 @@ from .cache import (
 )
 from .config import AppConfig, load_config
 from .corpus import Doc
-from .connectors.inbox import INBOX_META_RE, InboxConnector, parse_inbox_file
+from .connectors.inbox import INBOX_META_RE, InboxConnector, InboxEntry, parse_inbox_file
 from .connectors.journal import JournalConnector
 from .connectors.knowledge_graph import KnowledgeGraphConnector
 from .connectors.md_memory import SEPARATOR, MarkdownMemoryConnector
@@ -39,13 +39,17 @@ from .eval.history import append_run, compare, load_runs, regressions
 from .eval.metrics import by_overlap_band
 from .eval.runner import EvalReport, run_eval
 from .index.bm25 import BM25Index, searchable_text
-from .index.chunker import chunk_document
+from .index.chunker import chunk_doc_records, chunk_document
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
 from .index.manifest import ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest, write_manifest
 from .index.store import VectorStore
+from . import liveness
 from .llm import LLMClient
 from .migrate import migrate_kg_sync
 from .monitor import QueryLogger
+from .pending import create_pending, list_pending, oldest_pending_age
+from .promote import promote_pending
+from .reconcile import reconcile_inbox
 from .retrieval.rerank import CrossEncoderReranker
 from .retrieval.search import SearchConfig, SearchEngine
 from .schema import Severity, validate
@@ -185,38 +189,146 @@ def cmd_sync(args) -> int:
     return 0
 
 
-def cmd_remember(args) -> int:
+@dataclass
+class RememberResult:
+    """Shared outcome type for both `cmd_remember` (CLI) and serve's
+    /remember handler (§5), so the §7.1 write-ordering contract (marker
+    written BEFORE success is reported) is implemented exactly once."""
+    entry: InboxEntry | None
+    status: str  # "written" | "duplicate" | "empty" | "marker_failed"
+    path: Path | None = None
+    error: str | None = None
+
+
+def append_inbox_entry(corpus: Path, text: str, *, from_: str | None = None,
+                       session: str | None = None, corrects: str | None = None) -> RememberResult:
     """Append a user-confirmed memory to the inbox (the only explicit write
-    surface; promoted into sources/ by `sync inbox`)."""
-    corpus = _config_for(args).corpus_path
+    surface; promoted by the drain or inline by serve's /remember)."""
+    text = text.strip()
+    if not text:
+        return RememberResult(None, "empty")
     inbox_dir = corpus / "inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
     today = _dt.date.today().isoformat()
     path = inbox_dir / f"{today}.md"
 
-    text = args.text.strip()
-    if not text:
-        print("remember: empty text", file=sys.stderr)
-        return 2
     existing = parse_inbox_file(path) if path.exists() else []
     if any(e.text == text for e in existing):
-        print("already in inbox; nothing appended")
-        return 0
+        return RememberResult(None, "duplicate", path=path)
 
     meta = f"created={today}, last={today}"
-    if args.from_:
-        meta += f", from={args.from_}"
-    if args.session:
-        meta += f", session={args.session}"
-    if args.corrects:
-        meta += f", corrects={args.corrects}"
+    if from_:
+        meta += f", from={from_}"
+    if session:
+        meta += f", session={session}"
+    if corrects:
+        meta += f", corrects={corrects}"
+    entry_obj = InboxEntry(text, today, today, from_ or "pi", session or "", corrects or "")
     entry = f"{text}\n\n<!-- {meta} -->"
     with path.open("a", encoding="utf-8") as fh:
         if path.stat().st_size > 0:
             fh.write(f"\n{SEPARATOR}\n")
         fh.write(entry + "\n")
-    print(f"remembered -> inbox/{path.name}")
+    # SPEC §7.1 mitigation 1: the pending marker is written BEFORE reporting
+    # success. An entry that reaches the inbox but not the pending directory
+    # must surface as a failure to the caller, not a silent success -- the
+    # marker's absence is otherwise indistinguishable from "nothing to do".
+    try:
+        create_pending(corpus, entry_obj.entry_id)
+    except OSError as exc:
+        return RememberResult(entry_obj, "marker_failed", path=path, error=str(exc))
+    return RememberResult(entry_obj, "written", path=path)
+
+
+def cmd_remember(args) -> int:
+    corpus = _config_for(args).corpus_path
+    result = append_inbox_entry(corpus, args.text, from_=args.from_, session=args.session,
+                                corrects=args.corrects)
+    if result.status == "empty":
+        print("remember: empty text", file=sys.stderr)
+        return 2
+    if result.status == "duplicate":
+        print("already in inbox; nothing appended")
+        return 0
+    if result.status == "marker_failed":
+        print(f"remember: wrote inbox/{result.path.name} but failed to mark it "
+              f"pending ({result.error}) -- it will NOT be auto-promoted; run "
+              f"`alexandria reconcile` to recover it", file=sys.stderr)
+        return 1
+    print(f"remembered -> inbox/{result.path.name} (pending {result.entry.entry_id})")
     return 0
+
+
+def cmd_promote(args) -> int:
+    """The drain (§4): promote every currently-pending `remember` entry through
+    the crash-safe write-ordered pipeline in promote.py. Serve's /remember
+    handler calls promote_pending() directly (inline, scoped to one entry);
+    this subcommand is the offline fallback -- run on a timer, or by hand."""
+    config = _config_for(args)
+    corpus = config.corpus_path
+    embedder = _cached_embedder(config, corpus)
+    store = VectorStore(corpus / ".alexandria" / "index")
+    lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+    result = promote_pending(corpus, config, embedder, store, lexical)
+    if result.skipped_locked:
+        print("promote: write lock held by another process, skipped this run")
+        return 0
+    # Telemetry (§7): a completed cycle counts even with nothing to promote --
+    # that is still evidence the drain ran, which is what liveness.json proves.
+    liveness.record_success(corpus, promoted_count=len(result.promoted),
+                            generation=read_index_generation(corpus))
+    if not result.promoted and not result.errors:
+        print("promote: nothing pending")
+        return 0
+    for error in result.errors:
+        print(f"promote: {error}", file=sys.stderr)
+    if result.promoted:
+        plural = "y" if len(result.promoted) == 1 else "ies"
+        print(f"promote: {len(result.promoted)} entr{plural} promoted, "
+              f"{result.chunks_written} chunks written")
+    return 1 if result.errors else 0
+
+
+def cmd_serve(args) -> int:
+    """§5: run the warm HTTP server. Blocks until interrupted; the CLI itself
+    stays fully functional whether this is running or not (S6)."""
+    from .serve import NonLoopbackRefused, serve as serve_forever
+
+    config = _config_for(args)
+    unix_sockets: dict[str, str] = {}
+    for spec in args.unix_socket:
+        if "=" not in spec:
+            print(f"serve: --unix-socket expects IDENTITY=PATH, got {spec!r}", file=sys.stderr)
+            return 2
+        identity, sock_path = spec.split("=", 1)
+        unix_sockets[identity] = sock_path
+    try:
+        serve_forever(config.corpus_path, config=config, host=args.host, port=args.port,
+                      unix_sockets=unix_sockets)
+    except NonLoopbackRefused as exc:
+        print(f"serve: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_reconcile(args) -> int:
+    """§7.1's independent observer: every inbox/*.md entry must have a
+    matching document under sources/inbox/. An unpromoted entry with no
+    pending marker is genuinely stranded (nothing is tracking it) and gets
+    requeued; an unpromoted entry that IS correctly marked pending is normal
+    backlog, not a fault."""
+    corpus = _config_for(args).corpus_path
+    report = reconcile_inbox(corpus)
+    print(f"reconcile: {report.total_entries} entries in {report.total_files} files, "
+          f"{len(report.stranded)} stranded, {len(report.already_pending)} pending, "
+          f"{len(report.unreadable_files)} unreadable")
+    for name in report.unreadable_files:
+        print(f"reconcile: unreadable inbox file {name}", file=sys.stderr)
+    for entry_id in report.stranded:
+        print(f"reconcile: stranded entry {entry_id} (requeued)", file=sys.stderr)
+    return 0 if report.healthy else 1
 
 
 def cmd_index(args) -> int:
@@ -317,6 +429,7 @@ def cmd_index(args) -> int:
     gen = write_index_generation(corpus)
     print(f"index: corpus generation {gen} (query/response caches invalidated)")
     write_manifest(corpus, embedder, config.embed_provider)
+    liveness.record_success(corpus, promoted_count=0, generation=gen)
     if args.rebuild:
         _rebuild_marker(corpus).unlink(missing_ok=True)
     return 0
@@ -475,25 +588,38 @@ def cmd_search(args) -> int:
     return 0
 
 
-def cmd_answer(args) -> int:
-    """Synthesize a cited answer page for a question (phase-4 answer endpoint).
+@dataclass
+class AnswerOutcome:
+    """Shared result type for both `cmd_answer` (CLI, prints it) and serve's
+    /answer handler (§5, JSON-encodes it) -- the response cache, cost ledger,
+    and audit-trail logic live in `run_answer` exactly once so the two paths
+    cannot silently diverge."""
+    emitted: bool
+    text: str | None
+    n_claims: int
+    answer_id: str
+    cached: bool = False
+    error: str | None = None
+    failed_claims: list = None  # type: ignore[assignment]
 
-    Runs the full gather -> write -> judge -> repair pipeline over the indexed
-    corpus and prints the emitted page. The page is written to --save-dir (or a
-    temp dir) -- never into the private corpus wiki implicitly.
-    """
+
+def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int,
+              llm_model: str, grader_a_model: str, grader_b_model: str,
+              base_url: str | None, api_key_env: str | None, prompt_version: str,
+              save_dir: str | None = None, caller: str | None = None,
+              user: str | None = None) -> AnswerOutcome:
+    """Run the full gather -> write -> judge -> repair pipeline (or replay a
+    cached page) for one question against an already-built `engine`. No
+    printing; side effects are exactly what the spec requires (response
+    cache, audit log, cost ledger) and nothing else."""
     from .cache import ResponseCache
     from .llm import LLMClient
     from .synthesis.pipeline import run_pipeline
 
-    config = _config_for(args)
-    corpus = config.corpus_path
     answer_id = str(uuid.uuid4())
-    engine = _build_search_engine(config, corpus, corpus_root=corpus, client="answer")
     response_cache = ResponseCache(corpus)
     generation = read_index_generation(corpus)
-    rkey = response_cache.key(args.question, args.llm_model, args.k,
-                              args.prompt_version, generation)
+    rkey = response_cache.key(question, llm_model, k, prompt_version, generation)
 
     # RESPONSE CACHE: a previously-emitted answer for the same question/model
     # config is replayed verbatim (TTL 7d); the pipeline is skipped entirely.
@@ -501,39 +627,32 @@ def cmd_answer(args) -> int:
     # nothing to cost (SPEC F5).
     cached_page = response_cache.get(rkey)
     if cached_page is not None:
-        logger = AuditLogger(config.corpus_path)
-        logger.answer(query=args.question, total_ms=0, emitted=True,
-                      model=args.llm_model, n_claims=cached_page.get("n_claims", 0),
-                      stages={}, caller=args.caller, user=args.user,
+        logger = AuditLogger(corpus)
+        logger.answer(query=question, total_ms=0, emitted=True,
+                      model=llm_model, n_claims=cached_page.get("n_claims", 0),
+                      stages={}, caller=caller, user=user,
                       trace={"cache_hit": True}, id=answer_id)
-        print("[cached] " + cached_page["text"])
-        return 0
+        return AnswerOutcome(True, cached_page["text"], cached_page.get("n_claims", 0),
+                             answer_id, cached=True)
 
-    save_dir = Path(args.save_dir).expanduser() if args.save_dir else None
-    emit_root = save_dir if save_dir else Path(tempfile.mkdtemp(prefix="alexandria-answer-"))
+    save_path = Path(save_dir).expanduser() if save_dir else None
+    emit_root = save_path if save_path else Path(tempfile.mkdtemp(prefix="alexandria-answer-"))
 
-    writer = LLMClient(model=args.llm_model, base_url=args.base_url, api_key_env=args.api_key_env)
-    grader_a = LLMClient(model=args.grader_a_model, base_url=args.base_url, api_key_env=args.api_key_env)
-    grader_b = LLMClient(model=args.grader_b_model, base_url=args.base_url, api_key_env=args.api_key_env)
+    writer = LLMClient(model=llm_model, base_url=base_url, api_key_env=api_key_env)
+    grader_a = LLMClient(model=grader_a_model, base_url=base_url, api_key_env=api_key_env)
+    grader_b = LLMClient(model=grader_b_model, base_url=base_url, api_key_env=api_key_env)
     _t_answer0 = time.time()
     result = run_pipeline(
-        engine,
-        args.question,
-        gather_llm=writer,
-        writer_llm=writer,
-        repair_llm=writer,
-        audit_llm=grader_a,
-        coverage_llm_a=grader_a,
-        coverage_llm_b=grader_b,
-        corpus_root=emit_root,
-        seed_k=args.k,
-        writer_model=args.llm_model,
-        prompt_version=args.prompt_version,
+        engine, question,
+        gather_llm=writer, writer_llm=writer, repair_llm=writer,
+        audit_llm=grader_a, coverage_llm_a=grader_a, coverage_llm_b=grader_b,
+        corpus_root=emit_root, seed_k=k, writer_model=llm_model,
+        prompt_version=prompt_version,
     )
     total_ms = int((time.time() - _t_answer0) * 1000)
-    logger = AuditLogger(config.corpus_path)
+    logger = AuditLogger(corpus)
     verdict = getattr(result.repair, "verdict", None)
-    failed_ids = getattr(verdict, "failed_claim_ids", ()) or ()
+    failed_ids = list(getattr(verdict, "failed_claim_ids", ()) or ())
     page = getattr(result.repair, "page", None)
     n_claims = len(page.claims) if page else 0
     trace = _answer_trace(result)
@@ -542,29 +661,52 @@ def cmd_answer(args) -> int:
     # attribution the pipeline doesn't expose. Logged on BOTH outcomes below --
     # a failed synthesis still spent real tokens.
     if writer.last_usage:
-        engine.logger.log_usage(query_id=answer_id, model=args.llm_model, **writer.last_usage)
+        engine.logger.log_usage(query_id=answer_id, model=llm_model, **writer.last_usage)
     if not result.emitted:
-        logger.answer(query=args.question, total_ms=total_ms, emitted=False,
-                      model=args.llm_model, n_claims=n_claims,
-                      failed_claims=list(failed_ids),
+        logger.answer(query=question, total_ms=total_ms, emitted=False,
+                      model=llm_model, n_claims=n_claims, failed_claims=failed_ids,
                       error="synthesis failed its native checks",
                       stages=getattr(result, "timings_ms", {}),
-                      caller=args.caller, user=args.user, trace=trace, id=answer_id)
+                      caller=caller, user=user, trace=trace, id=answer_id)
+        return AnswerOutcome(False, None, n_claims, answer_id,
+                             error="synthesis failed its native checks", failed_claims=failed_ids)
+    page_text = result.page_path.read_text(encoding="utf-8")
+    logger.answer(query=question, total_ms=total_ms, emitted=True,
+                  model=llm_model, n_claims=n_claims,
+                  stages=getattr(result, "timings_ms", {}),
+                  caller=caller, user=user, trace=trace, id=answer_id)
+    response_cache.put(rkey, {"text": page_text, "n_claims": n_claims})
+    if not save_path:
+        shutil.rmtree(emit_root, ignore_errors=True)
+    return AnswerOutcome(True, page_text, n_claims, answer_id)
+
+
+def cmd_answer(args) -> int:
+    """Synthesize a cited answer page for a question (phase-4 answer endpoint).
+
+    Runs the full gather -> write -> judge -> repair pipeline over the indexed
+    corpus and prints the emitted page. The page is written to --save-dir (or a
+    temp dir) -- never into the private corpus wiki implicitly.
+    """
+    config = _config_for(args)
+    corpus = config.corpus_path
+    engine = _build_search_engine(config, corpus, corpus_root=corpus, client="answer")
+    outcome = run_answer(
+        config, corpus, args.question, engine=engine, k=args.k,
+        llm_model=args.llm_model, grader_a_model=args.grader_a_model,
+        grader_b_model=args.grader_b_model, base_url=args.base_url,
+        api_key_env=args.api_key_env, prompt_version=args.prompt_version,
+        save_dir=args.save_dir, caller=args.caller, user=args.user)
+    if outcome.cached:
+        print("[cached] " + outcome.text)
+        return 0
+    if not outcome.emitted:
         print("answer: synthesis failed its native checks; no page emitted.",
               file=sys.stderr)
-        for claim in (page.claims if page else []):
-            if claim.id in failed_ids:
-                print(f"  failed claim {claim.id}: {claim.text[:200]}", file=sys.stderr)
+        for claim_id in outcome.failed_claims or ():
+            print(f"  failed claim {claim_id}", file=sys.stderr)
         return 1
-    page_text = result.page_path.read_text(encoding="utf-8")
-    logger.answer(query=args.question, total_ms=total_ms, emitted=True,
-                  model=args.llm_model, n_claims=n_claims,
-                  stages=getattr(result, "timings_ms", {}),
-                  caller=args.caller, user=args.user, trace=trace, id=answer_id)
-    response_cache.put(rkey, {"text": page_text, "n_claims": n_claims})
-    print(page_text)
-    if not save_dir:
-        shutil.rmtree(emit_root, ignore_errors=True)
+    print(outcome.text)
     return 0
 
 
@@ -724,6 +866,11 @@ def _require_index(corpus: Path) -> None:
 def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True,
                          corpus_root: Path | None = None, client: str = "cli") -> SearchEngine:
     _require_index(corpus)
+    # §7: every invocation performs the liveness check and prints one line to
+    # stderr if stale -- never raises, never blocks results (gate W7).
+    live = liveness.check(corpus)
+    if live.stale:
+        print(f"alexandria: stale -- {live.reason}", file=sys.stderr)
     embedder = _cached_embedder(config, corpus)
     try:
         verify_manifest(corpus, embedder, config.embed_provider)
@@ -770,45 +917,11 @@ def _load_chunk_records(corpus: Path, config: AppConfig, limit: int, workers: in
     records: list[dict] = []
     errors: list[str] = []
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        for chunk_records, error in pool.map(lambda path: _chunk_path(path, corpus, config), paths):
+        for chunk_records, error in pool.map(lambda path: chunk_doc_records(path, corpus, config), paths):
             records.extend(chunk_records)
             if error:
                 errors.append(error)
     return records, errors
-
-
-def _chunk_path(path: Path, corpus: Path, config: AppConfig) -> tuple[list[dict], str | None]:
-    try:
-        document = Doc.read(path, root=corpus)
-        markdown = path.read_text(encoding="utf-8")
-    except (OSError, ValueError) as exc:
-        return [], f"{path.relative_to(corpus)}: {exc}"
-    metadata = _chunk_metadata(document.frontmatter, document.doc_id)
-    chunks = chunk_document(document.doc_id, markdown, config.chunk_tokens, config.chunk_overlap)
-    return [{
-        "chunk_id": chunk.chunk_id,
-        "doc_id": chunk.doc_id,
-        "text": chunk.text,
-        "heading_path": chunk.heading_path,
-        **metadata,
-    } for chunk in chunks], None
-
-
-def _chunk_metadata(frontmatter: dict, doc_id: str) -> dict:
-    generated = frontmatter.get("generated")
-    generated_at = frontmatter.get("generated_at")
-    if generated_at is None and isinstance(generated, dict):
-        generated_at = generated.get("at")
-    return {
-        "type": frontmatter.get("type"),
-        "project": frontmatter.get("project"),
-        "status": frontmatter.get("status"),
-        "source": frontmatter.get("source"),
-        "tags": list(frontmatter.get("tags") or []),
-        "entities": list(frontmatter.get("entities") or []),
-        "layer": "wiki" if doc_id.startswith("wiki/") else "sources",
-        "generated_at": generated_at,
-    }
 
 
 def _print_eval_error(message: str, *, as_json: bool) -> None:
@@ -892,8 +1005,24 @@ def build_parser() -> argparse.ArgumentParser:
                           help="source_id this entry corrects/supersedes")
     remember.set_defaults(func=cmd_remember)
 
+    promote = sub.add_parser("promote",
+                             help="drain: promote every currently-pending remember entry")
+    promote.set_defaults(func=cmd_promote)
+
+    reconcile = sub.add_parser("reconcile",
+                               help="independent check: every inbox entry has a promoted doc")
+    reconcile.set_defaults(func=cmd_reconcile)
+
     lint = sub.add_parser("lint", help="validate every document against the schema")
     lint.set_defaults(func=cmd_lint)
+
+    serve = sub.add_parser("serve", help="stdlib HTTP server: /health /search /answer /remember")
+    serve.add_argument("--host", default=os.environ.get("ALEXANDRIA_SERVE_HOST", "127.0.0.1"))
+    serve.add_argument("--port", type=int, default=int(os.environ.get("ALEXANDRIA_SERVE_PORT", "8420")))
+    serve.add_argument("--unix-socket", action="append", default=[],
+                       metavar="IDENTITY=PATH",
+                       help="one Unix socket per client identity (§5.3); repeatable")
+    serve.set_defaults(func=cmd_serve)
 
     index = sub.add_parser("index", help="chunk, embed, and index the corpus")
     index.add_argument("--rebuild", action="store_true", help="recreate index tables (retain embedding cache)")
