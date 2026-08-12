@@ -135,6 +135,36 @@ def test_s1_health_returns_200_with_cross_checked_chunk_counts(tmp_path, monkeyp
         assert body["chunk_count_lancedb"] == body["chunk_count_fts5"]
         assert body["chunk_counts_agree"] is True
         assert body["chunk_count_lancedb"] > 0
+        # S1's precise wording: cross-checked against BOTH the FTS row count
+        # AND an independent source-document walk -- not merely echoed from
+        # the single LanceDB handle the request already trusted. The
+        # source-doc walk catches a failure LanceDB-vs-FTS5 agreement never
+        # could: both derived indexes silently frozen together while real
+        # documents keep changing on disk.
+        assert body["source_document_count"] == 1
+        assert body["distinct_documents_indexed"] == 1
+        assert body["source_documents_agree"] is True
+
+
+def test_s1_the_source_document_walk_actually_catches_a_frozen_index(tmp_path, monkeypatch):
+    """Proves source_documents_agree is a REAL check, not decoration: add a
+    second source document on disk WITHOUT reindexing, and the independent
+    walk must disagree with what the (now stale) index believes exists --
+    exactly the failure LanceDB-vs-FTS5 agreement is structurally blind to,
+    since both derived indexes are frozen together."""
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    addr = tcp_server.server_address
+
+    with _running(tcp_server, uds_servers):
+        extra = corpus / "sources" / "unindexed.md"
+        extra.write_text("---\nsource: test\n---\n\nA document that never gets indexed.\n")
+
+        status, body = _request(addr, "GET", "/health")
+        assert status == 200
+        assert body["source_document_count"] == 2
+        assert body["distinct_documents_indexed"] == 1
+        assert body["source_documents_agree"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +219,46 @@ def test_s3_warm_search_is_well_under_half_a_second(tmp_path, monkeypatch):
         elapsed = time.monotonic() - started
         assert status == 200
         assert elapsed < 0.5, f"warm search took {elapsed:.3f}s, vs a measured 25-33s cold path"
+
+
+def test_s3_the_model_loads_exactly_once_across_many_requests(tmp_path, monkeypatch):
+    """S3's precise wording: OBSERVED by counting loader invocations, not
+    inferred from latency -- fast requests would also look fine if a
+    second model got loaded and cached under a slightly different key
+    (e.g. by accident, a half_precision mismatch), since the cache would
+    still make request 3..N fast. Only counting the actual constructor
+    calls proves there is exactly one model in memory."""
+    import sentence_transformers
+
+    import alexandria.retrieval.rerank as rerank_mod
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    addr = tcp_server.server_address
+
+    # Force a cold load for THIS test regardless of what earlier tests in
+    # this same process already warmed into the shared cache.
+    cache_key = (ctx.config.rerank_model, True)
+    rerank_mod._MODEL_CACHE.pop(cache_key, None)
+
+    load_count = 0
+    original_ctor = sentence_transformers.CrossEncoder
+
+    def counting_ctor(*args, **kwargs):
+        nonlocal load_count
+        load_count += 1
+        return original_ctor(*args, **kwargs)
+
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", counting_ctor)
+
+    with _running(tcp_server, uds_servers):
+        for i in range(5):
+            status, body = _request(addr, "POST", "/search", {"query": f"example gateway {i}"}, timeout=60.0)
+            assert status == 200
+
+    assert load_count == 1, (
+        f"CrossEncoder constructor invoked {load_count} times across 5 requests "
+        f"to the SAME server -- should be exactly 1")
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +369,19 @@ def test_s7_identity_comes_from_the_socket_not_a_spoofed_body_field(tmp_path, mo
         content = entries[0].read_text()
         assert "from=identity-a" in content
         assert "attacker-controlled-name" not in content
+
+        # S7's second half: a request over TCP is recorded under the RESERVED
+        # "local-anonymous" identity, not blank, not inherited from whichever
+        # UDS identity happened to be requested first, and not spoofable
+        # either.
+        tcp_addr = tcp_server.server_address
+        status, body = _request(tcp_addr, "POST", "/remember",
+                                {"text": "Spoofing test fact two.", "from": "also-attacker-controlled"})
+        assert status == 200
+        entries_after = [p for p in corpus.glob("inbox/*.md")]
+        combined = "\n".join(p.read_text() for p in entries_after)
+        assert "from=local-anonymous" in combined
+        assert "also-attacker-controlled" not in combined
 
 
 # ---------------------------------------------------------------------------

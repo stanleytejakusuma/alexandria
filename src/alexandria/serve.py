@@ -119,14 +119,39 @@ def _json_ok(status: int, payload: dict) -> tuple[int, bytes, str]:
     return status, json.dumps(payload).encode(), "application/json"
 
 
+def _source_document_count(corpus: Path) -> int:
+    """An independent walk of sources/+wiki/ ON DISK -- not derived from
+    either index. Counts markdown FILES, not chunks: re-chunking here would
+    duplicate the cost /health exists to let callers avoid paying, and a
+    per-document count is what a distinct-doc_id count from either index
+    can be meaningfully compared against."""
+    count = 0
+    for sub in ("sources", "wiki"):
+        base = corpus / sub
+        if base.is_dir():
+            count += sum(1 for _ in base.rglob("*.md"))
+    return count
+
+
 def _health_payload(ctx: ServeContext) -> dict:
-    """S1: the reported chunk count is cross-checked against a second,
-    independent source (FTS5's row count) rather than echoed from a single
-    handle the request already trusted -- the same LanceDB/FTS5 agreement
-    invariant gate W3 exercises on the write path, applied here as a read
-    path health signal."""
+    """S1: the reported chunk count is cross-checked against TWO
+    independent sources -- FTS5's row count, and a walk of sources/+wiki/ on
+    disk -- rather than echoed from the single LanceDB handle the request
+    already trusted. FTS5 agreement catches the write-path failure gate W3
+    exercises (the two derived indexes disagreeing); the source-document
+    walk catches a different failure entirely: an index that is INTERNALLY
+    consistent (Lance and FTS5 agree with each other) but has silently
+    stopped seeing new or deleted documents on disk -- something no
+    LanceDB-vs-FTS5 comparison could ever detect, since both are built from
+    the same walk."""
     lance_count = ctx.store.count()
     fts_count = ctx.lexical.connection.execute("SELECT COUNT(*) FROM chunk_metadata").fetchone()[0]
+    # chunk_metadata has no doc_id column (index/bm25.py's schema); chunk_id
+    # is `{doc_id}#{10-hex-hash}` (index/chunker.py), so doc_id is derived by
+    # stripping the hash suffix rather than adding a column just for this.
+    chunk_ids = ctx.lexical.connection.execute("SELECT chunk_id FROM chunk_metadata").fetchall()
+    distinct_docs_indexed = len({row[0].rsplit("#", 1)[0] for row in chunk_ids})
+    source_doc_count = _source_document_count(ctx.corpus)
     live = liveness.check(ctx.corpus)
     return {
         "status": "degraded" if live.stale else "ok",
@@ -134,6 +159,9 @@ def _health_payload(ctx: ServeContext) -> dict:
         "chunk_count_lancedb": lance_count,
         "chunk_count_fts5": fts_count,
         "chunk_counts_agree": lance_count == fts_count,
+        "source_document_count": source_doc_count,
+        "distinct_documents_indexed": distinct_docs_indexed,
+        "source_documents_agree": source_doc_count == distinct_docs_indexed,
         "uptime_seconds": round(time.monotonic() - ctx.started_monotonic, 1),
         "liveness_stale": live.stale,
         "liveness_reason": live.reason,

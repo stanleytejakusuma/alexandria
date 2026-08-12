@@ -36,6 +36,17 @@ class BM25Index:
         self.connection.execute("PRAGMA journal_mode=WAL")
         mode = self.connection.execute("PRAGMA journal_mode").fetchone()[0]
         self.wal_active = str(mode).lower() == "wal"
+        # Known narrow gap (found via a real two-process repro, gate F1):
+        # busy_timeout is itself set by a PRAGMA statement, so it cannot
+        # protect the handful of statements executed before it -- if two
+        # processes race to create the SAME brand-new database file (its
+        # very first-ever write, before WAL is durably active), one can
+        # still see "database is locked" on this constructor. In practice
+        # this cannot happen on the promote path: promote.py holds the
+        # §4.2 flock around its whole write sequence, so no second promote
+        # is ever concurrently constructing a BM25Index against the same
+        # file. It remains possible only if some future writer bypasses
+        # that lock entirely on a corpus's first-ever index.
         self.connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, text)")
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS chunk_metadata ("
