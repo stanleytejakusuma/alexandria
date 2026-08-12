@@ -44,6 +44,7 @@ from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbe
 from .index.manifest import ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest, write_manifest
 from .index.store import VectorStore
 from . import liveness
+from .backup import backup_state, restore_state
 from .llm import LLMClient
 from .migrate import migrate_kg_sync
 from .monitor import QueryLogger
@@ -329,6 +330,32 @@ def cmd_reconcile(args) -> int:
     for entry_id in report.stranded:
         print(f"reconcile: stranded entry {entry_id} (requeued)", file=sys.stderr)
     return 0 if report.healthy else 1
+
+
+def cmd_backup(args) -> int:
+    """§6: back up `.alexandria` STATE only -- never the rebuildable indexes
+    (chunks.lance, fts.sqlite). See backup.STATE_PATHS for the exact list."""
+    corpus = _config_for(args).corpus_path
+    result = backup_state(corpus, Path(args.dest))
+    print(f"backup: wrote {result.archive_path} ({len(result.included)} paths)")
+    for rel in result.included:
+        print(f"backup: included {rel}")
+    for rel in result.missing:
+        print(f"backup: skipped {rel} (not present)", file=sys.stderr)
+    return 0
+
+
+def cmd_restore(args) -> int:
+    """§6/B1: restore `.alexandria` STATE from a backup_state() archive.
+    Overwrites in place unless --dry-run. Refuses to touch anything outside
+    the fixed STATE_PATHS allowlist regardless of what the archive contains."""
+    corpus = _config_for(args).corpus_path
+    result = restore_state(corpus, Path(args.archive), dry_run=args.dry_run)
+    verb = "would restore" if args.dry_run else "restored"
+    print(f"restore: {verb} {len(result.restored)} paths from {args.archive}")
+    for name in result.restored:
+        print(f"restore: {verb} {name}")
+    return 0
 
 
 def cmd_index(args) -> int:
@@ -1012,6 +1039,15 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile = sub.add_parser("reconcile",
                                help="independent check: every inbox entry has a promoted doc")
     reconcile.set_defaults(func=cmd_reconcile)
+
+    backup = sub.add_parser("backup", help="back up .alexandria state (never the rebuildable indexes)")
+    backup.add_argument("dest", help="path to write the .tar.gz archive")
+    backup.set_defaults(func=cmd_backup)
+
+    restore = sub.add_parser("restore", help="restore .alexandria state from a backup archive")
+    restore.add_argument("archive", help="path to a backup_state() .tar.gz archive")
+    restore.add_argument("--dry-run", action="store_true", help="list what would be restored, write nothing")
+    restore.set_defaults(func=cmd_restore)
 
     lint = sub.add_parser("lint", help="validate every document against the schema")
     lint.set_defaults(func=cmd_lint)
