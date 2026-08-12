@@ -115,3 +115,11 @@ code by two independent audits.
 | 8 | Real attribution, structurally verified | **Advanced, still open.** `serve` now derives identity from the socket (one Unix socket per identity; TCP → reserved `local-anonymous`) and never from the request body, and the inbox sink rejects payloads that could forge entry structure or attribution (`1386c46`, extended to `from_`). What remains: `--user`/`--caller` are still unverified passthrough hints on the CLI path, which is the "worse than absent" trail this item names. |
 | 9 | Citation-linkage build-out | **Untouched.** Still open. |
 | 10 | Procurement floor | **Untouched.** Still open. |
+
+### P1 items closed since (2026-08-13)
+
+| # | Item | Status now |
+|---|---|---|
+| 17 | CLI attribution | **Closed** by `664d896` — `--user` deleted rather than validated (it defaulted to an env var, was written verbatim to `search.jsonl`, and nothing consumed it); identity now derived from the OS user. This is the CLI half of #8. |
+| 21 | Golden set structurally blind | **Substantially closed** by `3357fdd`. 22 hand-verified negative cases now exist and the gate fires on precision, not just recall: `regressions()` reports named unanswerable queries the engine grew more confident about. Measured separation — positive top-1 median 0.9819 vs negative 0.0238 — resolved spec Q5 (relevance floor 0.12). **What remains:** n=49 is still underpowered and there is still no significance bar, so a small recall move is not distinguishable from noise. #29 (offline policy tuning) is unblocked on the precision half only. |
+| 20 | Golden set not in repo | **Unchanged, now wider.** `negative-v1.jsonl` also lives in the corpus rather than the repo, so neither half of the gate is independently reproducible by a third party. |
