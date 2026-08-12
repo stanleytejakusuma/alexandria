@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -440,7 +441,7 @@ def _run_index_pipeline(records: list[dict], embedder, store, lexical, *, batch_
 def cmd_search(args) -> int:
     config = _config_for(args)
     corpus = config.corpus_path
-    engine = _build_search_engine(config, corpus)
+    engine = _build_search_engine(config, corpus, client="search")
     filters = {field: value for field, value in {
         "type": args.type, "project": args.project, "layer": args.layer,
     }.items() if value is not None}
@@ -473,7 +474,8 @@ def cmd_answer(args) -> int:
 
     config = _config_for(args)
     corpus = config.corpus_path
-    engine = _build_search_engine(config, corpus, corpus_root=corpus)
+    answer_id = str(uuid.uuid4())
+    engine = _build_search_engine(config, corpus, corpus_root=corpus, client="answer")
     response_cache = ResponseCache(corpus)
     generation = read_index_generation(corpus)
     rkey = response_cache.key(args.question, args.llm_model, args.k,
@@ -481,13 +483,15 @@ def cmd_answer(args) -> int:
 
     # RESPONSE CACHE: a previously-emitted answer for the same question/model
     # config is replayed verbatim (TTL 7d); the pipeline is skipped entirely.
+    # No LLM call happens on this path, so no ledger row is written -- there is
+    # nothing to cost (SPEC F5).
     cached_page = response_cache.get(rkey)
     if cached_page is not None:
         logger = AuditLogger(config.corpus_path)
         logger.answer(query=args.question, total_ms=0, emitted=True,
                       model=args.llm_model, n_claims=cached_page.get("n_claims", 0),
                       stages={}, caller=args.caller, user=args.user,
-                      trace={"cache_hit": True})
+                      trace={"cache_hit": True}, id=answer_id)
         print("[cached] " + cached_page["text"])
         return 0
 
@@ -519,13 +523,19 @@ def cmd_answer(args) -> int:
     page = getattr(result.repair, "page", None)
     n_claims = len(page.claims) if page else 0
     trace = _answer_trace(result)
+    # COST LEDGER (SPEC F5): the writer client is the primary answer-generation
+    # model and the one cost worth tracking without inventing multi-model
+    # attribution the pipeline doesn't expose. Logged on BOTH outcomes below --
+    # a failed synthesis still spent real tokens.
+    if writer.last_usage:
+        engine.logger.log_usage(query_id=answer_id, model=args.llm_model, **writer.last_usage)
     if not result.emitted:
         logger.answer(query=args.question, total_ms=total_ms, emitted=False,
                       model=args.llm_model, n_claims=n_claims,
                       failed_claims=list(failed_ids),
                       error="synthesis failed its native checks",
                       stages=getattr(result, "timings_ms", {}),
-                      caller=args.caller, user=args.user, trace=trace)
+                      caller=args.caller, user=args.user, trace=trace, id=answer_id)
         print("answer: synthesis failed its native checks; no page emitted.",
               file=sys.stderr)
         for claim in (page.claims if page else []):
@@ -536,7 +546,7 @@ def cmd_answer(args) -> int:
     logger.answer(query=args.question, total_ms=total_ms, emitted=True,
                   model=args.llm_model, n_claims=n_claims,
                   stages=getattr(result, "timings_ms", {}),
-                  caller=args.caller, user=args.user, trace=trace)
+                  caller=args.caller, user=args.user, trace=trace, id=answer_id)
     response_cache.put(rkey, {"text": page_text, "n_claims": n_claims})
     print(page_text)
     if not save_dir:
@@ -698,7 +708,7 @@ def _require_index(corpus: Path) -> None:
 
 
 def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True,
-                         corpus_root: Path | None = None) -> SearchEngine:
+                         corpus_root: Path | None = None, client: str = "cli") -> SearchEngine:
     _require_index(corpus)
     return SearchEngine(
         _cached_embedder(config, corpus),
@@ -710,6 +720,7 @@ def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = Tr
         QueryLogger(corpus / ".alexandria" / "queries.sqlite"),
         query_cache=QueryCache(corpus) if query_cache else None,
         corpus_root=corpus_root or corpus,
+        client=client,
     )
 
 

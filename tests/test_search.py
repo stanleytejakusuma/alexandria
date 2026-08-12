@@ -241,3 +241,50 @@ def test_reindex_invalidates_cache_for_a_long_lived_engine(tmp_path: Path):
     assert engine.last_cache_hit == 0, (
         "after a reindex the warm engine served a stale cached result"
     )
+
+
+class _RecordingLogger:
+    def __init__(self):
+        self.calls = []
+
+    def log(self, **kwargs):
+        self.calls.append(kwargs)
+        return True
+
+
+def test_client_attribution_distinguishes_search_from_answer_retrieval(tmp_path: Path):
+    """SPEC F3: cache_hit=1 rows must be splittable by which caller retrieved --
+    a genuine sub-10ms search-cache hit vs. a retrieval leg inside /answer.
+    Previously every caller shared the SearchEngine default client="cli", a dead
+    discriminator (queries.sqlite showed 100% client='cli' with 2,377 rows).
+    Mutation check: drop the client= kwarg passed to SearchEngine's constructor
+    (or the logger.log call) and this test fails on the second assertion.
+    """
+    from alexandria.cache import QueryCache
+
+    embedder = HashEmbedder(dim=24)
+    vectors = embedder.embed(
+        ["sweep page fails lint", "sweep page retry lint", "unrelated notes"])
+    rows = [
+        record("sources/a", "sources/a", "sweep page fails lint", vectors[0], project="core"),
+        record("wiki/a", "wiki/a", "sweep page retry lint", vectors[1], project="core"),
+        record("sources/b", "sources/b", "unrelated notes", vectors[2], project="other"),
+    ]
+    store = VectorStore(tmp_path / "index")
+    store.upsert(rows)
+    lexical = BM25Index(tmp_path / "fts.sqlite")
+    lexical.index(rows)
+    recording_logger = _RecordingLogger()
+    engine = SearchEngine(embedder, store, lexical, IdentityReranker(),
+                          SearchConfig(prefetch=5, top_k=2, wiki_boost=1.25),
+                          logger=recording_logger,
+                          query_cache=QueryCache(tmp_path), client="answer",
+                          corpus_root=tmp_path)
+
+    engine.search("sweep page fails lint")
+
+    assert recording_logger.calls, "logger.log must be invoked"
+    assert all(call["client"] == "answer" for call in recording_logger.calls), (
+        "a SearchEngine built with client='answer' must attribute every logged "
+        "query to 'answer', not the old dead-default 'cli'"
+    )

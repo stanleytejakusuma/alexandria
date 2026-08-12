@@ -74,7 +74,11 @@ def write_index_generation(corpus: str | Path) -> int:
 def _db(corpus: str | Path, name: str) -> sqlite3.Connection:
     d = Path(corpus).expanduser() / _CACHE_DIR
     d.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(d / name)
+    con = sqlite3.connect(d / name, check_same_thread=False)
+    # See index/bm25.py §3.1: wait for a concurrent writer instead of raising
+    # "database is locked" immediately.
+    con.execute("PRAGMA busy_timeout=5000")
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute(_SCHEMA)
     con.commit()
     return con

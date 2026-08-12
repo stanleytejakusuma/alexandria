@@ -42,10 +42,10 @@ class AuditLogger:
                model: str, n_claims: int = 0, failed_claims: list[str] | None = None,
                error: str = "", stages: dict[str, int] | None = None,
                caller: str = "cli", user: str = "local",
-               trace: dict | None = None) -> None:
+               trace: dict | None = None, id: str = "") -> None:
         self._append("answers", {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "kind": "answer", "query": query, "total_ms": total_ms,
+            "kind": "answer", "id": id, "query": query, "total_ms": total_ms,
             "emitted": emitted, "model": model, "n_claims": n_claims,
             "failed_claims": failed_claims or [], "error": error,
             "stages": stages or {}, "caller": caller, "user": user,

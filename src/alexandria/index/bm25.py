@@ -26,7 +26,16 @@ class BM25Index:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        # busy_timeout makes a concurrent writer WAIT for the lock instead of
+        # raising "database is locked" immediately -- the literal prerequisite
+        # for a second writer (SPEC-write-path-and-serve.md §3.1). journal_mode
+        # is verified, not assumed: WAL can silently fail to engage on some
+        # filesystems (e.g. certain network mounts), and a caller depending on
+        # concurrent readers-during-write needs to know if it didn't.
+        self.connection.execute("PRAGMA busy_timeout=5000")
         self.connection.execute("PRAGMA journal_mode=WAL")
+        mode = self.connection.execute("PRAGMA journal_mode").fetchone()[0]
+        self.wal_active = str(mode).lower() == "wal"
         self.connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, text)")
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS chunk_metadata ("

@@ -170,6 +170,10 @@ class _SQLiteVectorStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path, check_same_thread=False)
+        # See index/bm25.py §3.1: wait for a concurrent writer instead of
+        # raising "database is locked" immediately.
+        self.connection.execute("PRAGMA busy_timeout=5000")
+        self.connection.execute("PRAGMA journal_mode=WAL")
         self._create()
 
     def _create(self) -> None:

@@ -17,11 +17,11 @@ class QueryLogger:
         self.path = Path(path)
 
     def log(self, *, query: str, filters: Mapping, tier: str, retrieved_ids: Sequence[str],
-            scores: Sequence[float], latency_ms: float, cache_hit: bool, client: str) -> bool:
+            scores: Sequence[float], latency_ms: float, cache_hit: int, client: str) -> bool:
         """Append a query record, returning false rather than disrupting retrieval on error."""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(self.path) as connection:
+            with self._connect() as connection:
                 connection.execute(
                     "CREATE TABLE IF NOT EXISTS queries ("
                     "query_id TEXT PRIMARY KEY, ts TEXT NOT NULL, q TEXT NOT NULL, filters TEXT NOT NULL, "
@@ -37,3 +37,38 @@ class QueryLogger:
             return True
         except (OSError, sqlite3.Error):
             return False
+
+    def log_usage(self, *, query_id: str, model: str, prompt_tokens: int, completion_tokens: int,
+                  total_tokens: int, cache_read: int = 0) -> bool:
+        """Record LLM token usage for one /answer call, joinable to its query_id (SPEC F5).
+
+        No dollar cost is computed or stored: this repo has no pricing table anywhere
+        (verified by grep), and inventing one would fabricate a number nobody measured.
+        Tokens are the durable fact; a rate file can turn them into cost later without
+        needing to have existed at write time.
+        """
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self._connect() as connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS usage ("
+                    "id TEXT PRIMARY KEY, query_id TEXT NOT NULL, ts TEXT NOT NULL, model TEXT NOT NULL, "
+                    "prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL, "
+                    "total_tokens INTEGER NOT NULL, cache_read INTEGER NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO usage VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), query_id, datetime.now(timezone.utc).isoformat(), model,
+                     int(prompt_tokens), int(completion_tokens), int(total_tokens), int(cache_read)),
+                )
+            return True
+        except (OSError, sqlite3.Error):
+            return False
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path)
+        # See index/bm25.py §3.1: wait for a concurrent writer instead of
+        # raising "database is locked" immediately.
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA journal_mode=WAL")
+        return connection

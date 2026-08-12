@@ -226,6 +226,10 @@ class CachedEmbedder:
         self.cache_path = Path(cache_path)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(self.cache_path, check_same_thread=False)
+        # See index/bm25.py §3.1: wait for a concurrent writer instead of raising
+        # "database is locked" immediately.
+        self._connection.execute("PRAGMA busy_timeout=5000")
+        self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute(
             "CREATE TABLE IF NOT EXISTS embeddings (cache_key TEXT PRIMARY KEY, vector TEXT NOT NULL)"
         )
