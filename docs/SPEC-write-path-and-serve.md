@@ -632,7 +632,30 @@ Each gate is a test, not a claim.
   response-cache hit (no LLM call, nothing to cost).
 - **F6** A `remember` that writes the inbox entry but fails to write the pending marker
   reports failure to its caller; and the reconcile detects an inbox entry with no
-  promoted document **without consulting the pending list**.
+  promoted document **without treating the presence of a pending marker as
+  sufficient evidence of health**.
+
+  *Amended 2026-08-13 (ratified).* The original wording was "without consulting
+  the pending list", which the implementation does not satisfy literally and
+  should not. Detection is already independent — `reconcile` derives
+  unpromoted-ness from the artifacts (`all((corpus / doc.path).exists())`), not
+  from the marker — and it consults the list only to *classify* an entry it has
+  already detected as ordinary backlog rather than stranded. Removing that
+  classification would report "unhealthy" on every corpus with queued work,
+  which trains operators to ignore the signal.
+
+  But the original wording was protecting something real, and it is not
+  hypothetical: on 2026-08-13 nine entries sat marked-pending for 3.3 hours
+  because **nothing implemented the 600s drain they were waiting for**. Every
+  one would have been classified `already_pending` — healthy — by a boolean
+  marker check. The health endpoint caught it; `reconcile` did not.
+
+  The binding rule is therefore a time bound, reusing
+  `liveness.DEFAULT_DRAIN_INTERVAL_SECONDS`, the same threshold the health
+  surface already applies: unpromoted with no marker is **stranded**;
+  unpromoted with a marker older than 2x the drain interval is **also
+  stranded**; unpromoted with a fresh marker is ordinary backlog. A marker may
+  downgrade severity only while it is young enough to still be plausible.
 
 **Write path**
 - **W1** `remember` returns in under 500 ms and does not load the embedding model.

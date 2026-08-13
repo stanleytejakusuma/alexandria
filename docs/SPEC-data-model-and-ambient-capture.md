@@ -716,7 +716,13 @@ latency finding being closed.
 
 ## 7. Phase 5 — erasure
 
-Blocked on §9 Q1. Tombstones (§3.2) remove a record from *retrieval*; erasure
+**Scope set by §9 Q1 (ratified 2026-08-13): tombstone-first.** This phase
+delivers removal from the retrievable surface only. Removal from *existence* is
+deliberately out of scope here; the Q1 rider that could require it binds
+**Phase 3**, not this phase, because it changes how records are written rather
+than how they are deleted.
+
+Tombstones (§3.2) remove a record from *retrieval*; erasure
 removes it from *existence*. A document survives in: `sources/*.md`,
 `chunks.lance`, `fts.sqlite`, `enrichment.sqlite`, `queries.sqlite`
 (`retrieved_ids`, which is also the learning signal), corpus git history, `wiki/`
