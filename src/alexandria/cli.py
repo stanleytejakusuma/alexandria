@@ -45,7 +45,8 @@ from .eval.runner import EvalReport, run_eval
 from .index.bm25 import BM25Index, searchable_text
 from .index.chunker import chunk_doc_records, chunk_document, is_indexable_source
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
-from .index.manifest import ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest, write_manifest
+from .index.manifest import (ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest,
+                             verify_manifest_for_write, write_manifest)
 from .index.store import VectorStore
 from . import liveness
 from .backup import backup_state, restore_state
@@ -274,10 +275,24 @@ def append_inbox_entry(corpus: Path, text: str, *, from_: str | None = None,
         meta += f", corrects={corrects}"
     entry_obj = InboxEntry(text, today, today, from_ or "pi", session or "", corrects or "")
     entry = f"{text}\n\n<!-- {meta} -->"
-    with path.open("a", encoding="utf-8") as fh:
-        if path.stat().st_size > 0:
-            fh.write(f"\n{SEPARATOR}\n")
-        fh.write(entry + "\n")
+    # One atomic O_APPEND write, not a size check plus two writes. serve is a
+    # ThreadingHTTPServer and this append is not under the write lock (taking
+    # it would fail every remember that races a drain, breaking W1's <500ms),
+    # so an interleave here permanently fuses two facts into one entry in a
+    # corpus with no deletion path. The separator is written unconditionally --
+    # deciding on file size is the race -- and the empty leading chunk that
+    # produces on a fresh file is dropped by _parse_inbox_text.
+    payload = f"\n{SEPARATOR}\n{entry}\n".encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        written = os.write(fd, payload)
+    finally:
+        os.close(fd)
+    if written != len(payload):
+        # A short write leaves a torn entry that a concurrent append can
+        # interleave into; say so rather than reporting success.
+        return RememberResult(None, "marker_failed", path=path,
+                              error=f"short write to {path}: {written}/{len(payload)} bytes")
     # SPEC §7.1 mitigation 1: the pending marker is written BEFORE reporting
     # success. An entry that reaches the inbox but not the pending directory
     # must surface as a failure to the caller, not a silent success -- the
@@ -498,6 +513,13 @@ def cmd_index(args) -> int:
                 "rebuild set contains duplicate chunk_id(s); append would insert "
                 f"every copy: {dupes}")
     embedder = _cached_embedder(config, corpus)
+    # F4 on the write path: refuse BEFORE embedding, or this run writes foreign
+    # vectors into the existing column and then rewrites the manifest to match,
+    # after which the read-path guard passes forever over a mixed vector space.
+    try:
+        verify_manifest_for_write(corpus, embedder, config.embed_provider, store)
+    except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
+        raise SystemExit(f"alexandria: {exc}") from exc
     started = time.monotonic()
     stats = _run_index_pipeline(records, embedder, store, lexical,
                                 batch_size=config.embed_batch_size,

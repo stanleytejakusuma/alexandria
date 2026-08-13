@@ -118,6 +118,24 @@ def read_manifest(corpus: str | Path) -> dict[str, Any] | None:
         raise ManifestCorrupt(f"{path} exists but could not be parsed: {exc}") from exc
 
 
+def verify_manifest_for_write(corpus: str | Path, embedder, provider: str, store) -> None:
+    """Guard the WRITE path: refuse to add vectors to a non-empty index that a
+    different model built.
+
+    verify_manifest() guards readers, but a reader can only observe corruption a
+    writer already committed -- and an index run then overwrites the manifest to
+    match whatever it just wrote, so the read-path guard passes forever after.
+    The guard has to sit where the damage is done.
+
+    An empty index has no vectors to disagree with, so both a missing manifest
+    and a provider change are legitimate there; the manifest is written at the
+    end of the run. That also covers --rebuild, which drops the table first.
+    """
+    if store.count() == 0:
+        return
+    verify_manifest(corpus, embedder, provider)
+
+
 def verify_manifest(corpus: str | Path, embedder, provider: str) -> None:
     """Refuse loudly on a missing or mismatched manifest (gate F4).
 

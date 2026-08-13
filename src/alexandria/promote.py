@@ -37,6 +37,7 @@ from typing import Callable
 from .cache import write_index_generation
 from .connectors.inbox import InboxConnector
 from .index.chunker import chunk_doc_records
+from .index.manifest import read_manifest, verify_manifest_for_write, write_manifest
 from .pending import list_pending, unlink_pending
 from .writelock import write_lock
 
@@ -84,6 +85,19 @@ def promote_pending(corpus, config, embedder, store, lexical, *,
         result.skipped_locked = True
         return result
     try:
+        # Same F4 write-path guard as cmd_index: a drain running under a
+        # different --embed-provider would otherwise pollute the vector space
+        # silently. serve verifies at startup (S9); cmd_promote builds its own.
+        verify_manifest_for_write(corpus, embedder, config.embed_provider, store)
+        if read_manifest(corpus) is None:
+            # promote is a writer, so it must claim the vector space it is about
+            # to populate. Written BEFORE any vector lands: a corpus reached
+            # only through remember+promote (never `alexandria index`) would
+            # otherwise end up non-empty with no manifest, and every subsequent
+            # promote would refuse forever. Claiming first also survives a crash
+            # at any of the five write-order points, where claiming afterwards
+            # would leave exactly that unrecoverable state.
+            write_manifest(corpus, embedder, config.embed_provider)
         conn = InboxConnector(inbox_dir=corpus / "inbox")
         wanted = set(ids)
         items_by_id = {}
