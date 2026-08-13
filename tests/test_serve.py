@@ -256,13 +256,15 @@ def test_s3_the_model_loads_exactly_once_across_many_requests(tmp_path, monkeypa
     import alexandria.retrieval.rerank as rerank_mod
 
     corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
-    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
-    addr = tcp_server.server_address
 
     # Force a cold load for THIS test regardless of what earlier tests in
-    # this same process already warmed into the shared cache.
-    cache_key = (ctx.config.rerank_model, True)
-    rerank_mod._MODEL_CACHE.pop(cache_key, None)
+    # this same process already warmed into the shared cache. Both the clear
+    # and the counter must be installed BEFORE bind(): since 2026-08-13 the
+    # single load happens at STARTUP, not on request 1, so a counter armed
+    # after bind() sees zero constructor calls and proves nothing. The
+    # assertion is unchanged and now covers strictly more -- exactly one
+    # model across startup AND five requests, not across five requests alone.
+    rerank_mod._MODEL_CACHE.clear()
 
     load_count = 0
     original_ctor = sentence_transformers.CrossEncoder
@@ -274,14 +276,17 @@ def test_s3_the_model_loads_exactly_once_across_many_requests(tmp_path, monkeypa
 
     monkeypatch.setattr(sentence_transformers, "CrossEncoder", counting_ctor)
 
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    addr = tcp_server.server_address
+
     with _running(tcp_server, uds_servers):
         for i in range(5):
             status, body = _request(addr, "POST", "/search", {"query": f"example gateway {i}"}, timeout=60.0)
             assert status == 200
 
     assert load_count == 1, (
-        f"CrossEncoder constructor invoked {load_count} times across 5 requests "
-        f"to the SAME server -- should be exactly 1")
+        f"CrossEncoder constructor invoked {load_count} times across startup "
+        f"plus 5 requests to the SAME server -- should be exactly 1")
 
 
 # ---------------------------------------------------------------------------
@@ -642,3 +647,32 @@ def test_startup_warms_the_embedding_provider_bypassing_the_cache(tmp_path, monk
 
     assert len(calls) == 2, (
         f"expected one provider-level embed per startup, got {len(calls)}: {calls}")
+
+
+def test_startup_leaves_nothing_in_the_query_path_lazily_loaded(tmp_path, monkeypatch):
+    """The embedder was only half the cold path.
+
+    Measured live 2026-08-13 right after the embedder warm-up shipped: first
+    novel query 16.11s, second 2.14s, third 0.80s. `_warm_embedder` was doing
+    its job; `CrossEncoderReranker` loads a separate ~90MB model lazily on the
+    first *search*, so startup still reported ready while the query path was
+    cold.
+
+    Asserts the invariant rather than the function: by the time bind() returns,
+    no component of the query path may still be waiting to load. A third lazy
+    component should fail this test rather than slip past a hand-written list.
+    """
+    from alexandria.retrieval.rerank import CrossEncoderReranker
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    loaded_during_startup = []
+    original = CrossEncoderReranker._load
+    def spy(self):
+        loaded_during_startup.append(True)
+        return original(self)
+    monkeypatch.setattr(CrossEncoderReranker, "_load", spy)
+    _ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    with _closing(tcp_server, uds_servers):
+        pass
+    assert loaded_during_startup, (
+        "bind() returned with the reranker model still unloaded -- the first "
+        "real query would pay the cold load that the warm-up exists to absorb")

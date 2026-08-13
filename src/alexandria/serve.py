@@ -104,6 +104,7 @@ def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
 
     engine = _build_search_engine(config, corpus, corpus_root=corpus, client="serve")
     _warm_embedder(engine.embedder)
+    _warm_reranker(engine.reranker)
     lock = threading.Lock()
     return ServeContext(
         config=config, corpus=corpus, engine=engine,
@@ -140,6 +141,33 @@ def _warm_embedder(embedder) -> None:
     already makes for a provider/manifest mismatch.
     """
     getattr(embedder, "provider", embedder).embed(["warm the embedding model"])
+
+
+def _warm_reranker(reranker) -> None:
+    """Load the reranker model too -- the embedder was only half the cold path.
+
+    Measured live on 2026-08-13, immediately after `_warm_embedder` shipped:
+    first novel query 16.11s, second 2.14s, third 0.80s. The embedder warm-up
+    was working; `CrossEncoderReranker` simply loads its own ~90MB model
+    lazily on the first *search*, so the first user after every restart still
+    paid a cold load while startup reported ready.
+
+    Warming component-by-component is whack-a-mole, so the TEST pins the
+    invariant (nothing in the query path is still lazy after startup) rather
+    than this function -- a fourth lazy component should fail the test, not
+    slip through because only the two known ones are listed here.
+
+    Best-effort, unlike the embedder. `search.py` is explicitly
+    failure-tolerant on reranking: a reranker that cannot load degrades
+    ranking but still answers, so refusing to start would trade a real
+    outage for a latency problem. An embedder that cannot load answers
+    nothing, which is why that one is allowed to kill startup.
+    """
+    from .retrieval.rerank import RerankCandidate
+    try:
+        reranker.rerank("warm", [RerankCandidate("warm", "warm the reranker model", 0.0)], 1)
+    except Exception:
+        pass
 
 
 def start_drain(ctx: ServeContext, *,
