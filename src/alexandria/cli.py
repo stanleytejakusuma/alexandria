@@ -426,6 +426,12 @@ def cmd_restore(args) -> int:
         return 1
     verb = "would restore" if args.dry_run else "restored"
     print(f"restore: {verb} {len(result.restored)} paths from {args.archive}")
+    if result.skipped:
+        print(f"restore: SKIPPED {len(result.skipped)} member(s) outside the state allowlist:")
+        for name in result.skipped[:10]:
+            print(f"  - {name}")
+        if len(result.skipped) > 10:
+            print(f"  ... and {len(result.skipped) - 10} more")
     for name in result.restored:
         print(f"restore: {verb} {name}")
     return 0

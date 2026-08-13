@@ -67,9 +67,18 @@ def list_pending(corpus: str | Path) -> list[str]:
     directory = pending_dir(corpus)
     if not directory.exists():
         return []
-    entries = [p for p in directory.iterdir() if p.is_file()]
-    entries.sort(key=lambda p: p.stat().st_mtime)
-    return [p.name for p in entries]
+    # stat() after iterdir() is a TOCTOU against a drain consuming markers:
+    # the marker is the redo log, so it is unlinked concurrently by design.
+    # A vanished entry is not an error, it is the normal success case.
+    entries: list[tuple[float, str]] = []
+    for p in directory.iterdir():
+        try:
+            if p.is_file():
+                entries.append((p.stat().st_mtime, p.name))
+        except FileNotFoundError:
+            continue
+    entries.sort()
+    return [name for _, name in entries]
 
 
 def oldest_pending_age(corpus: str | Path, *, now: float | None = None) -> float | None:
@@ -81,9 +90,15 @@ def oldest_pending_age(corpus: str | Path, *, now: float | None = None) -> float
         return None
     oldest: float | None = None
     for entry in directory.iterdir():
-        if not entry.is_file():
+        try:
+            if not entry.is_file():
+                continue
+            mtime = entry.stat().st_mtime
+        except FileNotFoundError:
+            # Consumed mid-scan by a concurrent drain. This is the liveness
+            # path (§7) -- it must never raise, or the health signal dies
+            # exactly when the system is busiest.
             continue
-        mtime = entry.stat().st_mtime
         if oldest is None or mtime < oldest:
             oldest = mtime
     if oldest is None:

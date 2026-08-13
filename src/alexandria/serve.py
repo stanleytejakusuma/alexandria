@@ -353,11 +353,24 @@ def _make_handler_class(ctx: ServeContext, identity: str) -> type[BaseHTTPReques
             self._dispatch_safely("GET", b"")
 
         def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            if length > MAX_BODY_BYTES:
-                self._respond(*(413, json.dumps({"error": "request body too large"}).encode(),
-                               "application/json"))
-                self.rfile.read(0)
+            # Content-Length is attacker-controlled and was previously parsed
+            # OUTSIDE _dispatch_safely, so a non-numeric value raised through
+            # BaseHTTPRequestHandler and closed the socket with no response --
+            # indistinguishable from a network failure. A negative value was
+            # worse: it passed the `> MAX_BODY_BYTES` test and then reached
+            # rfile.read(-1), which reads to EOF and bypasses the cap entirely.
+            raw = self.headers.get("Content-Length", "") or "0"
+            try:
+                length = int(raw)
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY_BYTES:
+                status, msg = ((413, "request body too large") if length > MAX_BODY_BYTES
+                               else (400, "invalid Content-Length"))
+                self._respond(status, json.dumps({"error": msg}).encode(), "application/json")
+                # The body is still unread in the socket; with keep-alive the
+                # residue would be parsed as the next request line.
+                self.close_connection = True
                 return
             body = self.rfile.read(length) if length else b""
             self._dispatch_safely("POST", body)
