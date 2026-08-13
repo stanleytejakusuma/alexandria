@@ -20,6 +20,7 @@ here is never evidence that retrieval is healthy.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -284,6 +285,53 @@ def test_separation_report_is_internally_consistent(engine, report):
         high = payload[f"{side}_top1_max"]
         assert low <= median <= high, f"{side} median {median} outside [{low}, {high}]"
     assert 0.0 <= payload["clean_floor_recall"] <= 1.0
+
+
+def test_harness_changes_gate_themselves_without_paying_for_the_quality_gate():
+    """Routing in `eval-gate.py`: which staged paths earn which gate.
+
+    Two distinct holes are guarded here, both found by reading the routing rather
+    than by a failure:
+
+    - Editing the harness or its fixtures used to run NO gate. The one thing such
+      a change can break -- the instrument -- was the only thing unchecked.
+    - Adding those paths to WATCHED would have been the wrong fix: it drags in the
+      60-90s private quality gate, which also appends a row to the corpus's eval
+      history, for an edit that provably cannot move retrieval quality. That is
+      the friction the WATCHED comment warns turns a gate into something people
+      route around.
+
+    Third: a commit touching synthesis AND retrieval used to return after the
+    synthesis branch, exempting retrieval from its gate entirely.
+    """
+    gates_to_run = _load_gate_router()
+
+    assert gates_to_run(["README.md"]) == set()
+    assert gates_to_run(["src/alexandria/retrieval/search.py"]) == {"synthetic", "quality"}
+    assert gates_to_run(["src/alexandria/synthesis/write.py"]) == {"synthesis"}
+
+    for path in ("src/alexandria/eval/synthetic.py",
+                 "scripts/synthetic-eval-gate.py",
+                 "tests/test_synthetic_gate.py",
+                 "tests/fixtures/synthetic-golden-v1.jsonl",
+                 "tests/fixtures/synthetic-corpus/sources/policy/renewals-main.md"):
+        assert gates_to_run([path]) == {"synthetic"}, (
+            f"{path} must gate the harness and must NOT trigger the private "
+            f"quality gate"
+        )
+
+    assert gates_to_run([
+        "src/alexandria/synthesis/write.py", "src/alexandria/retrieval/search.py",
+    ]) == {"synthesis", "synthetic", "quality"}
+
+
+def _load_gate_router():
+    """Import `gates_to_run` from a hyphenated script name imports cannot reach."""
+    spec = importlib.util.spec_from_file_location(
+        "eval_gate", Path(__file__).resolve().parents[1] / "scripts" / "eval-gate.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.gates_to_run
 
 
 def test_gate_runs_with_no_private_corpus_and_no_network(tmp_path):

@@ -70,6 +70,43 @@ SYNTHESIS_TESTS = (
     "tests/test_gather_completeness.py",
 )
 
+# The measuring instrument itself. Changing these cannot move retrieval quality,
+# so they must NOT trigger the private quality gate -- that would spend 60-90s and
+# append a history row for an edit that provably changed no retrieval behaviour,
+# which is exactly the friction the WATCHED comment above warns about.
+#
+# They must, however, trigger the synthetic gate. Until this existed, editing the
+# harness or its fixtures ran no gate at all: the one thing a change here can
+# break is the only thing nothing was checking.
+HARNESS_WATCHED = (
+    "src/alexandria/eval/",
+    "scripts/synthetic-eval-gate.py",
+    "tests/test_synthetic_gate.py",
+    "tests/fixtures/synthetic-",
+)
+
+
+def gates_to_run(changed: list[str]) -> set[str]:
+    """Decide which gates a set of staged paths earns. Pure, so it can be tested.
+
+    Returns any of: "synthesis", "synthetic", "quality".
+
+    A retrieval change earns both the synthetic gate (is the instrument sound?)
+    and the quality gate (did the number move?). A harness change earns only the
+    former. A synthesis change earns its own offline net and, since 2026-08-13,
+    no longer suppresses the others: the previous version returned immediately
+    after the synthesis branch, so a commit touching synthesis AND retrieval was
+    silently exempt from the retrieval gate entirely.
+    """
+    gates: set[str] = set()
+    if any(path.startswith(SYNTHESIS_WATCHED) for path in changed):
+        gates.add("synthesis")
+    if any(path.startswith(WATCHED) for path in changed):
+        gates.update({"synthetic", "quality"})
+    if any(path.startswith(HARNESS_WATCHED) for path in changed):
+        gates.add("synthetic")
+    return gates
+
 
 def staged_files() -> list[str]:
     r = subprocess.run(
@@ -80,13 +117,11 @@ def staged_files() -> list[str]:
 
 
 def main() -> int:
-    changed = staged_files()
-    synthesis_changed = any(f.startswith(SYNTHESIS_WATCHED) for f in changed)
-    retrieval_changed = any(f.startswith(WATCHED) for f in changed)
-    if not synthesis_changed and not retrieval_changed:
+    gates = gates_to_run(staged_files())
+    if not gates:
         return 0  # nothing gate-relevant staged -- don't pay the cost
 
-    if synthesis_changed:
+    if "synthesis" in gates:
         print("eval-gate: synthesis-relevant files changed, running offline "
               "regression net ...", file=sys.stderr)
         result = subprocess.run(
@@ -103,25 +138,27 @@ def main() -> int:
             return 1
         print("eval-gate: synthesis regression net green (live re-measurement "
               "still required for prompt changes).", file=sys.stderr)
-        return 0
 
     # The reproducible half: runs everywhere, needs no private corpus and no
     # network. Deliberately BEFORE the skippable half, so the check that always
     # runs is also the one that always reports.
-    print("eval-gate: retrieval-relevant files changed, running the synthetic "
-          "harness gate ...", file=sys.stderr)
-    synthetic = subprocess.run(
-        [sys.executable, str(REPO / "scripts" / "synthetic-eval-gate.py")],
-        cwd=REPO, capture_output=True, text=True,
-    )
-    print(synthetic.stdout)
-    if synthetic.returncode != 0:
-        print(synthetic.stderr, file=sys.stderr)
-        print("eval-gate FAILED -- the synthetic harness gate is red. This does not "
-              "mean retrieval quality dropped; it means the measuring instrument "
-              "itself is broken, which invalidates every number the private gate "
-              "would report next.", file=sys.stderr)
-        return 1
+    if "synthetic" in gates:
+        print("eval-gate: running the synthetic harness gate ...", file=sys.stderr)
+        synthetic = subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "synthetic-eval-gate.py")],
+            cwd=REPO, capture_output=True, text=True,
+        )
+        print(synthetic.stdout)
+        if synthetic.returncode != 0:
+            print(synthetic.stderr, file=sys.stderr)
+            print("eval-gate FAILED -- the synthetic harness gate is red. This does "
+                  "not mean retrieval quality dropped; it means the measuring "
+                  "instrument itself is broken, which invalidates every number the "
+                  "private gate would report next.", file=sys.stderr)
+            return 1
+
+    if "quality" not in gates:
+        return 0
 
     corpus = Path.home() / "alexandria-corpus"
     golden = corpus / ".alexandria" / "golden" / "golden-v1.jsonl"
