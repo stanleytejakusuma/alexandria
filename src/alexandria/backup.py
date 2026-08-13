@@ -53,6 +53,7 @@ class BackupResult:
 @dataclass
 class RestoreResult:
     restored: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
     dry_run: bool = False
 
 
@@ -114,6 +115,11 @@ def restore_state(corpus: Path, archive_path: Path, *, dry_run: bool = False) ->
     with tarfile.open(archive_path, "r:gz") as tar:
         for member in tar.getmembers():
             if not _is_allowed_member(member.name, allowed_prefixes):
+                # Trimming is deliberate (see docstring), but silence is not:
+                # a restore that dropped members reported the same "restored N
+                # paths" as a clean one, so the operator could not tell a good
+                # backup from a tampered or truncated one.
+                result.skipped.append(member.name)
                 continue
             result.restored.append(member.name)
             if not dry_run:
