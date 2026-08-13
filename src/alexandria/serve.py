@@ -44,7 +44,8 @@ DEFAULT_K = 5
 REMOTE_ENV = "ALEXANDRIA_SERVE_ALLOW_REMOTE"
 LOCAL_ANONYMOUS = "local-anonymous"  # §5.2/§5.3: fixed identity for any TCP caller
 
-__all__ = ["ServeContext", "build_serve_context", "dispatch", "bind", "serve", "NonLoopbackRefused"]
+__all__ = ["ServeContext", "build_serve_context", "dispatch", "bind", "serve",
+           "start_drain", "NonLoopbackRefused"]
 
 
 class NonLoopbackRefused(Exception):
@@ -102,6 +103,7 @@ def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
     from .cli import _build_search_engine  # local import: cli imports nothing from serve
 
     engine = _build_search_engine(config, corpus, corpus_root=corpus, client="serve")
+    _warm_embedder(engine.embedder)
     lock = threading.Lock()
     return ServeContext(
         config=config, corpus=corpus, engine=engine,
@@ -117,6 +119,73 @@ def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
             "prompt_version": os.environ.get("ALEXANDRIA_PROMPT_VERSION", "v1"),
         },
     )
+
+
+def _warm_embedder(embedder) -> None:
+    """Load the embedding model during startup, not on the first request.
+
+    Measured after the first launchd start (2026-08-13): first query 26.29s,
+    every query after it 0.03s. "Always on" was not "always warm", so the
+    first user after every reboot paid the whole cold load -- the exact cost
+    serve exists to amortize.
+
+    Goes to the provider DIRECTLY. The startup manifest check does embed a
+    probe, but through CachedEmbedder, which serves it from the on-disk
+    embedding cache and never touches the provider -- which is precisely why
+    serve stayed cold despite already embedding something at startup. Any
+    warm-up routed through the cache is a no-op on the second start.
+
+    A failure here is not caught: an engine whose model cannot load answers
+    nothing, and refusing to start with the real error is the same choice S9
+    already makes for a provider/manifest mismatch.
+    """
+    getattr(embedder, "provider", embedder).embed(["warm the embedding model"])
+
+
+def start_drain(ctx: ServeContext, *,
+                interval: float = liveness.DEFAULT_DRAIN_INTERVAL_SECONDS) -> threading.Event:
+    """§11's offline drain, actually running.
+
+    Until this existed the interval was only a threshold liveness.check()
+    judged against: `promote_pending` had exactly two callers -- serve's
+    inline /remember, and `alexandria promote` by hand -- so anything
+    remembered through the CLI stayed invisible to search indefinitely
+    (2026-08-13: nine entries, 3.3 hours, reported by /health as degraded
+    against a drain nothing implemented).
+
+    Takes `ctx.engine_lock` for the same reason the inline promote does: two
+    writers in one process is the concurrency bug the write path was hardened
+    against. `promote_pending`'s own flock still guards other processes, and
+    its `skipped_locked` return is a normal outcome (W5), not an error --
+    the entry stays pending and the next tick takes it.
+
+    Returns the stop Event so a caller can end the loop; the thread is a
+    daemon either way, so it never keeps the process alive.
+    """
+    stop = threading.Event()
+
+    def loop() -> None:
+        while not stop.wait(interval):
+            try:
+                with ctx.engine_lock:
+                    result = promote_pending(ctx.corpus, ctx.config, ctx.embedder,
+                                             ctx.store, ctx.lexical)
+                if result.skipped_locked:
+                    # Another process holds the write lock. Nothing ran, so
+                    # nothing may be recorded as a successful cycle.
+                    continue
+                liveness.record_success(ctx.corpus, promoted_count=len(result.promoted),
+                                        generation=read_index_generation(ctx.corpus))
+                for message in result.errors:
+                    print(f"alexandria drain: {message}", file=sys.stderr)
+            except Exception:
+                # A drain that dies on the first transient error recreates,
+                # silently, the exact bug it was written to fix. Report it and
+                # take the next tick.
+                traceback.print_exc()
+
+    threading.Thread(target=loop, name="alexandria-drain", daemon=True).start()
+    return stop
 
 
 def _json_error(status: int, message: str) -> tuple[int, bytes, str]:
@@ -433,6 +502,10 @@ def bind(corpus: str | Path, *, config: AppConfig | None = None, host: str = "12
             f"refusing to bind {host}: set {REMOTE_ENV}=1 to allow a non-loopback bind")
 
     ctx = build_serve_context(cfg, corpus)
+    # Started here, not in serve(), because bind() is the single chokepoint
+    # both the blocking entry point and every test go through -- a drain wired
+    # only into serve() would be exercised by nothing.
+    start_drain(ctx)
 
     tcp_handler = _make_handler_class(ctx, LOCAL_ANONYMOUS)
     tcp_server = TCPHTTPServer((host, port), tcp_handler)

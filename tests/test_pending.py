@@ -63,3 +63,23 @@ def test_oldest_pending_age_measures_the_oldest_marker(tmp_path):
     age = oldest_pending_age(tmp_path)
     assert age is not None
     assert 999 <= age <= 1005, f"expected ~1000s, got {age}"
+
+
+def test_pending_age_is_none_for_an_entry_with_no_marker_and_measures_one_that_has(tmp_path):
+    """F6 reads a SINGLE marker's age; measuring it here (not in the caller)
+    keeps reconcile and liveness judging staleness on the same mtime basis."""
+    from alexandria.pending import pending_age
+
+    assert pending_age(tmp_path, "never-marked") is None  # no pending dir at all
+    create_pending(tmp_path, "fresh")
+    assert pending_age(tmp_path, "absent") is None        # dir exists, entry does not
+
+    fresh = pending_age(tmp_path, "fresh")
+    assert fresh is not None and 0 <= fresh < 5
+
+    import os
+    marker = pending_dir(tmp_path) / "fresh"
+    old_time = time.time() - 2000
+    os.utime(marker, (old_time, old_time))
+    aged = pending_age(tmp_path, "fresh")
+    assert aged is not None and 1999 <= aged <= 2005, f"expected ~2000s, got {aged}"

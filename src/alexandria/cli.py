@@ -396,8 +396,10 @@ def cmd_reconcile(args) -> int:
     """§7.1's independent observer: every inbox/*.md entry must have a
     matching document under sources/inbox/. An unpromoted entry with no
     pending marker is genuinely stranded (nothing is tracking it) and gets
-    requeued; an unpromoted entry that IS correctly marked pending is normal
-    backlog, not a fault."""
+    requeued; so is one whose marker is older than 2x the drain interval (F6:
+    a marker downgrades severity only while it is young enough to still be
+    plausible). An unpromoted entry with a FRESH marker is normal backlog,
+    not a fault."""
     corpus = _config_for(args).corpus_path
     report = reconcile_inbox(corpus)
     print(f"reconcile: {report.total_entries} entries in {report.total_files} files, "
@@ -406,7 +408,8 @@ def cmd_reconcile(args) -> int:
     for name in report.unreadable_files:
         print(f"reconcile: unreadable inbox file {name}", file=sys.stderr)
     for entry_id in report.stranded:
-        print(f"reconcile: stranded entry {entry_id} (requeued)", file=sys.stderr)
+        note = "requeued" if entry_id in report.requeued else "marker stale, left as is"
+        print(f"reconcile: stranded entry {entry_id} ({note})", file=sys.stderr)
     return 0 if report.healthy else 1
 
 

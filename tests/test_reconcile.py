@@ -4,6 +4,8 @@ pending marker or the swallowing parser.
 
 from __future__ import annotations
 
+import time
+
 from alexandria.cli import app
 from alexandria.pending import is_pending, list_pending
 from alexandria.promote import promote_pending
@@ -126,3 +128,33 @@ def test_reconcile_via_the_real_cli_subcommand(tmp_path, monkeypatch):
     corpus = tmp_path / "corpus"
     _remember(tmp_path, monkeypatch, "Fact via the CLI reconcile path.")
     assert app(["--corpus", str(corpus), "reconcile"]) == 0
+
+
+def test_a_stale_pending_marker_is_stranded_not_healthy_backlog(tmp_path, monkeypatch):
+    """F6 as amended 2026-08-13. Nine entries sat marked-pending for 3.3h
+    because nothing implemented the drain they were waiting for; a boolean
+    marker check called every one of them healthy backlog. Past 2x the drain
+    interval the marker is no longer evidence anything is tracking the entry.
+
+    The stale marker must survive untouched: refreshing its mtime would reset
+    the only clock that detected the fault, and `requeued` would then claim
+    work that never happened.
+    """
+    import os
+
+    from alexandria.pending import pending_dir
+    from alexandria.reconcile import STALE_MARKER_SECONDS
+
+    corpus = tmp_path / "corpus"
+    entry_id = _remember(tmp_path, monkeypatch, "Fact whose drain never ran.")
+    marker = pending_dir(corpus) / entry_id
+    aged = time.time() - (STALE_MARKER_SECONDS + 60)
+    os.utime(marker, (aged, aged))
+
+    report = reconcile_inbox(corpus, requeue=True)
+
+    assert not report.healthy, "an entry whose marker outlived 2x the drain interval is a fault"
+    assert report.stranded == [entry_id]
+    assert report.already_pending == []
+    assert report.requeued == [], "the marker already exists; nothing was requeued"
+    assert abs(marker.stat().st_mtime - aged) < 1, "reconcile must not refresh the evidence"

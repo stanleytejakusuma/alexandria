@@ -11,16 +11,26 @@ healthy *because* the work never got recorded.
 This module derives health from the artifacts instead: it compares inbox
 entries against promoted documents directly, an invariant checkable from the
 two sources of truth alone -- "every entry in inbox/*.md has a corresponding
-document in sources/inbox/". An unpromoted entry is only reported as
-*stranded* when it ALSO has no pending marker -- that combination is the
-actual failure signature (nothing is tracking it, by any mechanism). An
-unpromoted entry that IS correctly marked pending is normal backlog waiting
-for the next drain cycle, not a fault; conflating the two would make this
-command report "unhealthy" on every ordinary corpus with unpromoted work
-queued, training operators to ignore it -- the same cry-wolf failure mode
-this project has repeatedly found in monitoring that reports success on
-unverified assumptions. Stranded entries are (re)queued and reported;
-normal-pending entries are counted separately and do not affect health.
+document in sources/inbox/". An unpromoted entry that IS correctly marked
+pending is normal backlog waiting for the next drain cycle, not a fault;
+conflating the two would make this command report "unhealthy" on every
+ordinary corpus with unpromoted work queued, training operators to ignore it
+-- the same cry-wolf failure mode this project has repeatedly found in
+monitoring that reports success on unverified assumptions. Stranded entries
+are (re)queued and reported; normal-pending entries are counted separately
+and do not affect health.
+
+But a marker only downgrades severity **while it is still young enough to be
+plausible** (F6, amended 2026-08-13). On that date nine entries sat marked
+pending for 3.3 hours because nothing implemented the 600s drain they were
+waiting for; a boolean marker check called every one of them healthy backlog.
+So the rule is a time bound against the same threshold §7's health surface
+already applies (`liveness.WARN_MULTIPLE * DEFAULT_DRAIN_INTERVAL_SECONDS`):
+unpromoted with no marker is stranded; unpromoted with a marker older than
+that is *also* stranded; unpromoted with a fresh marker is ordinary backlog.
+A stale marker is left exactly as it is -- refreshing its mtime would reset
+the only clock that detected the fault, so `requeued` reports only markers
+this run actually created.
 
 Must not inherit `parse_inbox_file`'s blindness: that function swallows
 OSError/UnicodeDecodeError and returns [], which would make an unreadable
@@ -38,18 +48,23 @@ from pathlib import Path
 
 from .connectors.base import RawItem
 from .connectors.inbox import InboxConnector, read_inbox_file_strict
-from .pending import create_pending, is_pending
+from .liveness import DEFAULT_DRAIN_INTERVAL_SECONDS, WARN_MULTIPLE
+from .pending import create_pending, pending_age
 
-__all__ = ["ReconcileReport", "reconcile_inbox"]
+__all__ = ["ReconcileReport", "STALE_MARKER_SECONDS", "reconcile_inbox"]
+
+# F6: past this, a pending marker is no longer evidence that anything is
+# tracking the entry. Same threshold, same constants, as liveness.check().
+STALE_MARKER_SECONDS = WARN_MULTIPLE * DEFAULT_DRAIN_INTERVAL_SECONDS
 
 
 @dataclass
 class ReconcileReport:
     total_entries: int = 0
     total_files: int = 0
-    stranded: list[str] = field(default_factory=list)       # no doc AND no pending marker
-    requeued: list[str] = field(default_factory=list)       # stranded ids now (re)marked pending
-    already_pending: list[str] = field(default_factory=list)  # no doc but correctly marked pending -- normal backlog
+    stranded: list[str] = field(default_factory=list)       # no doc AND no live marker (missing, or older than STALE_MARKER_SECONDS)
+    requeued: list[str] = field(default_factory=list)       # stranded ids whose marker this run created
+    already_pending: list[str] = field(default_factory=list)  # no doc but freshly marked pending -- normal backlog
     unreadable_files: list[str] = field(default_factory=list)  # hard errors, never swallowed
 
     @property
@@ -89,11 +104,15 @@ def reconcile_inbox(corpus: str | Path, *, requeue: bool = True) -> ReconcileRep
             promoted = all((corpus / doc.path).exists() for doc in docs)
             if promoted:
                 continue
-            if is_pending(corpus, entry.entry_id):
+            age = pending_age(corpus, entry.entry_id)
+            if age is not None and age <= STALE_MARKER_SECONDS:
                 report.already_pending.append(entry.entry_id)
                 continue
             report.stranded.append(entry.entry_id)
-            if requeue:
-                create_pending(corpus, entry.entry_id)
+            # create_pending is O_CREAT|O_EXCL, so a stale marker survives
+            # untouched and is not claimed as requeued -- the age IS the
+            # evidence, and a report that quietly reset it would be the
+            # "reported success while doing nothing" bug wearing a new hat.
+            if requeue and create_pending(corpus, entry.entry_id):
                 report.requeued.append(entry.entry_id)
     return report
