@@ -1068,7 +1068,8 @@ def _print_eval_report(report: EvalReport, delta) -> None:
             print(f"  error: {result.error}")
     summary = report.summary
     scored = summary.n - len(summary.target_errors)
-    print(f"\nrecall@k: {summary.recall_at_k:.1%} ({summary.hits}/{scored})  "
+    low, high = summary.recall_ci
+    print(f"\nrecall@k: {summary.recall_at_k:.1%} [{low:.1%}-{high:.1%}] ({summary.hits}/{scored})  "
           f"MRR: {summary.mrr:.3f}  errors: {summary.errors}")
     if summary.misses:
         print("misses: " + ", ".join(summary.misses))
@@ -1094,7 +1095,11 @@ def _print_eval_report(report: EvalReport, delta) -> None:
     elif report.negatives:
         print(f"\nprecision: {len(report.negatives)} negatives ran, separation not computable")
     if delta is not None:
+        verdict = ("significant" if delta.significant
+                   else "NOT significant -- within noise at this sample size")
         print(f"\nvs previous: recall {delta.recall_at_k:+.1%}, MRR {delta.mrr:+.3f}")
+        print(f"  paired McNemar p={delta.p_value:.3f} "
+              f"({len(delta.hit_to_miss)} hit->miss, {len(delta.miss_to_hit)} miss->hit): {verdict}")
         if delta.negative_confidence_rose:
             print("PRECISION REGRESSION -- more confident on unanswerable queries: "
                   + ", ".join(delta.negative_confidence_rose))

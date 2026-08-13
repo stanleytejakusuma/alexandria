@@ -348,3 +348,29 @@ def test_allow_partial_index_overrides_the_refusal(tmp_path, capsys):
     with contextlib.suppress(Exception):
         cmd_eval(args)
     assert "refusing to measure a partial index" not in capsys.readouterr().err
+
+
+def test_eval_output_shows_the_interval_and_withholds_a_verdict_it_cannot_support(capsys):
+    """A reader must not be able to take a one-query flip away as a finding."""
+    from alexandria.cli import _print_eval_report
+    from alexandria.eval.history import compare
+    from alexandria.eval.metrics import EvalResult, summarize
+    from alexandria.eval.runner import EvalReport
+
+    def report(results):
+        return EvalReport(results=results, summary=summarize(results), config={},
+                          corpus_chunks=1, timestamp="2026-08-13T00:00:00+00:00", git_sha="abc123")
+
+    previous = report([
+        EvalResult("moved", "q", True, 1, ["sources/a"], 1.0),
+        EvalResult("steady", "q", True, 1, ["sources/b"], 1.0),
+    ])
+    current = report([
+        EvalResult("moved", "q", False, 0, [], 1.0),
+        EvalResult("steady", "q", True, 1, ["sources/b"], 1.0),
+    ])
+    _print_eval_report(current, compare(previous, current))
+    out = capsys.readouterr().out
+    assert "recall@k: 50.0% [9.5%-90.5%]" in out
+    assert "NOT significant" in out
+    assert "p=1.000" in out

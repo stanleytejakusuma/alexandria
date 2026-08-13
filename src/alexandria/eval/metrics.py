@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 
-__all__ = ["EvalResult", "EvalSummary", "by_overlap_band", "mrr", "recall_at_k",
-          "reciprocal_rank", "summarize"]
+__all__ = ["EvalResult", "EvalSummary", "Z_95", "by_overlap_band", "mcnemar_exact", "mrr",
+          "recall_at_k", "reciprocal_rank", "summarize", "wilson_interval"]
+
+Z_95 = 1.959963984540054
+"""Standard-normal quantile for a two-sided 95% interval."""
 
 
 @dataclass(frozen=True)
@@ -59,10 +63,24 @@ class EvalSummary:
     target_errors: list[str]
     errors: int = 0
     error_ids: list[str] | None = None
+    recall_ci: tuple[float, float] = (0.0, 0.0)
+    """Two-sided 95% Wilson score interval on recall_at_k.
+
+    Wilson, not the normal approximation: at this golden set's n=49 and p near 0.9
+    the normal interval runs past 1.0 and reports an impossible upper bound. Wilson
+    stays inside [0, 1] and keeps its coverage at the extremes where these numbers
+    actually sit.
+    """
+
+    @property
+    def scored(self) -> int:
+        """Denominator behind recall_at_k: entries less those with missing targets."""
+        return self.n - len(self.target_errors)
 
     def to_dict(self) -> dict:
         data = asdict(self)
         data["error_ids"] = self.error_ids or []
+        data["recall_ci"] = list(self.recall_ci)
         return data
 
     @classmethod
@@ -76,7 +94,54 @@ class EvalSummary:
             target_errors=[str(value) for value in raw.get("target_errors", [])],
             errors=int(raw.get("errors", 0)),
             error_ids=[str(value) for value in raw.get("error_ids", [])],
+            # History predating the interval stays loadable: recompute it from the
+            # counts the run already recorded rather than reporting a fake (0, 0).
+            recall_ci=_ci_from_dict(raw),
         )
+
+
+def _ci_from_dict(raw: dict) -> tuple[float, float]:
+    stored = raw.get("recall_ci")
+    if stored:
+        low, high = stored
+        return (float(low), float(high))
+    scored = int(raw["n"]) - len(raw.get("target_errors", []))
+    return wilson_interval(int(raw["hits"]), scored)
+
+
+def wilson_interval(successes: int, n: int, z: float = Z_95) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion, clamped to [0, 1].
+
+    An empty sample has no interval to report, so it widens to the whole range
+    rather than collapsing to a falsely precise (0, 0).
+    """
+    if n <= 0:
+        return (0.0, 1.0)
+    p = successes / n
+    denominator = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denominator
+    margin = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denominator
+    return (max(0.0, center - margin), min(1.0, center + margin))
+
+
+def mcnemar_exact(hit_to_miss: int, miss_to_hit: int) -> float:
+    """Two-sided exact McNemar p-value for a paired hit/miss comparison.
+
+    The two runs answer the *same* queries, so only the queries that changed
+    verdict carry information -- the ones both runs hit, or both miss, say nothing
+    about which is better. Under the null (a change is equally likely to flip a
+    query either way) the discordant pairs are Binomial(b + c, 0.5).
+
+    Exact rather than the chi-square approximation because b + c here is a handful
+    of queries, which is exactly where chi-square stops being trustworthy. No
+    discordant pairs at all means no evidence of a difference: p = 1.0.
+    """
+    discordant = hit_to_miss + miss_to_hit
+    if discordant == 0:
+        return 1.0
+    smaller = min(hit_to_miss, miss_to_hit)
+    tail = sum(math.comb(discordant, i) for i in range(smaller + 1)) / (2 ** discordant)
+    return min(1.0, 2.0 * tail)
 
 
 def recall_at_k(retrieved_ids: Sequence[str], want_ids: Sequence[str], k: int) -> bool:
@@ -136,4 +201,5 @@ def summarize(results: Sequence[EvalResult]) -> EvalSummary:
         target_errors=target_errors,
         errors=len(errors),
         error_ids=errors,
+        recall_ci=wilson_interval(hits, len(scored)),
     )

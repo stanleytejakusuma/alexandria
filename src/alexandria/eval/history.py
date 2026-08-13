@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .metrics import mcnemar_exact
 from .runner import EvalReport
 
 __all__ = ["Delta", "append_run", "compare", "load_runs", "regressions"]
@@ -27,6 +28,16 @@ class Delta:
     clean_floor_recall: float = 0.0
     """Change in the fraction of answerable queries clearing the no-false-positive
     floor. Reported for visibility; the gate fires on the named list above."""
+    p_value: float = 1.0
+    """Exact two-sided McNemar p-value over the recall transitions.
+
+    1.0 when nothing changed verdict, which is the honest reading: no discordant
+    pairs is no evidence of a difference, not a confirmed absence of one.
+    """
+
+    @property
+    def significant(self) -> bool:
+        return self.p_value < SIGNIFICANCE_ALPHA
 
     @property
     def recall_delta(self) -> float:
@@ -65,19 +76,22 @@ def compare(previous: EvalReport, current: EvalReport) -> Delta:
     """Compare aggregate scores and each shared query's pass/fail transition."""
     previous_hits = {result.id: result.hit for result in previous.results if not result.target_error}
     current_hits = {result.id: result.hit for result in current.results if not result.target_error}
+    hit_to_miss = [
+        result.id for result in previous.results
+        if previous_hits.get(result.id) is True and current_hits.get(result.id) is False
+    ]
+    miss_to_hit = [
+        result.id for result in current.results
+        if previous_hits.get(result.id) is False and current_hits.get(result.id) is True
+    ]
     return Delta(
         recall_at_k=current.summary.recall_at_k - previous.summary.recall_at_k,
         mrr=current.summary.mrr - previous.summary.mrr,
-        hit_to_miss=[
-            result.id for result in previous.results
-            if previous_hits.get(result.id) is True and current_hits.get(result.id) is False
-        ],
-        miss_to_hit=[
-            result.id for result in current.results
-            if previous_hits.get(result.id) is False and current_hits.get(result.id) is True
-        ],
+        hit_to_miss=hit_to_miss,
+        miss_to_hit=miss_to_hit,
         negative_confidence_rose=_negative_confidence_rose(previous, current),
         clean_floor_recall=_clean_floor_recall(current) - _clean_floor_recall(previous),
+        p_value=mcnemar_exact(len(hit_to_miss), len(miss_to_hit)),
     )
 
 
@@ -86,6 +100,10 @@ def compare(previous: EvalReport, current: EvalReport) -> Delta:
 # reader argues with a number they can see; scores are bounded in [0, 1] and the
 # measured negative median is 0.024, so 0.10 is several times typical spread.
 CONFIDENCE_RISE_THRESHOLD = 0.10
+
+# The bar a recall difference must clear before the gate is willing to call it
+# real. Conventional 0.05; stated here so a reader argues with a visible number.
+SIGNIFICANCE_ALPHA = 0.05
 
 
 def _top_score(result) -> float:
