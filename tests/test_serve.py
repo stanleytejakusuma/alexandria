@@ -489,3 +489,156 @@ def test_s9_a_manifest_mismatched_provider_refuses_to_start(tmp_path, monkeypatc
 
     with pytest.raises(SystemExit):
         serve_mod.bind(corpus, config=mismatched_config, host="127.0.0.1", port=0)
+
+
+# ---------------------------------------------------------------------------
+# The drain timer serve documented but never ran, and the startup warm-up.
+# (2026-08-13: nine entries pending for 3.3h; first query after a launchd
+# start took 26.29s against 0.03s warm.)
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _closing(tcp_server, uds_servers):
+    """Bind without serving: these tests exercise startup and the drain, not
+    the request path, so nothing needs a serve_forever thread -- but the
+    listening sockets still have to be released."""
+    try:
+        yield
+    finally:
+        for server in (tcp_server, *uds_servers):
+            server.server_close()
+
+
+def _wait_until(predicate, timeout: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_the_drain_promotes_an_entry_nobody_sent_a_request_for(tmp_path, monkeypatch):
+    """promote_pending had exactly two callers -- serve's inline /remember and
+    the manual CLI -- so a fact remembered through the CLI stayed unsearchable
+    indefinitely while liveness judged it against a 600s drain interval
+    nothing implemented. Observable proof: the marker is consumed and the
+    document exists, with no HTTP request made at all."""
+    from alexandria import serve as serve_mod
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    assert app(["--corpus", str(corpus), "remember", "The drain promoted this unasked."]) == 0
+    assert len(list_pending(corpus)) == 1
+
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    stop = serve_mod.start_drain(ctx, interval=0.02)
+    with _closing(tcp_server, uds_servers):
+        drained = _wait_until(lambda: not list_pending(corpus))
+        stop.set()
+
+    assert drained, "the drain never consumed the pending marker"
+    docs = list((corpus / "sources" / "inbox").rglob("*.md"))
+    assert docs, "marker consumed but no document written -- promotion did nothing"
+    assert (corpus / ".alexandria" / "liveness.json").exists()
+
+
+def test_the_drain_survives_an_exception_and_takes_the_next_tick(tmp_path, monkeypatch):
+    """A drain that dies on the first transient error recreates, silently, the
+    bug it exists to fix."""
+    from alexandria import serve as serve_mod
+    from alexandria.promote import PromoteResult
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient promote failure")
+        return PromoteResult()
+
+    monkeypatch.setattr(serve_mod, "promote_pending", flaky)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    stop = serve_mod.start_drain(ctx, interval=0.02)
+    with _closing(tcp_server, uds_servers):
+        kept_ticking = _wait_until(lambda: len(calls) >= 3)
+        stop.set()
+
+    assert kept_ticking, f"the drain stopped after the exception ({len(calls)} calls)"
+
+
+def test_a_lock_skipped_drain_cycle_records_no_liveness_success(tmp_path, monkeypatch):
+    """W5: another process holding the write lock is a normal outcome, but a
+    cycle that did nothing must not write evidence that it did -- that is the
+    house failure mode (a step reporting success while doing nothing)."""
+    from alexandria import serve as serve_mod
+    from alexandria.writelock import write_lock
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    assert app(["--corpus", str(corpus), "remember", "Fact behind a held write lock."]) == 0
+    entry_id = list_pending(corpus)[0]
+    state_file = corpus / ".alexandria" / "liveness.json"
+    state_file.unlink()  # written by `index`; absence is what makes this observable
+
+    lock = write_lock(corpus)
+    assert lock.acquire(), "test could not take the write lock it needs to hold"
+    try:
+        ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+        stop = serve_mod.start_drain(ctx, interval=0.02)
+        with _closing(tcp_server, uds_servers):
+            time.sleep(0.5)  # several ticks, every one of them lock-skipped
+            stop.set()
+    finally:
+        lock.release()
+
+    assert list_pending(corpus) == [entry_id], "the entry must stay pending for the next drain"
+    assert not state_file.exists(), "a lock-skipped cycle recorded a successful drain"
+
+
+def test_bind_starts_the_drain_timer(tmp_path, monkeypatch):
+    """The wiring itself: a drain nothing calls is the same dead code as no
+    drain at all."""
+    from alexandria import serve as serve_mod
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    started = []
+
+    def recorder(ctx, **kwargs):
+        started.append(ctx)
+        return threading.Event()
+
+    monkeypatch.setattr(serve_mod, "start_drain", recorder)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    with _closing(tcp_server, uds_servers):
+        pass
+
+    assert started and started[0] is ctx, "bind() must start the drain timer"
+
+
+def test_startup_warms_the_embedding_provider_bypassing_the_cache(tmp_path, monkeypatch):
+    """Measured: 26.29s first query, 0.03s after -- serve was lazy-loading the
+    model on the first request, so always-on was not always-warm.
+
+    Two binds, two provider calls. The startup manifest check already embeds a
+    probe, but through CachedEmbedder, which serves it from the on-disk cache
+    and never loads a model; a warm-up routed the same way would show one call
+    on a fresh cache and none ever again.
+    """
+    from alexandria.index.embedder import HashEmbedder
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    calls = []
+    original = HashEmbedder.embed
+
+    def counting(self, texts):
+        calls.append(list(texts))
+        return original(self, texts)
+
+    monkeypatch.setattr(HashEmbedder, "embed", counting)
+    for _ in range(2):
+        _ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+        with _closing(tcp_server, uds_servers):
+            pass
+
+    assert len(calls) == 2, (
+        f"expected one provider-level embed per startup, got {len(calls)}: {calls}")

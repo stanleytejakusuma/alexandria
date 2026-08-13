@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 __all__ = ["create_pending", "is_pending", "list_pending", "oldest_pending_age",
-           "pending_dir", "unlink_pending"]
+           "pending_age", "pending_dir", "unlink_pending"]
 
 
 def pending_dir(corpus: str | Path) -> Path:
@@ -60,6 +60,21 @@ def unlink_pending(corpus: str | Path, entry_id: str) -> bool:
 
 def is_pending(corpus: str | Path, entry_id: str) -> bool:
     return (pending_dir(corpus) / entry_id).exists()
+
+
+def pending_age(corpus: str | Path, entry_id: str, *, now: float | None = None) -> float | None:
+    """Seconds since this entry's marker was written, or None if it is not
+    pending. Same mtime basis as `oldest_pending_age` -- age is measured here
+    rather than by each caller, so the health surface (§7) and `reconcile`
+    (§7.1/F6) cannot drift into judging staleness two different ways."""
+    try:
+        mtime = (pending_dir(corpus) / entry_id).stat().st_mtime
+    except OSError:
+        # Not pending, or the directory does not exist yet. Consumed mid-check
+        # by a concurrent drain lands here too, and "no longer pending" is the
+        # honest answer in that case, not an error.
+        return None
+    return (now if now is not None else time.time()) - mtime
 
 
 def list_pending(corpus: str | Path) -> list[str]:
