@@ -1,16 +1,30 @@
 # SPEC — data model and ambient capture
 
-Status: revised after adversarial review (round 1 of 2). Supersedes nothing;
-extends `SPEC-write-path-and-serve.md` (shipped) and absorbs
+Status: revised after two adversarial review rounds; review budget spent.
+Supersedes nothing; extends `SPEC-write-path-and-serve.md` (shipped) and absorbs
 `SPEC-versioning-and-supersession.md` (written, unbuilt) as its §3.2.
 
-Round 1 found three defects that changed the design, all now fixed and recorded
-in place rather than quietly corrected: the write-ordering justification was
-factually false (D4b), the deduplication mechanism could not catch its own
-motivating example (§3.4), and the headline acceptance gate passed by
-construction (R4). Six further gates were vacuous as written. Where a first-draft
-claim was wrong, the correction says so explicitly — a spec that hides its own
-revisions teaches the next reader nothing.
+**Round 1** found three defects that changed the design: the write-ordering
+justification was factually false (D4b), the deduplication mechanism could not
+catch its own motivating example (§3.4), and the headline acceptance gate passed
+by construction (R4). Six further gates were vacuous as written.
+
+**Round 2** reviewed round 1's *fixes*, which had been written by the same author
+who made the original errors and had never themselves been examined. It found
+that the largest of them, D4a, was half right: the durability half genuinely
+fixed the replay bug, while the availability half left tombstones failing **open**
+and revisions overwriting each other on disk. It also found that the published
+relevance-floor measurement was computed against the wrong score, and that a
+document making capture fully automatic contained **no policy on secrets** — in a
+corpus with no deletion path.
+
+Every correction is recorded in place, with the wrong claim left visible beside
+it. A spec that quietly fixes its own errors teaches the next reader nothing, and
+two of the three round-2 findings exist precisely because a confident earlier
+claim went unchecked.
+
+**Two rounds is the cap.** Remaining risk is carried as named requirements and
+provisional gates (R3, H2), not as further review.
 
 The write-path package made Alexandria *fast and safe to write to*. It did not
 make anything *use* it. This package targets the two gaps that remain: a data
@@ -293,6 +307,44 @@ Three things fall out, and each fixes a real defect in the first draft:
    Had it been authoritative, its loss would destroy the revision graph and the
    backup scope would have had to grow to cover it.
 
+**Two consequences the first version of this decision did not follow through,
+found in review. Both are load-bearing and both are requirements on Phase 1.**
+
+**(a) A tombstone must be enforceable without the projection, or it fails open.**
+A frontmatter-only revision — a tombstone, or adding a `supersedes` link — leaves
+the body text unchanged. `chunk_id` derives from `doc_id`, heading path and text
+(`index/chunker.py`), so the new revision produces *identical* chunk ids, and
+`store.upsert` overwrites in place. Neither `SCALAR_FIELDS` (`index/store.py`)
+nor `METADATA_COLUMNS` (`index/bm25.py`) carries `deleted`, `entity_id` or
+`entity_rev`. So on the shipped schema a tombstoned document is **still fully
+retrievable**, and D5's read-time resolution could only exclude it by joining the
+projection on every search — putting a rebuildable index on the critical read
+path, where a missing or stale one **fails open and serves deleted content**.
+That is the opposite of what a tombstone is for.
+
+> **Requirement:** `deleted` and `entity_id` join `SCALAR_FIELDS` and
+> `METADATA_COLUMNS` in Phase 1, so exclusion is enforced by a filter the
+> retrieval path already applies (`prefilter=True`) and fails **closed**. The
+> projection then accelerates resolution; it never authorises it. Adding these
+> columns is the same schema change §3.5 already requires, so the cost is shared,
+> not new — but it means the tombstone work cannot be sequenced after the FTS
+> rebuild, it must ride along with it.
+
+**(b) Two revisions of one entity collide on disk and the older is destroyed.**
+`source_filename()` (`corpus.py`) is deterministic on `(source, source_id,
+title)`, and `Doc.write` is an unconditional `write_text`. Two revisions of the
+same entity with an unchanged title therefore resolve to the *same path*, and
+writing rev 2 silently destroys rev 1 — which defeats D4's append-only guarantee
+at the storage layer, in a system whose entire audit claim rests on it. The
+repo already names this hazard: `corpus.py`'s docstring advertises `body_hash`
+as "the immutability tripwire", but its only non-test caller is `migrate.py` —
+it is documented, not wired.
+
+> **Requirement:** revision documents are path-disjoint — the filename carries
+> `entity_rev`. Gate D4 must assert two revisions coexist *as files*, not merely
+> as rows. A test that writes rev 2 and reads back a revision graph from the
+> projection passes while rev 1 is already gone.
+
 ### D4b — The generation counter gates caches only
 
 Recorded because the first draft asserted the opposite and built on it.
@@ -418,11 +470,38 @@ and sails past any hash.
 
 So deduplication is enforced where it is decidable:
 
-1. **Source-level idempotency (primary).** Each burst has a stable id derived
-   from its session and boundaries. A burst is distilled **at most once**;
-   consumption is recorded before the observations are written. This is the only
-   mechanism that catches the nondeterministic-redistillation case, because it
-   never invokes the model a second time.
+1. **Source-level idempotency (primary).** Each burst has a stable id. A burst is
+   distilled **at most once**. This is the only mechanism that catches the
+   nondeterministic-redistillation case, because it never invokes the model a
+   second time.
+
+   **Two corrections from review — the first draft described a mechanism the
+   shipped code does not implement.**
+
+   **The current burst id is not stable.** `connectors/pi_sessions.py` derives
+   `burst_id` by hashing every message's role and text. An **open session gaining
+   one more turn therefore produces a different id**, misses the `seen` check, and
+   is redistilled — recreating exactly the §1.4 defect this clause exists to
+   prevent. §5.1.1's periodic sweep makes it *more* likely, because it deliberately
+   runs against sessions that are still live.
+
+   > **Requirement:** derive `burst_id` from `(session path, first-message
+   > timestamp, window ordinal)` — identifiers fixed at the moment a burst opens
+   > and invariant to anything appended after. Gate D7 must distil a burst, append
+   > a turn, and re-distil, asserting one set of observations.
+
+   **Consumption is recorded *after* the writes, not before.** The first draft
+   said before. `commit()` in `connectors/pi_sessions.py` records after, and its
+   docstring gives the reason: a failed distillation must leave the burst
+   unconsumed. Gate A3 requires that behaviour too — so the first draft's ordering
+   contradicted both the code and its own gate. Recording before would convert
+   every transient model failure into permanent silent data loss, which is far
+   worse than the duplicate it prevents.
+
+   > **Resolution:** consumption is recorded **after** the writes. Fail-safe beats
+   > fail-clean here because the corpus has no deletion path but a burst can
+   > always be redistilled. The duplicate window this leaves is closed by the
+   > stable id above, not by the ordering.
 2. **`content_hash` (supplement).** Cheap, `UNIQUE` where a source guarantees
    it, and genuinely useful for byte-identical re-ingestion — the
    re-running-a-connector case. Retained, but no longer load-bearing.
@@ -567,6 +646,54 @@ ingests them — 1,366 documents already present. Ambient write there needs
 nothing new. Only the *read* path needs `serve`, which exists and was proven
 cross-host on 2026-08-12.
 
+### 5.5 Secrets and third-party content — the highest-risk part of this package
+
+**Added in review round 2. The first draft omitted this entirely, which was the
+single most dangerous gap in it.**
+
+Everything above this line makes capture automatic. Session transcripts contain
+pasted credentials, API keys, tokens, private client material, and personal
+information about third parties who never consented to being recorded. Today a
+human decides what to write down and that judgement is the filter. Ambient
+capture removes the human and keeps the filter's absence.
+
+The compounding factor is §1.5: **there is no deletion path.** Automatic capture
+and permanent storage are each defensible alone. Together, without a filter,
+they are a machine for producing unremovable secrets at machine speed — and the
+first time it matters, it will have been running for months.
+
+Requirements, all in Phase 3 and none deferrable:
+
+1. **Redaction before distillation, not after.** A high-entropy/known-prefix scan
+   (`sk-`, `ghp_`, `xox`, `-----BEGIN`, JWT shapes, `Authorization:` headers)
+   runs over burst text *before* it reaches the model. Redact-then-distil, so a
+   secret never leaves the machine in a prompt and never reaches the gateway.
+   The repo already has the pattern list: `.leakpatterns.local` and
+   `scripts/precommit-scan.py`. **Reuse the existing scanner rather than writing
+   a second one** — two scanners drift, and the one that drifts is the one nobody
+   is committing against.
+2. **Fail closed.** A burst whose scan errors is skipped, not captured. It stays
+   unconsumed and is retried; §5.1.1's sweep makes skipping cheap.
+3. **A path exclusion list.** Sessions under configured paths are never captured
+   — the mechanism for client work under NDA, and for anything the operator
+   simply does not want recorded.
+4. **This is not a solved problem and the spec does not pretend otherwise.**
+   Entropy scanning has false negatives; a secret in prose ("the password is
+   hunter2") defeats it. The honest claim is that it removes the *mechanical*
+   class of leak, not that it makes capture safe. Which is why 5.6 exists.
+
+### 5.6 A kill switch, and the ability to inspect before it lands
+
+- `ALEXANDRIA_AMBIENT=0` disables all automatic capture, checked at the top of
+  every trigger path. One environment variable, no restart, no config file. A
+  feature that writes permanently to a corpus with no undo **must** have an off
+  switch that a person can reach in five seconds.
+- Distillation output lands in `inbox/` as a pending entry, so the existing
+  `alexandria promote` path applies and there is a window in which a capture can
+  be inspected and dropped **before** it becomes an indexed document. This costs
+  nothing to build — it is the shipped write path — and is the only review
+  opportunity that exists before permanence.
+
 ---
 
 ## 6. Phase 4 — ambient read
@@ -636,37 +763,73 @@ them, and git history means rewriting or crypto-shredding.
 - **Q4 — does ambient capture cover subagent sessions?** `pi.events.on("subagents:*")`
   exists and subagents do substantial work, but their transcripts are numerous
   and often narrow. Defaulting to no.
-- **Q5 — what is the relevance floor? RESOLVED 2026-08-13, measured.** The
+- **Q5 — what is the relevance floor? PARTLY RESOLVED 2026-08-13. A first
+  answer was published here and was wrong; this records the correction.** The
   blocker was that nothing existed to validate a threshold against. A negative
   set now does: 22 hand-verified queries the corpus cannot answer
   (`.alexandria/golden/negative-v1.jsonl`), measured against the 49-entry golden
   set at 46,021 chunks.
 
+  **The first measurement was computed wrongly.** `separation()` read
+  `scores[0]` for every positive, but `hit` only means the target appeared
+  somewhere in top-k — so for a hit at rank 3 it scored a document that was
+  *wrong*. Corrected to `scores[rank-1]` (`src/alexandria/eval/negative.py`,
+  regression test `test_a_positive_contributes_the_score_of_its_hit_not_of_the_top_result`):
+
+  | | published | corrected |
+  |---|---|---|
+  | positive top-1 median | 0.9819 | 0.9785 |
+  | positive **minimum** | 0.1190 | **0.0274** |
+  | recall at a 0.4409 floor | 87.1% | **83.9%** |
+  | recall at a 0.12 floor | 100% | **90.3%** |
+
+  The median barely moved because 23 of 31 hits are at rank 1; the *minimum*
+  collapsed. **The floor decision depends entirely on the minimum**, so the
+  error fell exactly where it mattered.
+
   | | positive (31 hits) | negative (22) |
   |---|---|---|
-  | top-1 median | 0.9819 | 0.0238 |
-  | top-1 min / max | 0.1190 / 0.9985 | 0.0031 / 0.4409 |
+  | top-1 median | 0.9785 | 0.0238 |
+  | min / max | 0.0274 / 0.9985 | 0.0031 / 0.4409 |
 
-  The distributions separate: a floor at **0.4409** (just above the best
-  unanswerable query) admits zero known-bad results and retains **87.1%** of
-  answerable ones.
+  **The original decision of 0.12 rested on "retains 100%", which is false.** It
+  retains 90.3% and still admits 2 of 22 negatives. The trade-off curve is flat:
 
-  **But the 12.9% it costs is not a random sample.** All four positives falling
-  below that floor are `overlap_band: zero` — queries sharing no vocabulary with
-  their target, which is precisely the class semantic retrieval exists to serve
-  and grep cannot. A floor set for cleanliness taxes the capability the system is
-  built on.
+  | floor | retained | known-bad admitted |
+  |---|---|---|
+  | 0.12 | 90.3% | 2 |
+  | 0.20 | 87.1% | 2 |
+  | 0.3374 | 83.9% | 2 |
+  | 0.4409 | 83.9% | 1 |
 
-  **Decision:** floor at **0.12**, just under the weakest positive hit. It
-  retains 100% of answerable queries and admits 2 of 22 negatives
-  (`stripe-webhook-idempotency` 0.4409, `mongodb-aggregation` 0.3374). For
-  ambient injection this is the right side of the trade: injected context is
-  advisory and the agent can disregard a bad chunk, whereas a dropped chunk is
-  invisible and unrecoverable. The 0.4409 floor is the correct choice for any
-  future surface where a wrong result is *acted on* rather than read.
+  **The finding that survives — and it is stronger than the one it replaces.**
+  All **five** positives below 0.4409 are `overlap_band: zero` (0.0274, 0.0547,
+  0.1032, 0.1671, 0.3262) — queries sharing no vocabulary with their target,
+  precisely the class semantic retrieval exists to serve and grep cannot. The
+  weakest of them scores 0.0274, *below* the negative median of 0.0238's
+  neighbourhood and beneath 8 of the 22 unanswerable queries.
 
-  Both numbers are conventions over one measurement, not constants. Gate R3 is
-  unblocked and specifies 0.12.
+  **Therefore: no score floor separates the zero-overlap band from unanswerable
+  queries.** This is not a threshold that needs tuning; it is the wrong
+  instrument. Any floor high enough to exclude confident nonsense also excludes
+  the hardest real hits, and the band it taxes (33.3% recall — the system's
+  weakest surface) is the one least able to afford it.
+
+  **Decision:** specify **0.12** for Phase 4 ambient injection, on the narrow
+  and now-explicit grounds that injected context is advisory and a wrong chunk
+  is cheaper than a missing one — *not* on any claim of clean separation. Treat
+  it as a starting value to be replaced by observed data, per Q2's
+  measure-then-bound discipline. **Any surface where a retrieved result is
+  acted on rather than read must not use a bare score floor at all** until a
+  better instrument exists.
+
+  **Still unresolved, and why R3 stays provisional:** 21 of the 22 negatives are
+  out-of-domain brand queries (Kafka, Stripe, MongoDB). The realistic ambient-read
+  failure is the *in-domain near-miss* — a query about this corpus's own subject
+  matter that it happens not to cover — and the two negatives scoring highest are
+  the two closest to in-domain. The 0.0238 median is partly an artefact of how
+  easy the negative set is. ≥10 in-domain negatives are required before any floor
+  is treated as validated.
 
   **Known decay:** a negative case asserts absence, and absence expires as the
   corpus grows — including from this session being distilled into it, which will
@@ -684,17 +847,29 @@ vacuous tests in the write-path package.
 
 **Data model**
 - **D1** A LanceDB table created with an all-empty column and later written with
-  values does not raise; the explicit schema holds the declared type.
+  values **reads the values back with the declared dtype intact**. "Does not
+  raise" is vacuous — it passes against a table that accepts writes and returns
+  nothing, which is the exact failure mode being guarded against.
 - **D2** A filtered search over a corpus where the filter excludes most
   documents returns **only** matching documents and returns the full requested
   `k` when that many exist. Behavioural: asserting the shape of a config list or
   that a kwarg equals `prefilter=True` passes against a mock and proves nothing.
 - **D3** An observation with `type="bug"` is rejected at write with a
-  diagnosable error and nothing is persisted.
-- **D4** A correction creates `rev=2`; `rev=1` remains on disk and is retrievable
-  via `--as-of` a date before the correction.
+  diagnosable error and nothing is persisted — asserted at **every** write path,
+  including a connector `sync`, which does not route through `promote.py`. The
+  spec must name the single chokepoint that enforces this; today `Doc.write`
+  performs no validation, so "enforced in code" (D3) has no home and would be
+  enforced only on the path someone remembered.
+- **D4** A correction creates `rev=2`; `rev=1` remains **as a distinct file on
+  disk** and is retrievable via `--as-of` a date before the correction. The
+  file-level assertion is load-bearing: revisions currently resolve to the same
+  path and `Doc.write` overwrites unconditionally, so a projection-only
+  assertion passes while rev 1 has already been destroyed (D4a(b)).
 - **D5** A tombstoned document is absent from search, absent from FTS5, absent
-  from synthesis, and its head row and audit rows still exist.
+  from synthesis, and its head row and audit rows still exist — **with
+  `corpus.sqlite` deleted**. Exclusion must not depend on the projection, or it
+  fails open and serves deleted content whenever the projection is missing or
+  stale (D4a(a)).
 - **D6** Read-time resolution returns exactly one revision per `entity_id`, and
   adds **no more than 50ms to p50** on the real corpus measured over ≥100
   queries. A threshold, because "measurably does not regress" is satisfied by
@@ -709,7 +884,12 @@ vacuous tests in the write-path package.
   draft's mechanism could not catch its own motivating example (§3.4).
 - **D7a** A byte-identical document re-ingested by re-running a connector
   produces one record. This is what `content_hash` genuinely covers.
-- **D8** A title match outranks an equally-scoring body match.
+- **D8** A title match outranks an equally-scoring body match. Note the cost this
+  gate conceals: the FTS schema is `fts5(chunk_id UNINDEXED, text)` with no
+  `title` column and `title` is absent from `METADATA_COLUMNS`, so satisfying it
+  is a full ~46k-chunk FTS rebuild, not a ranking tweak. It sequences **inside
+  Phase 2** alongside the `deleted`/`entity_id` columns D4a(a) requires, so the
+  corpus is rebuilt once rather than three times.
 - **D9** The predecessor connector recovers `type`, `files_read`,
   `files_modified`, `prompt_number` for a known observation, and upgrades the
   existing graph-projected document rather than creating a duplicate.
@@ -721,6 +901,17 @@ vacuous tests in the write-path package.
 - **D10a** Deleting `corpus.sqlite` entirely and rebuilding it from `sources/`
   frontmatter reproduces it exactly — the executable statement of D4a. If this
   fails, the projection is secretly authoritative and the backup scope is wrong.
+  Two conditions, both from review: any column **not** derivable from frontmatter
+  (`relevance_count` is derived from `queries.sqlite`) must be named as excluded,
+  or the gate is unpassable by construction; and the rebuild must be exercised at
+  **corpus scale**, not on a fixture — a rebuild that works on 5 documents and
+  takes 40 minutes on 33,000 has not been shown to work.
+- **D11** Every document carries a frontmatter `schema_version`. Three schema
+  changes are proposed here (typed observations, revision fields, `deleted`);
+  without a version, a future migration cannot tell a pre-migration document from
+  a malformed one, and the repo already has this scar — `index/store.py` raises
+  "index schema predates enrichment columns" because a schema changed with no way
+  to detect which generation a record belonged to.
 
 **Storage**
 - **H1** Compaction reduces fragment count and leaves every chunk retrievable.
@@ -744,25 +935,40 @@ vacuous tests in the write-path package.
   is still captured by the next periodic sweep (§5.1.1). A1 tests the happy path;
   this tests the case the hook cannot see.
 - **A7** Two sessions ending simultaneously produce one set of observations per
-  burst, not two. Exercises §5.1.1's sweep against §3.4's burst-level
-  idempotency under genuine concurrency.
+  burst, not two — asserted with **both writers reaching distillation**, not with
+  one returning `skipped_locked`. The write lock makes the naive version nearly
+  vacuous: the second writer does nothing, so burst idempotency is never
+  exercised. Run the second writer *after* the first releases, against the same
+  still-open session.
+- **A8** A burst containing a credential-shaped string is redacted **before** the
+  model is called (§5.5), asserted by inspecting the prompt, not the output. A
+  gate checking only that the stored observation is clean passes against an
+  implementation that already sent the secret to the gateway.
+- **A9** `ALEXANDRIA_AMBIENT=0` disables capture on every trigger path — shutdown
+  hook and periodic sweep both (§5.6).
+- **A10** A session under a configured excluded path is never captured (§5.5).
 
 **Ambient read**
 - **R1** With `serve` down, a session starts normally — no error, no added
   latency beyond the probe timeout, no injected context.
 - **R2** With `serve` up, relevant context is injected and recorded under a
   distinct `client`.
-- **R3** Below the relevance floor of **0.12** (§9 Q5, measured), nothing is
-  injected. Asserted against the negative set: no `negative-v1.jsonl` query
-  produces injected context at or below the floor, and every golden-set hit
-  clears it.
-- **R4** Re-running the §1.1 audit after a week shows a non-zero count of
-  **agent-initiated** in-session queries, **excluding `client=injection`**.
-  The exclusion is the whole gate: §6 has the session-start hook issue a query
-  every session, so a count that includes injections is non-zero by construction
-  and would pass against an implementation whose injected context is never read.
-  Reported alongside n (sessions observed) and the injection count, so a
-  one-week n=1 result is not mistaken for more than it is.
+- **R3 — PROVISIONAL, not counted green.** Below the relevance floor of **0.12**
+  (§9 Q5), nothing is injected. Asserted against the negative set: 20 of 22
+  `negative-v1.jsonl` queries produce no injected context. **Not** "every
+  golden-set hit clears the floor" — measurably false, 3 of 31 do not, and a gate
+  asserting it would fail on correct behaviour. The gate records the retained
+  fraction (90.3%) rather than asserting completeness.
+  Provisional until ≥10 in-domain negatives exist (§9 Q5).
+- **R4** Re-running the §1.1 audit after a week shows in-session queries that are
+  **agent-initiated**, established by an **allowlist** of caller values — not by
+  excluding `client=injection` alone. That exclusion is necessary but not
+  sufficient: the launchd sweep, the weekly loop, and eval runs all write to the
+  same table, so a deny-list leaves the count satisfiable by machinery. The
+  reported figure is the **rate**: agent-initiated queries in ≥1 of every 3
+  sessions, correlated to sessions by id, over n ≥ 20 sessions. "Non-zero over a
+  week" is passable by a single query and would not distinguish a working system
+  from a dead one.
 
 ---
 

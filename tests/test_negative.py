@@ -180,6 +180,47 @@ def test_missed_positives_are_excluded_from_the_distribution():
     assert report.clean_floor_recall == 1.0
 
 
+def test_a_positive_contributes_the_score_of_its_hit_not_of_the_top_result():
+    """`hit` only means the target was somewhere in top-k -- possibly not first.
+
+    Scores descend, so reading scores[0] for a hit at rank 3 measures a document
+    that was WRONG, inflating the positive distribution and overstating
+    separation. Found by review after the first real run published a floor
+    justified by a positive minimum of 0.1190; corrected, that minimum was
+    0.0274 and the claim it supported ("retains 100%") was false.
+
+    Mutation check: reverting to scores[0] makes positive_top1_min 0.95 and
+    clean_floor_recall 1.0, and this test fails on both.
+    """
+    hit_at_rank_three = EvalResult(
+        id="p0", query="q", hit=True, rank=3,
+        retrieved_ids=["wrong-a", "wrong-b", "target"],
+        latency_ms=1.0, scores=(0.95, 0.80, 0.30),
+    )
+    negatives = [_result("n0", hit=False, scores=[0.50])]
+    report = separation([hit_at_rank_three], negatives)
+    assert report.positive_top1_min == 0.30
+    # The negative outscores the real hit, so no threshold separates them.
+    assert report.clean_floor_recall == 0.0
+    assert report.separable is False
+
+
+def test_a_hit_whose_rank_falls_outside_its_scores_is_skipped_not_crashed():
+    """Defensive: a fake engine may report a rank without a matching score list.
+
+    Skipping is right -- fabricating a score would corrupt the distribution the
+    floor is derived from -- but it must not take the whole run down.
+    """
+    inconsistent = EvalResult(
+        id="p0", query="q", hit=True, rank=9,
+        retrieved_ids=["target"], latency_ms=1.0, scores=(0.9,),
+    )
+    good = _result("p1", hit=True, scores=[0.8])
+    report = separation([inconsistent, good], [_result("n0", hit=False, scores=[0.1])])
+    assert report.n_positive == 1
+    assert report.positive_top1_min == 0.8
+
+
 def test_rows_with_no_results_are_skipped_rather_than_scored_as_zero():
     positives = [_result("p0", hit=True, scores=[0.9])]
     negatives = [_result("n0", hit=False, scores=[0.2]), _result("empty", hit=False, scores=[])]

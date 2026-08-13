@@ -160,8 +160,21 @@ def separation(positive: Sequence[EvalResult], negative: Sequence[EvalResult]) -
     would measure the wrong thing. Rows with no results at all are skipped on
     both sides -- an empty result set has no top-1 score to compare, and treating
     it as 0.0 would flatter the separation.
+
+    A positive contributes the score of the *hit itself* (`scores[rank-1]`), not
+    of the engine's top result. `hit` only means the target appeared somewhere in
+    top-k, so for a hit at rank 3 the top-1 score belongs to a document that was
+    wrong. Scores descend, so taking scores[0] silently inflates the positive
+    distribution and overstates separation -- measured on the first real run:
+    minimum positive fell 0.1190 -> 0.0274 once corrected, moving the retained
+    fraction at a 0.12 floor from an apparent 100% to 90.3%. A negative has no
+    correct answer by definition, so its top-1 score is the right measure: it is
+    the engine's most confident wrong claim.
     """
-    positive_scores = sorted(r.scores[0] for r in positive if r.hit and r.scores)
+    positive_scores = sorted(
+        r.scores[r.rank - 1] for r in positive
+        if r.hit and r.scores and 0 < r.rank <= len(r.scores)
+    )
     negative_scores = sorted(r.scores[0] for r in negative if r.scores)
     if not positive_scores or not negative_scores:
         raise ValueError(
