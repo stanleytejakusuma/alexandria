@@ -59,6 +59,7 @@ from .reconcile import reconcile_inbox
 from .retrieval.rerank import CrossEncoderReranker
 from .retrieval.search import SearchConfig, SearchEngine
 from .schema import Severity, validate
+from .writelock import DEFAULT_LOCK_TIMEOUT, write_lock
 
 def cmd_migrate(args) -> int:
     report = migrate_kg_sync(args.vault, args.corpus, dry_run=args.dry_run)
@@ -482,6 +483,38 @@ def cmd_index(args) -> int:
               f"model={manifest['model']} dim={manifest['dim']} "
               f"normalized={manifest['normalized']} dtype={manifest['dtype']}")
         return 0
+
+    # BACKLOG #50: promote_pending is the only other writer of the FTS/vector
+    # tables this command drops and rebuilds (--rebuild) or otherwise writes
+    # into. Neither `write_lock()`'s LOCK_NB default nor cmd_index taking no
+    # lock at all excludes the other -- a promote (CLI, or serve's 600s drain)
+    # can land its FTS insert after this run's chunk-record snapshot is taken
+    # but before --rebuild's lexical.drop() wipes the table, which then never
+    # gets that promote's row back (the rebuild only re-adds the pre-drop
+    # snapshot). The promote still unlinks its pending marker regardless, so
+    # the entry is permanently promoted-but-unsearchable in a corpus with no
+    # deletion path. Unlike the drain, an index run that silently skipped or
+    # silently raced would be exactly the "reported success while doing
+    # nothing" failure this project keeps finding -- so index WAITS for the
+    # lock (bounded, DEFAULT_LOCK_TIMEOUT -- see writelock.py for why 30s) and
+    # fails loudly, non-zero, naming the holder, rather than skip or race.
+    lock = write_lock(corpus)
+    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+        holder = lock.holder_pid()
+        holder_desc = f"pid {holder}" if holder else "an unknown process"
+        raise SystemExit(
+            f"alexandria: index could not acquire the corpus write lock within "
+            f"{DEFAULT_LOCK_TIMEOUT:.0f}s (held by {holder_desc}). Refusing to run "
+            f"a partial or racing index -- wait for the current writer (promote, "
+            f"or serve's drain) to finish and retry.")
+    try:
+        return _cmd_index_locked(args, config, corpus)
+    finally:
+        lock.release()
+
+
+def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
+    """The body of `index`, run while BACKLOG #50's write lock is held."""
     records, errors = _load_chunk_records(corpus, config, args.limit, args.workers)
     for error in errors:
         print(f"skip: {error}", file=sys.stderr)
