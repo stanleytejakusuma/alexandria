@@ -72,14 +72,34 @@ def all_files() -> list[str]:
     return [f for f in r.stdout.splitlines() if f.strip()]
 
 
+# A zero-width character splits a name in two for every regex below while
+# leaving it perfectly readable to a human -- `H\u200dermes` defeats a /Hermes/
+# pattern and still reads as the name on GitHub. Found in three files on
+# 2026-08-13, after they had already been pushed to a public repo. There is no
+# legitimate use for these in this codebase, so they are both stripped before
+# matching AND reported in their own right.
+ZERO_WIDTH = "\u200b\u200c\u200d\u2060\ufeff"
+_ZERO_WIDTH_RE = re.compile(f"[{ZERO_WIDTH}]")
+
+
 def scan_text(text: str, patterns: list[tuple[str, str]]) -> list[tuple[int, str, str]]:
     """Return (lineno, pattern_name, matched_snippet) for every hit."""
     hits = []
     for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = _ZERO_WIDTH_RE.sub("", line)
+        evaded = stripped != line
+        if evaded:
+            col = _ZERO_WIDTH_RE.search(line).start()
+            hits.append((lineno, "zero-width character (leak-scanner evasion)",
+                         line[max(0, col - 30):col + 20].strip()[:60]))
         for name, rx in patterns:
-            m = re.search(rx, line)
-            if m:
-                hits.append((lineno, name, m.group(0)[:60]))
+            # Match the stripped form too, or the evasion still works: the
+            # character is reported but the name it hides is not.
+            for candidate in ((line, stripped) if evaded else (line,)):
+                m = re.search(rx, candidate)
+                if m:
+                    hits.append((lineno, name, m.group(0)[:60]))
+                    break
     return hits
 
 

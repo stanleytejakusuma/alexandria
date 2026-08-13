@@ -5,7 +5,7 @@ The fixed cost this amortizes is the ~16s embedding-model cold load (D3),
 not the vector store -- LanceDB is an embedded library, not something that
 benefits from a daemon on its own. `serve` exists to (a) kill that 16s on
 every CLI invocation, (b) provide the read path a second harness on another
-host needs (§12's H‍ermes acceptance canary), and (c) let `/remember` run
+host needs (§12's second-host acceptance canary), and (c) let `/remember` run
 promote inline instead of waiting for the drain timer.
 
 Deliberately NOT built (§10): TLS, auth beyond filesystem/socket identity,

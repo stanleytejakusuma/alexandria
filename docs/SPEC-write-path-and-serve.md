@@ -798,7 +798,7 @@ much further — the one item here that genuinely gets more expensive with time.
 
 ## 12. Acceptance
 
-The package is done when a **fresh Pi session** and **H‍ermes on the second host** both
+The package is done when a **fresh Pi session** and **the agent on the second host** both
 answer a question correctly from the same corpus, over the real path, where the answer
 depends on a fact recorded *after* the server started — and neither could have known it
 otherwise.

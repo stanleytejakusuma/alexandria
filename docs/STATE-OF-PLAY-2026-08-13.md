@@ -159,7 +159,7 @@ argument for ambient capture and it is empirical, not rhetorical.
 
 | # | Item | Blocked on |
 |---|---|---|
-| **13** | H‍ermes real-path canary — proven by `curl` from the second host, never wired into its actual skill | user approval; capital-bearing host |
+| **13** | second-host real-path canary — proven by `curl` from the second host, never wired into its actual skill | user approval; capital-bearing host |
 | **18** | Opus review pass on the write-path **code** (rounds 1–2 covered the spec) | nothing |
 | **20** | Golden set n=49 has no significance bar — small recall moves indistinguishable from noise | nothing; blocks BACKLOG #29 |
 | **21** | Negatives decay as the corpus grows; this session's own distillation adds documents containing Kafka/MongoDB/Stripe | re-verify when golden set is reviewed |
