@@ -15,14 +15,19 @@ Each test here fails if its guard is reverted; that is the point of them.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 
 import pytest
 
-from alexandria.cli import app, append_inbox_entry
+from alexandria.cli import app, append_inbox_entry, _cached_embedder
+from alexandria.config import load_config
 from alexandria.connectors.inbox import parse_inbox_file
 from alexandria.index.manifest import read_manifest
+from alexandria.index.bm25 import BM25Index
+from alexandria.index.store import VectorStore
+from alexandria.promote import promote_pending
 
 
 # --- 1. the inbox append is atomic -------------------------------------------------
@@ -129,3 +134,90 @@ def test_a_second_promote_is_not_deadlocked_by_the_write_guard(tmp_path, monkeyp
 
     assert app(["--corpus", str(corpus), "remember", "second fact about billing"]) == 0
     assert app(["--corpus", str(corpus), "promote"]) == 0
+
+
+# --- 4. round-3 fixes: the two gates the round-2 fixes left untested ---------------
+
+
+def test_a_promote_that_dies_before_writing_vectors_does_not_mislabel_the_index(
+    tmp_path, monkeypatch
+):
+    """The claim predicate must be the SAME predicate the guard exempts on.
+
+    With the claim keyed on `read_manifest() is None` but the exemption keyed
+    on `store.count() == 0`, a promote that claims provider A and then dies
+    before store.upsert leaves an empty index labelled A. The next promote
+    under provider B is exempted (count is still 0), sees a manifest present
+    so does not claim, and lands B vectors under an A label. promote never
+    rewrites the manifest at the end the way cmd_index does, so nothing ever
+    repairs it -- and there is no deletion path.
+    """
+    from alexandria.index.manifest import read_manifest
+
+    corpus = tmp_path / "corpus"
+    (corpus / ".alexandria").mkdir(parents=True)
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    assert app(["--corpus", str(corpus), "remember", "first fact"]) == 0
+
+    config = load_config(corpus_override=corpus)
+    embedder = _cached_embedder(config, corpus)
+    store = VectorStore(corpus / ".alexandria" / "index")
+    lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+
+    class Boom(RuntimeError):
+        pass
+
+    def die_after_embed(step):
+        if step == "embed":
+            raise Boom("process died before any vector landed")
+
+    with pytest.raises(Boom):
+        promote_pending(corpus, config, embedder, store, lexical, test_hook=die_after_embed)
+
+    # The crash left a manifest but no vectors: exactly the stranded state.
+    assert read_manifest(corpus) is not None
+    assert store.count() == 0
+
+    # A second promote under the same empty-index condition must RE-CLAIM,
+    # not skip. Reverting the predicate to `read_manifest(corpus) is None`
+    # makes this assertion fail, because the stale claim survives.
+    stale = dict(read_manifest(corpus))
+    stale["provider"] = "some-other-provider"
+    manifest_path = corpus / ".alexandria" / "index" / "manifest.json"
+    manifest_path.write_text(json.dumps(stale), encoding="utf-8")
+
+    result = promote_pending(corpus, config, embedder, store, lexical)
+
+    assert result.promoted, "the entry should have promoted on the retry"
+    assert store.count() > 0, "vectors landed, so the label now matters"
+    assert read_manifest(corpus)["provider"] == config.embed_provider, (
+        "the manifest still carries a provider that did not build these vectors"
+    )
+
+
+def test_a_remember_whose_marker_fails_reports_it_rather_than_claiming_success(
+    tmp_path, monkeypatch
+):
+    """F6: an entry written to the inbox with no pending marker is invisible
+    to promote. remember must not report success, and the distinct
+    inbox_write_failed status must not be conflated with it -- reconcile keys
+    off these codes, so a mislabel sends recovery down the wrong path."""
+    corpus = tmp_path / "corpus"
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+
+    def refuse(*a, **kw):
+        raise OSError(errno.EROFS, "read-only file system")
+
+    monkeypatch.setattr("alexandria.cli.create_pending", refuse)
+    result = append_inbox_entry(corpus, "a fact whose marker cannot be written")
+
+    assert result.status == "marker_failed", "must not be reported as written"
+    assert result.entry is not None, "the entry EXISTS on disk; callers need its id to recover"
+    assert "read-only file system" in (result.error or "")
+
+    # The inbox entry is genuinely there -- which is why silence would be a
+    # data-visibility bug rather than a no-op.
+    entries = parse_inbox_file(result.path)
+    assert len(entries) == 1
+    assert entries[0].entry_id == result.entry.entry_id

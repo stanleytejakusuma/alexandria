@@ -89,14 +89,23 @@ def promote_pending(corpus, config, embedder, store, lexical, *,
         # different --embed-provider would otherwise pollute the vector space
         # silently. serve verifies at startup (S9); cmd_promote builds its own.
         verify_manifest_for_write(corpus, embedder, config.embed_provider, store)
-        if read_manifest(corpus) is None:
+        if store.count() == 0:
             # promote is a writer, so it must claim the vector space it is about
             # to populate. Written BEFORE any vector lands: a corpus reached
             # only through remember+promote (never `alexandria index`) would
             # otherwise end up non-empty with no manifest, and every subsequent
-            # promote would refuse forever. Claiming first also survives a crash
-            # at any of the five write-order points, where claiming afterwards
-            # would leave exactly that unrecoverable state.
+            # promote would refuse forever.
+            #
+            # The condition MUST be the same predicate the guard exempts on
+            # (count == 0), not `read_manifest() is None`. With the two out of
+            # step, a promote that claimed provider A and then failed before
+            # store.upsert leaves an empty index labelled A; the next promote
+            # under provider B is exempted by count == 0, finds a manifest
+            # present so does not rewrite it, and lands B vectors under an A
+            # label. promote never rewrites the manifest at the end the way
+            # cmd_index does, so nothing repairs it -- permanent mislabelling
+            # in a corpus with no deletion path. Re-claiming whenever the index
+            # is empty is idempotent and closes that window.
             write_manifest(corpus, embedder, config.embed_provider)
         conn = InboxConnector(inbox_dir=corpus / "inbox")
         wanted = set(ids)

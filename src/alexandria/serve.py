@@ -287,6 +287,8 @@ def _handle_remember(ctx: ServeContext, identity: str, payload: dict) -> tuple[i
         return _json_error(400, result.error)
     if result.status == "duplicate":
         return _json_ok(200, {"status": "duplicate"})
+    if result.status == "inbox_write_failed":
+        return _json_error(500, f"failed to write the inbox entry: {result.error}")
     if result.status == "marker_failed":
         return _json_error(500, f"wrote inbox entry but failed to mark it pending: {result.error}")
 

@@ -7,8 +7,10 @@ busiest. Grouped by the surface they defend.
 
 from __future__ import annotations
 
+import errno
 import io
 import json
+import os
 import socket
 import tarfile
 import threading
@@ -96,29 +98,49 @@ def test_s2_a_non_numeric_content_length_gets_a_4xx_not_a_dropped_socket(tmp_pat
 
 # --- F6: the pending scan races a drain, by design ----------------------------------
 
+def _vanish_between_is_file_and_stat(monkeypatch, directory: Path, *, victims: int):
+    """Reproduce the ACTUAL production window, which an earlier draft of these
+    tests missed entirely.
+
+    `Path.is_file()` calls `Path.stat()` and swallows a real ENOENT via
+    `_ignore_error`, returning False. So a marker that vanishes BEFORE is_file
+    is simply skipped -- no exception, no bug. The only window that can raise
+    is between is_file's stat and the SECOND, explicit stat that reads st_mtime.
+
+    That distinction is not pedantic: the earlier draft unlinked on the first
+    stat and therefore passed against the unguarded code, which is exactly the
+    class of test this project keeps getting burned by. Here the first stat for
+    a given path succeeds and the second raises a real ENOENT (errno 2), which
+    is what a concurrent promote actually produces.
+    """
+    real_stat = Path.stat
+    seen: dict[Path, int] = {}
+    hits = {"n": 0}
+
+    def staged_stat(self, *a, **kw):
+        if self.parent == directory and hits["n"] < victims:
+            seen[self] = seen.get(self, 0) + 1
+            if seen[self] == 2:
+                hits["n"] += 1
+                self.unlink(missing_ok=True)
+                raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(self))
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", staged_stat)
+    return hits
+
+
 def test_listing_pending_survives_a_marker_consumed_mid_scan(tmp_path, monkeypatch):
-    """The marker IS the redo log, so promote unlinks it concurrently. A
-    scan that stats what it just listed hits FileNotFoundError. Reverting the
-    guard makes this raise."""
+    """The marker IS the redo log, so promote unlinks it concurrently. A scan
+    that stats what it just listed hits FileNotFoundError."""
     corpus = tmp_path / "corpus"
     for i in range(30):
         create_pending(corpus, f"entry-{i}")
 
-    directory = pending_dir(corpus)
-    real_stat = Path.stat
-    hit = {"n": 0}
-
-    def flaky_stat(self, *a, **kw):
-        # Consume a marker at the moment the scan reaches it.
-        if self.parent == directory and hit["n"] < 5:
-            hit["n"] += 1
-            self.unlink(missing_ok=True)
-        return real_stat(self, *a, **kw)
-
-    monkeypatch.setattr(Path, "stat", flaky_stat)
+    hits = _vanish_between_is_file_and_stat(monkeypatch, pending_dir(corpus), victims=5)
     names = list_pending(corpus)  # must not raise
 
-    assert hit["n"] == 5, "the race was never triggered; test is not proving anything"
+    assert hits["n"] == 5, "the race never fired; this test would prove nothing"
     assert len(names) == 25
 
 
@@ -129,20 +151,11 @@ def test_the_liveness_signal_does_not_die_when_a_drain_is_running(tmp_path, monk
     for i in range(10):
         create_pending(corpus, f"entry-{i}")
 
-    directory = pending_dir(corpus)
-    real_stat = Path.stat
-
-    def flaky_stat(self, *a, **kw):
-        # No .exists() here -- it calls stat(), which is this function.
-        if self.parent == directory:
-            self.unlink(missing_ok=True)
-            raise FileNotFoundError(self)
-        return real_stat(self, *a, **kw)
-
-    monkeypatch.setattr(Path, "stat", flaky_stat)
+    hits = _vanish_between_is_file_and_stat(monkeypatch, pending_dir(corpus), victims=3)
     age = oldest_pending_age(corpus)  # must not raise
 
-    assert age is None, "every marker vanished, so there is no oldest entry"
+    assert hits["n"] == 3, "the race never fired; this test would prove nothing"
+    assert age is not None, "seven markers survived, so there is still an oldest"
 
 
 def test_a_real_concurrent_drain_does_not_break_the_scan(tmp_path):

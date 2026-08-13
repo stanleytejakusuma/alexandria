@@ -201,7 +201,8 @@ class RememberResult:
     /remember handler (§5), so the §7.1 write-ordering contract (marker
     written BEFORE success is reported) is implemented exactly once."""
     entry: InboxEntry | None
-    status: str  # "written" | "duplicate" | "empty" | "marker_failed" | "invalid"
+    status: str  # "written" | "duplicate" | "empty" | "inbox_write_failed"
+    #             | "marker_failed" | "invalid"
     path: Path | None = None
     error: str | None = None
 
@@ -289,9 +290,10 @@ def append_inbox_entry(corpus: Path, text: str, *, from_: str | None = None,
     finally:
         os.close(fd)
     if written != len(payload):
-        # A short write leaves a torn entry that a concurrent append can
-        # interleave into; say so rather than reporting success.
-        return RememberResult(None, "marker_failed", path=path,
+        # A short write leaves a torn entry. `marker_failed` would be a lie --
+        # the marker was never attempted -- and reconcile keys off that status,
+        # so mislabelling here sends recovery down the wrong path.
+        return RememberResult(None, "inbox_write_failed", path=path,
                               error=f"short write to {path}: {written}/{len(payload)} bytes")
     # SPEC §7.1 mitigation 1: the pending marker is written BEFORE reporting
     # success. An entry that reaches the inbox but not the pending directory
@@ -336,7 +338,17 @@ def cmd_promote(args) -> int:
     embedder = _cached_embedder(config, corpus)
     store = VectorStore(corpus / ".alexandria" / "index")
     lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
-    result = promote_pending(corpus, config, embedder, store, lexical)
+    try:
+        result = promote_pending(corpus, config, embedder, store, lexical)
+    except ManifestMissing as exc:
+        # A corpus indexed before manifests existed has vectors but no manifest,
+        # so the write guard refuses. That is correct, but a bare traceback does
+        # not tell the operator the one-command way out.
+        raise SystemExit(
+            f"alexandria: {exc}\n"
+            "  this index predates the manifest, so its embedding provider cannot be\n"
+            "  verified. If you are certain --embed-provider matches what built it:\n"
+            "    alexandria --corpus <path> index --backfill-manifest") from exc
     if result.skipped_locked:
         print("promote: write lock held by another process, skipped this run")
         return 0
@@ -427,14 +439,28 @@ def cmd_restore(args) -> int:
     verb = "would restore" if args.dry_run else "restored"
     print(f"restore: {verb} {len(result.restored)} paths from {args.archive}")
     if result.skipped:
+        # Every one, not a preview: this list is the evidence that an archive
+        # was tampered with or truncated, and a "... and N more" tail is the
+        # part an attacker would want hidden.
         print(f"restore: SKIPPED {len(result.skipped)} member(s) outside the state allowlist:")
-        for name in result.skipped[:10]:
+        for name in result.skipped:
             print(f"  - {name}")
-        if len(result.skipped) > 10:
-            print(f"  ... and {len(result.skipped) - 10} more")
     for name in result.restored:
         print(f"restore: {verb} {name}")
     return 0
+
+
+def _guarded_write_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
+    """F4 on the write path: refuse BEFORE embedding, or the run writes foreign
+    vectors into the existing column and then rewrites the manifest to match,
+    after which the read-path guard passes forever over a mixed vector space."""
+    embedder = _cached_embedder(config, corpus)
+    try:
+        verify_manifest_for_write(corpus, embedder, config.embed_provider,
+                                  VectorStore(corpus / ".alexandria" / "index"))
+    except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
+        raise SystemExit(f"alexandria: {exc}") from exc
+    return embedder
 
 
 def cmd_index(args) -> int:
@@ -456,6 +482,10 @@ def cmd_index(args) -> int:
     records, errors = _load_chunk_records(corpus, config, args.limit, args.workers)
     for error in errors:
         print(f"skip: {error}", file=sys.stderr)
+    # F4 must run before ANY embedding, and enrichment embeds too (it calls
+    # _cached_embedder itself). Guarding only just before the main pipeline
+    # made "refuse before embedding" true on the non-enrich path only.
+    embedder = _guarded_write_embedder(config, corpus)
     if args.enrich:
         from .enrich import EnrichmentStore, enrich_docs_for_index, recipe_signature
         store = EnrichmentStore(corpus / ".alexandria" / "index")
@@ -518,14 +548,6 @@ def cmd_index(args) -> int:
             raise ValueError(
                 "rebuild set contains duplicate chunk_id(s); append would insert "
                 f"every copy: {dupes}")
-    embedder = _cached_embedder(config, corpus)
-    # F4 on the write path: refuse BEFORE embedding, or this run writes foreign
-    # vectors into the existing column and then rewrites the manifest to match,
-    # after which the read-path guard passes forever over a mixed vector space.
-    try:
-        verify_manifest_for_write(corpus, embedder, config.embed_provider, store)
-    except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
-        raise SystemExit(f"alexandria: {exc}") from exc
     started = time.monotonic()
     stats = _run_index_pipeline(records, embedder, store, lexical,
                                 batch_size=config.embed_batch_size,
