@@ -28,3 +28,6 @@ build/
 .idea/
 .vscode/
 .alexandria/
+
+# A worktree .venv is a symlink; the trailing-slash form above does not match one.
+.venv

@@ -14,6 +14,20 @@ change should not pay eval wall-clock time. Requires a real corpus + built index
 either is absent (a fresh clone, a CI box with no private corpus), this SKIPS rather
 than blocks -- the leak scanner is unconditional because it's about safety, this is
 about caution, and caution that blocks unrelated work stops being followed.
+
+TWO GATES, TWO PURPOSES (BACKLOG #20). That skip is honest but it left the repo with
+no gate at all for everyone else: on a fresh clone or in CI, a retrieval change was
+measured by nothing. So a retrieval-relevant change now runs BOTH:
+
+  1. scripts/synthetic-eval-gate.py -- unconditional, ~20s, over the synthetic corpus
+     committed in tests/fixtures/. Verifies the HARNESS: scoring, recall, the Wilson
+     interval, the significance bar, manifest/embed plumbing. It cannot see real
+     knowledge, so it can never tell you retrieval is GOOD.
+  2. `alexandria eval --fail-on-regression` -- skipped without the private corpus.
+     The only thing here that measures retrieval QUALITY.
+
+A green (1) with (2) skipped means the instrument works and nothing has been said
+about quality. Do not report it as the latter.
 """
 
 from __future__ import annotations
@@ -91,16 +105,36 @@ def main() -> int:
               "still required for prompt changes).", file=sys.stderr)
         return 0
 
+    # The reproducible half: runs everywhere, needs no private corpus and no
+    # network. Deliberately BEFORE the skippable half, so the check that always
+    # runs is also the one that always reports.
+    print("eval-gate: retrieval-relevant files changed, running the synthetic "
+          "harness gate ...", file=sys.stderr)
+    synthetic = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "synthetic-eval-gate.py")],
+        cwd=REPO, capture_output=True, text=True,
+    )
+    print(synthetic.stdout)
+    if synthetic.returncode != 0:
+        print(synthetic.stderr, file=sys.stderr)
+        print("eval-gate FAILED -- the synthetic harness gate is red. This does not "
+              "mean retrieval quality dropped; it means the measuring instrument "
+              "itself is broken, which invalidates every number the private gate "
+              "would report next.", file=sys.stderr)
+        return 1
+
     corpus = Path.home() / "alexandria-corpus"
     golden = corpus / ".alexandria" / "golden" / "golden-v1.jsonl"
     index = corpus / ".alexandria" / "index"
     if not golden.exists() or not index.exists():
-        print("eval-gate: SKIPPED (no private corpus/index on this machine -- "
-              "expected on a fresh clone or CI box)", file=sys.stderr)
+        print("eval-gate: private-corpus half SKIPPED (no private corpus/index on "
+              "this machine -- expected on a fresh clone or CI box). The synthetic "
+              "gate above passed: the harness works. Retrieval QUALITY was not "
+              "measured by this commit.", file=sys.stderr)
         return 0
 
-    print("eval-gate: retrieval-relevant files changed, running "
-          "`alexandria eval --fail-on-regression` ...", file=sys.stderr)
+    print("eval-gate: running `alexandria eval --fail-on-regression` against the "
+          "private corpus ...", file=sys.stderr)
     result = subprocess.run(
         [str(REPO / ".venv" / "bin" / "alexandria"), "eval", "--fail-on-regression"],
         cwd=REPO, capture_output=True, text=True,
