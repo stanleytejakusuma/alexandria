@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .filtering import sqlite_where
+from .filtering import deleted_flag, not_deleted_clause, sqlite_where
 
 __all__ = ["BM25Index"]
 
@@ -18,7 +18,18 @@ STOP_WORDS = frozenset({
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it",
     "of", "on", "or", "that", "the", "to", "was", "were", "what", "when", "where", "with",
 })
-METADATA_COLUMNS = ("type", "project", "status", "source", "tags", "entities", "layer", "generated_at")
+# The user-facing filter whitelist: the fields a caller may filter a query ON.
+#
+# "deleted" is deliberately NOT a member. The lexical leg's half of SPEC §D4a
+# (a filter enforced only on the dense leg is a hole a lexical-only query walks
+# straight through) is satisfied by the real `deleted` column in the
+# chunk_metadata DDL below plus the unconditional `not_deleted_clause` in
+# search() -- enforced on every query rather than opt-in per request. Adding it
+# here would let a caller filter on the flag, which is a different feature and
+# not the requirement. Unlike store.py's SCALAR_FIELDS, this tuple is not a
+# write-time projection, so absence from it drops nothing.
+METADATA_COLUMNS = ("type", "project", "status", "source", "tags", "entities", "layer",
+                    "generated_at")
 
 
 class BM25Index:
@@ -61,8 +72,19 @@ class BM25Index:
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS chunk_metadata ("
             "chunk_id TEXT PRIMARY KEY, type TEXT, project TEXT, status TEXT, source TEXT, tags TEXT NOT NULL, "
-            "entities TEXT NOT NULL, layer TEXT NOT NULL, generated_at TEXT)"
+            "entities TEXT NOT NULL, layer TEXT NOT NULL, generated_at TEXT,"
+            " deleted TEXT NOT NULL DEFAULT 'false')"
         )
+        # Same migration reasoning as index/store.py's _SQLiteVectorStore._create:
+        # a literal DEFAULT backfills pre-existing rows as visible, which is
+        # correct here too (no row could have been deleted before this column
+        # existed) and avoids hiding an entire pre-migration corpus until the
+        # next full reindex.
+        try:
+            self.connection.execute(
+                "ALTER TABLE chunk_metadata ADD COLUMN deleted TEXT NOT NULL DEFAULT 'false'")
+        except sqlite3.OperationalError:
+            pass  # already present
         self.connection.commit()
 
     # chunks_fts declares chunk_id UNINDEXED, so there is no index to resolve
@@ -108,13 +130,14 @@ class BM25Index:
                 layer = "wiki" if doc_id.startswith("wiki/") else "sources"
                 values = [chunk.get(field) for field in ("type", "project", "status", "source")]
                 values += [json_dumps_list(chunk.get("tags")), json_dumps_list(chunk.get("entities")),
-                           layer, chunk.get("generated_at")]
+                           layer, chunk.get("generated_at"), deleted_flag(chunk.get("deleted"))]
                 self.connection.execute(
-                    "INSERT INTO chunk_metadata(chunk_id, type, project, status, source, tags, entities, layer, generated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO chunk_metadata(chunk_id, type, project, status, source, tags, entities, layer, "
+                    "generated_at, deleted) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(chunk_id) DO UPDATE SET type=excluded.type, project=excluded.project, "
                     "status=excluded.status, source=excluded.source, tags=excluded.tags, entities=excluded.entities, "
-                    "layer=excluded.layer, generated_at=excluded.generated_at",
+                    "layer=excluded.layer, generated_at=excluded.generated_at, deleted=excluded.deleted",
                     [chunk["chunk_id"], *values],
                 )
 
@@ -125,10 +148,14 @@ class BM25Index:
         if expression is None:
             return []
         clause, params = sqlite_where(where, alias="m")
+        # not_deleted_clause is unconditional, same reasoning as
+        # index/store.py's search_vector: applied inside the WHERE that gates
+        # candidate selection, not as a post-hoc filter after LIMIT, so a
+        # deleted row never occupies one of the k slots.
         rows = self.connection.execute(
             "SELECT f.chunk_id, -bm25(chunks_fts) AS score "
             "FROM chunks_fts AS f JOIN chunk_metadata AS m ON m.chunk_id = f.chunk_id "
-            f"WHERE chunks_fts MATCH ? AND {clause} "
+            f"WHERE chunks_fts MATCH ? AND {not_deleted_clause('m')} AND {clause} "
             "ORDER BY bm25(chunks_fts), f.chunk_id LIMIT ?",
             [expression, *params, k],
         ).fetchall()

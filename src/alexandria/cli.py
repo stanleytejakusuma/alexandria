@@ -414,6 +414,133 @@ def cmd_reconcile(args) -> int:
     return 0 if report.healthy else 1
 
 
+def _doc_path_for(corpus: Path, doc_id: str) -> Path:
+    """doc_id -> corpus-relative markdown path, inverting corpus.doc_id().
+    Lenient about a caller passing the trailing `.md` either way."""
+    stem = doc_id[:-3] if doc_id.endswith(".md") else doc_id
+    return corpus / f"{stem}.md"
+
+
+def _cmd_list_deleted(corpus: Path) -> int:
+    """Source of truth is frontmatter (SPEC §D4a-style: the index is a
+    rebuildable projection), so this walks `sources/`+`wiki/` directly rather
+    than querying the index -- it is correct even before the corpus has ever
+    been indexed, and it can never disagree with what a rebuild would derive.
+    """
+    found: list[str] = []
+    for path in sorted(corpus.rglob("*.md")):
+        rel = path.relative_to(corpus)
+        if not is_indexable_source(rel):
+            continue
+        try:
+            doc = Doc.read(path, root=corpus)
+        except ValueError:
+            continue  # cmd_lint's job to report malformed frontmatter, not this one's
+        if doc.frontmatter.get("deleted") is True:
+            found.append(doc.doc_id)
+    if not found:
+        print("delete --list: no documents are flagged deleted")
+        return 0
+    for doc_id in found:
+        print(doc_id)
+    print(f"\n{len(found)} document(s) flagged deleted")
+    return 0
+
+
+def cmd_delete(args) -> int:
+    """Soft-delete (or --undelete) one document, and reproject the flag into
+    both indexes immediately -- never return 0 having only touched
+    frontmatter. SPEC §D4a's blocker is exactly a frontmatter-only tombstone:
+    it survives `store.upsert`'s field projection by being silently dropped,
+    so the chunk stays fully retrievable. `deleted` is a SCALAR_FIELDS member
+    (index/store.py) and a real chunk_metadata column (index/bm25.py) precisely
+    so that cannot happen here. Note it is deliberately NOT in bm25's
+    METADATA_COLUMNS: that tuple is the user-facing filter whitelist, and this
+    flag is enforced unconditionally by not_deleted_clause on every query
+    rather than being opt-in per request.
+
+    The durable half of the flag is the frontmatter write: `deleted` is a
+    document property re-derived by `doc_frontmatter_metadata` on every
+    reindex (index/chunker.py), so a `--rebuild` or a later `promote` can
+    never resurrect a tombstoned document by accident -- it will just derive
+    the same `deleted: true` fresh from disk. The index write below is purely
+    an optimization so the effect is immediate instead of waiting on the next
+    `alexandria index`.
+    """
+    config = _config_for(args)
+    corpus = config.corpus_path
+    if args.list:
+        return _cmd_list_deleted(corpus)
+    if not args.doc_id:
+        print("alexandria: delete requires a doc_id (or --list)", file=sys.stderr)
+        return 1
+
+    path = _doc_path_for(corpus, args.doc_id)
+    if not path.is_file():
+        print(f"alexandria: no such document: {args.doc_id}", file=sys.stderr)
+        return 1
+    try:
+        doc = Doc.read(path, root=corpus)
+    except ValueError as exc:
+        print(f"alexandria: {exc}", file=sys.stderr)
+        return 1
+
+    want_deleted = not args.undelete
+    already = doc.frontmatter.get("deleted") is True
+    doc.frontmatter["deleted"] = want_deleted
+    doc.write(corpus)
+
+    records, error = chunk_doc_records(path, corpus, config)
+    if error:
+        print(f"alexandria: {error}", file=sys.stderr)
+        return 1
+
+    verb = "undeleted" if args.undelete else "deleted"
+    ready: list[dict] = []
+    if records:
+        lock = write_lock(corpus)
+        if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+            holder = lock.holder_pid()
+            print(f"alexandria: frontmatter updated ({args.doc_id} is now {verb}) but could "
+                  f"not acquire the corpus write lock within {DEFAULT_LOCK_TIMEOUT:.0f}s "
+                  f"(held by {holder or 'an unknown process'}) -- the index still reflects "
+                  f"the OLD state until the next `alexandria index` run.", file=sys.stderr)
+            return 1
+        try:
+            store = VectorStore(corpus / ".alexandria" / "index")
+            lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+            # Reuse each chunk's EXISTING vector rather than re-embedding: the
+            # flag change never touches chunk text, so chunk_id (content-
+            # derived, see index/chunker.py's _make) is unchanged and the old
+            # vector is still correct. This is a metadata-only flip, and
+            # loading an embedding model to recompute an unchanged vector
+            # would be pure waste. A chunk_id get_many() can't find was never
+            # indexed (this document predates the corpus's first `index` run,
+            # or was never promoted) -- nothing to hide from search yet, and
+            # the frontmatter write above already guarantees the next
+            # `index`/`promote` will project the correct value.
+            existing = store.get_many([record["chunk_id"] for record in records])
+            for record in records:
+                vector = existing.get(record["chunk_id"], {}).get("vector")
+                if vector is not None:
+                    record["vector"] = vector
+                    ready.append(record)
+            if ready:
+                store.upsert(ready)
+                lexical.index(ready, append_only=False)
+                write_index_generation(corpus)
+        finally:
+            lock.release()
+
+    skipped = len(records) - len(ready)
+    note = f", {skipped} chunk(s) not yet indexed (will apply on the next `index`)" if skipped else ""
+    if already == want_deleted:
+        print(f"delete: {args.doc_id} was already {verb}{note}")
+    else:
+        print(f"delete: {args.doc_id} {verb} -- {len(ready)} chunk(s) updated{note}")
+    return 0
+
+
 def cmd_backup(args) -> int:
     """§6: back up `.alexandria` STATE only -- never the rebuildable indexes
     (chunks.lance, fts.sqlite). See backup.STATE_PATHS for the exact list."""
@@ -1243,6 +1370,13 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile = sub.add_parser("reconcile",
                                help="independent check: every inbox entry has a promoted doc")
     reconcile.set_defaults(func=cmd_reconcile)
+
+    delete = sub.add_parser("delete", help="soft-delete a document (or --undelete); --list shows what's deleted")
+    delete.add_argument("doc_id", nargs="?", default=None,
+                        help="corpus-relative doc id, e.g. sources/pi/note (required unless --list)")
+    delete.add_argument("--undelete", action="store_true", help="clear the deleted flag instead of setting it")
+    delete.add_argument("--list", action="store_true", help="list every document currently flagged deleted")
+    delete.set_defaults(func=cmd_delete)
 
     backup = sub.add_parser("backup", help="back up .alexandria state (never the rebuildable indexes)")
     backup.add_argument("dest", help="path to write the .tar.gz archive")

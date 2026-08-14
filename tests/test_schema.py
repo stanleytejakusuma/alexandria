@@ -107,6 +107,18 @@ def test_list_fields_reject_scalars():
     assert "bad_type" in codes(validate(core(aliases="one"), "sources/pi/n.md"))
 
 
+def test_deleted_must_be_a_boolean():
+    """Soft-delete tombstone (ARC-BRIEF). Strict bool, not merely truthy --
+    index/chunker.py's doc_frontmatter_metadata reads this with `is True`, so
+    a quoted `deleted: \"false\"` is silently treated as NOT deleted rather
+    than raising. This lint check is the only thing that surfaces that kind
+    of typo to the operator."""
+    assert validate(core(deleted=True), "sources/pi/n.md") == []
+    assert validate(core(deleted=False), "sources/pi/n.md") == []
+    assert "bad_type" in codes(validate(core(deleted="true"), "sources/pi/n.md"))
+    assert "bad_type" in codes(validate(wiki(deleted="false"), "wiki/x/n.md"))
+
+
 def test_unknown_keys_are_tolerated():
     """OKF 4.1: consumers MUST tolerate unknown keys."""
     assert validate(core(some_future_field="x"), "sources/pi/n.md") == []

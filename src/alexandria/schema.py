@@ -136,6 +136,15 @@ def validate(fm: dict, path: str) -> list[Issue]:
     if "title" in fm and not isinstance(fm["title"], str):
         err("bad_type", "title", "must be a string")
 
+    # Soft-delete tombstone (ARC-BRIEF soft-delete). Core, not profile-exclusive
+    # -- both sources and wiki pages can be marked deleted. Strict bool, not
+    # merely truthy: index/chunker.py's doc_frontmatter_metadata reads this
+    # with `is True`, so a quoted `deleted: "false"` is treated as NOT
+    # deleted there (the safer misread), but it is still a mistake worth
+    # surfacing at lint time rather than only relying on that asymmetry.
+    if "deleted" in fm and not isinstance(fm["deleted"], bool):
+        err("bad_type", "deleted", "must be a boolean")
+
     if "status" in fm and fm["status"] not in STATUSES:
         err("bad_enum", "status", f"{fm['status']!r} not in {sorted(STATUSES)}")
 

@@ -227,8 +227,19 @@ def _make(doc_id: str, heading_path: str, units: list[str], ordinal: int,
 
 def doc_frontmatter_metadata(frontmatter: dict, doc_id: str) -> dict:
     """Flatten a document's frontmatter into the scalar fields every chunk record
-    carries (see index/store.py SCALAR_FIELDS and index/bm25.py METADATA_COLUMNS --
-    this is the one place both indexes' shared metadata shape is derived)."""
+    carries (see index/store.py SCALAR_FIELDS and index/bm25.py's chunk_metadata
+    columns -- this is the one place both indexes' shared metadata shape is
+    derived).
+
+    This is also the SOLE place `deleted` is read out of frontmatter, and the
+    reason a soft-delete survives a reindex: `deleted` is not index state, it
+    is a document property like `type` or `project`, re-derived fresh from
+    `sources/`/`wiki/` on every call (full rebuild, `alexandria index`, or
+    single-document `promote`/`cmd_delete`). Marking a document deleted means
+    writing `deleted: true` into ITS frontmatter -- never poking the index
+    tables directly -- so the flag is exactly as durable as the document
+    itself and a `--rebuild` can never un-delete it by accident.
+    """
     generated = frontmatter.get("generated")
     generated_at = frontmatter.get("generated_at")
     if generated_at is None and isinstance(generated, dict):
@@ -242,6 +253,14 @@ def doc_frontmatter_metadata(frontmatter: dict, doc_id: str) -> dict:
         "entities": list(frontmatter.get("entities") or []),
         "layer": "wiki" if doc_id.startswith("wiki/") else "sources",
         "generated_at": generated_at,
+        # Strict identity, not truthiness: `deleted: "false"` is a quoted
+        # YAML string a human might hand-write believing it clears the flag,
+        # and Python's bool("false") is True. `is True` treats any non-bool
+        # value (including that typo) as NOT deleted, which is the safer
+        # misread for an authoring mistake -- `alexandria lint` (schema.py)
+        # separately flags a non-bool `deleted` as bad_type so the mistake is
+        # still visible, but it does not block indexing on its own.
+        "deleted": frontmatter.get("deleted") is True,
     }
 
 

@@ -9,13 +9,20 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .filtering import lancedb_where, normalize_filters, sqlite_where
+from .filtering import deleted_flag, lancedb_where, normalize_filters, not_deleted_clause, sqlite_where
 
 __all__ = ["VectorStore"]
 
 
+# "deleted" is a SCALAR_FIELDS member, not a frontmatter-only convenience --
+# see docs/SPEC-data-model-and-ambient-capture.md §D4a. A flag that lives only
+# in document frontmatter survives `store.upsert`'s field projection (the
+# `_normalise_record` return at the bottom of this file keeps only ALL_FIELDS)
+# by being silently dropped before the row is written, so the index keeps
+# serving a "deleted" chunk forever. Declaring it here is what makes
+# `not_deleted_clause` (index/filtering.py) enforceable at all.
 SCALAR_FIELDS = ("chunk_id", "doc_id", "text", "heading_path", "type", "project", "status",
-                 "source", "layer", "generated_at")
+                 "source", "layer", "generated_at", "deleted")
 ALL_FIELDS = (*SCALAR_FIELDS, "vector", "tags", "entities", "enrichment", "kind", "parent_doc", "target_chunk")
 
 
@@ -49,13 +56,21 @@ class VectorStore:
         # Red 2026-08-09: detect old LanceDB schemas before issuing field
         # projections. A table created before the enrichment columns existed
         # silently drops them on merge; the fix is an explicit rebuild.
+        # "deleted" (_normalise_record always supplies "true"/"false", never
+        # None) joins this guard for the same reason: an old table missing the
+        # column would otherwise merge_insert new rows with no `deleted` value
+        # at all -- update_all only touches fields present in `records`, but a
+        # brand-new column on an old table is the enrichment-column failure
+        # mode over again, so refuse loudly rather than let a tombstone write
+        # silently miss the column it depends on.
         existing = {field.name for field in table.schema}
-        if any(records[0].get(field) is not None for field in ("enrichment", "kind", "parent_doc", "target_chunk")):
-            missing = [field for field in ("enrichment", "kind", "parent_doc", "target_chunk")
+        if any(records[0].get(field) is not None
+               for field in ("enrichment", "kind", "parent_doc", "target_chunk", "deleted")):
+            missing = [field for field in ("enrichment", "kind", "parent_doc", "target_chunk", "deleted")
                        if field not in existing]
             if missing:
                 raise RuntimeError(
-                    "index schema predates enrichment columns "
+                    "index schema predates enrichment/deleted columns "
                     f"({', '.join(missing)}); run `alexandria index --rebuild`")
         merger = table.merge_insert("chunk_id")
         merger.when_matched_update_all().when_not_matched_insert_all().execute(records)
@@ -96,9 +111,15 @@ class VectorStore:
         if table is None:
             return []
         search = table.search(query_vec)
-        predicate = lancedb_where(where)
-        if predicate:
-            search = search.where(predicate, prefilter=True)
+        # not_deleted_clause is unconditional -- applied with prefilter=True
+        # so a deleted row never occupies one of the k slots in the first
+        # place (a post-hoc filter after limit() would silently shrink the
+        # candidate pool instead). See index/filtering.py for why this is an
+        # allow-list, not a negated deny-list.
+        user_predicate = lancedb_where(where)
+        predicate = (f"{not_deleted_clause()} AND ({user_predicate})"
+                     if user_predicate else not_deleted_clause())
+        search = search.where(predicate, prefilter=True)
         rows = search.limit(k).to_list()
         return [_record_from_lance(row) for row in rows]
 
@@ -182,11 +203,24 @@ class _SQLiteVectorStore:
             "chunk_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, text TEXT NOT NULL, heading_path TEXT NOT NULL, "
             "vector TEXT NOT NULL, type TEXT, project TEXT, status TEXT, source TEXT, tags TEXT NOT NULL, "
             "entities TEXT NOT NULL, layer TEXT NOT NULL, generated_at TEXT,"
-            " enrichment TEXT, kind TEXT, parent_doc TEXT, target_chunk TEXT)"
+            " enrichment TEXT, kind TEXT, parent_doc TEXT, target_chunk TEXT,"
+            " deleted TEXT NOT NULL DEFAULT 'false')"
         )
         # Red release change: enrich the schema in place for pre-existing DBs
         # (sqlite >= 3.35 supports ADD COLUMN IF NOT EXISTS).
-        for column in ("enrichment TEXT", "kind TEXT", "parent_doc TEXT", "target_chunk TEXT"):
+        #
+        # "deleted" gets a literal DEFAULT ('false'), not just a bare type --
+        # SQLite backfills every EXISTING row with a constant default on
+        # ADD COLUMN (unlike CURRENT_TIMESTAMP-style defaults, which cannot
+        # backfill). That default is correct, not merely convenient: no row
+        # could have been "deleted" before this column existed, since the
+        # concept did not exist yet, so retroactively marking every
+        # pre-migration row as visible loses nothing. A bare `ADD COLUMN
+        # deleted TEXT` would instead leave every existing row NULL, and
+        # `not_deleted_clause`'s fail-closed `= 'false'` predicate would then
+        # hide the entire pre-migration corpus until the next full reindex.
+        for column in ("enrichment TEXT", "kind TEXT", "parent_doc TEXT", "target_chunk TEXT",
+                       "deleted TEXT NOT NULL DEFAULT 'false'"):
             try:
                 self.connection.execute(f"ALTER TABLE chunks ADD COLUMN {column}")
             except sqlite3.OperationalError:
@@ -211,7 +245,7 @@ class _SQLiteVectorStore:
     def search_vector(self, query_vec: list[float], k: int, where: Mapping[str, Any] | None) -> list[dict]:
         clause, params = sqlite_where(where)
         rows = self.connection.execute(
-            f"SELECT {', '.join(ALL_FIELDS)} FROM chunks WHERE {clause}", params
+            f"SELECT {', '.join(ALL_FIELDS)} FROM chunks WHERE {not_deleted_clause()} AND {clause}", params
         ).fetchall()
         scored = []
         for row in rows:
@@ -262,6 +296,10 @@ def _normalise_record(chunk: Mapping[str, Any]) -> dict:
                   "enrichment", "kind", "parent_doc", "target_chunk"):
         value = record.get(field)
         record[field] = value if value is not None else ""
+    # See index/filtering.py:deleted_flag for the write-time default (missing
+    # -> "false") and why it is intentionally more permissive than the
+    # read-time fail-closed predicate.
+    record["deleted"] = deleted_flag(record.get("deleted"))
     return {field: record.get(field) for field in ALL_FIELDS}
 
 
@@ -287,7 +325,7 @@ def _lance_schema(records: list[dict]):
     dim = len(records[0]["vector"]) if records else 0
     text_fields = ("chunk_id", "doc_id", "text", "heading_path", "type", "project",
                    "status", "source", "layer", "generated_at", "enrichment", "kind",
-                   "parent_doc", "target_chunk")
+                   "parent_doc", "target_chunk", "deleted")
     fields = [pa.field(name, pa.string()) for name in text_fields]
     fields.append(pa.field("vector", pa.list_(pa.float32(), dim)))
     fields.append(pa.field("tags", pa.list_(pa.string())))
