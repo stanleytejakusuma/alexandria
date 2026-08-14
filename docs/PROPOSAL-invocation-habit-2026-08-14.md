@@ -31,9 +31,9 @@ the actual gap this proposal is about — not "nobody told the agent to use
 it," but "telling it isn't working."
 
 For comparison (as given in the brief, not independently re-verified here —
-I did not have access to claude-mem's source, only to `sources/claude-mem/`
-observation dumps already ingested into the corpus, which are data *from*
-claude-mem, not documentation *about* its mechanism): claude-mem binds 6
+I did not have access to the reference tool's source, only to observation
+dumps already ingested into the corpus, which are data *from* that tool,
+not documentation *about* its mechanism): the reference tool binds 6
 lifecycle hooks and auto-captures/injects deterministically, and has
 accumulated roughly 12,444 observations against Alexandria's ~43 genuine
 queries in the same rough window. The mechanical difference worth naming:
@@ -94,12 +94,12 @@ unreachable.
   each invocation still costs 25s. Do this first, independent of what's
   decided about C/D.
 
-### C. Full session-start auto-injection (the claude-mem-shaped option)
+### C. Full session-start auto-injection (the reference-tool-shaped option)
 
 Bind a session-start (or first-user-message) hook that runs
 `alexandria-context` unconditionally with the task/first message as the
 query, injecting results before the agent's first turn — mirroring
-claude-mem's hook model.
+the reference tool's hook model.
 
 - **Cost:** context tokens spent on *every* session, whether or not that
   session ever touches past-work territory. At current cold latency (25–33s
@@ -137,11 +137,11 @@ matches — otherwise the session proceeds exactly as today.
   (firing on a phrase that isn't actually about past work) cost one
   wasted `alexandria-context` call — bounded, not compounding across every
   session the way C is.
-- **This is the mechanical difference from claude-mem stated precisely:**
-  claude-mem hooks fire unconditionally at a fixed lifecycle point; this
+- **This is the mechanical difference from the reference tool, stated
+  precisely:** its hooks fire unconditionally at a fixed lifecycle point; this
   hook fires conditionally on a fixed, auditable pattern match. It's a
   smaller, cheaper step toward "deterministic instead of prompted" than
-  full parity with claude-mem's model, and it's sized to the narrow-band
+  full parity with the reference tool's model, and it's sized to the narrow-band
   scoping this project has already committed to.
 - **Recommendation: this is the one worth prototyping**, after B, and only
   if a few more weeks of the demand report (this is a re-runnable script,
@@ -151,7 +151,7 @@ matches — otherwise the session proceeds exactly as today.
 
 ## What I'm explicitly not recommending
 
-Full parity with claude-mem's 6-hook, unconditional-capture model (option C
+Full parity with the reference tool's 6-hook, unconditional-capture model (option C
 generalized to writes as well as reads). The corpus's own operating doctrine
 (`~/.pi/agent/AGENTS.md`) already treats ambient/ automatic *writes* as
 out of scope — memory writes go through an explicit inbox, never
@@ -172,5 +172,5 @@ gets written automatically.
    enough to justify shipping a new hook; a stable low agent-invocation rate
    across 3-4 weekly runs would be.
 3. **D** (trigger-phrase hook), if the trend holds, sized to the narrow band
-   the decision doc already scoped, not to full claude-mem parity.
+   the decision doc already scoped, not to full reference-tool parity.
 4. **Not C**, and not blanket capture, on current evidence.

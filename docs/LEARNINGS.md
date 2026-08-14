@@ -37,3 +37,32 @@ what a future session would otherwise have to rediscover by trial.
 No user corrections in this transcript — the "user" turns were the
 brief's own checklist items being worked through sequentially, not a human
 steering mid-task. No dead ends recorded either.
+
+## Worktree leak scans are weaker than main's — a false green (2026-08-14)
+
+`scripts/precommit-scan.py` loads its private pattern list from
+`REPO/.leakpatterns.local` (`precommit-scan.py:49`), and that file is
+**gitignored**. A `git worktree` therefore does not have it, so a scan run
+from an arc worktree silently loads **zero local patterns** and reports
+"leak scan clean" while checking only the built-in set.
+
+Observed concretely: `feat/demand` reported "leak scan clean" from
+`~/alexandria-demand` (11 patterns). The same tree scanned from
+`~/codebase/alexandria` after merge reported **23 patterns and 9 findings**
+— a third-party tool name repeated through one doc. The arc did nothing
+wrong; its scan was structurally incapable of seeing those patterns.
+
+Consequences, both directions:
+- Never accept an arc's own "leak scan clean" as sufficient. **Re-run the
+  scan on `main` after merging, before pushing** — the merge is the first
+  point the real pattern set is applied.
+- This is another instance of the standing rule: a step reported success
+  while doing almost nothing. The exit code was 0 and the message said
+  "clean"; the observable (pattern count) was the tell. Check the pattern
+  count in the scanner's own output — if it is not the number `main`
+  reports, the scan is weaker than it looks.
+
+A fix worth considering (not done here): have the scanner resolve the
+pattern file via `git rev-parse --git-common-dir` so worktrees find the
+main checkout's copy, or fail loudly when the file is absent instead of
+proceeding with the built-in set.
