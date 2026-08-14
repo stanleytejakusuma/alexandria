@@ -57,11 +57,17 @@ SYNTHETIC_TEXT_PATTERNS = [
 ]
 
 # Audit-log caller identities (see src/alexandria/auditlog.py, --caller flag) that are
-# confirmed non-interactive: local-anonymous = unauthenticated HTTP hits on the serve
-# daemon (matches the canary text patterns above 18/19 times, checked by hand);
-# consumer-audit = a self-test sweep of the audit pathway itself (8 queries in a single
-# 4-minute window on one date, including a deliberately absurd control query).
-SYNTHETIC_CALLERS = {"local-anonymous", "consumer-audit"}
+# confirmed non-interactive: consumer-audit = a self-test sweep of the audit pathway
+# itself (8 queries in a single 4-minute window on one date, including a deliberately
+# absurd control query).
+#
+# `local-anonymous` is deliberately NOT in this set. serve.py:45 assigns it as a fixed
+# identity for *any* TCP caller, so it carries no information about who called -- a
+# canary probe and a real question from the pi extension are stamped identically.
+# Treating it as synthetic made "no genuine query ever reached the daemon" true by
+# construction rather than by measurement, and discarded 10 real queries. Daemon rows
+# are therefore classified on their text content (is_synthetic_text) like any other row.
+SYNTHETIC_CALLERS = {"consumer-audit"}
 # pi-extension = the AlexandriaSearch/AlexandriaContext/AlexandriaAnswer tool bindings
 # in ~/.pi/agent/extensions/alexandria.ts (confirmed by reading that file: it sets
 # ALEXANDRIA_CALLER=pi-extension on every CLI-exec fallback call). This is exactly the

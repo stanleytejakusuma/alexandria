@@ -99,6 +99,45 @@ def test_classify_genuine_cli_caller_outside_burst():
     assert labels["g1"] == "genuine"
 
 
+def test_daemon_row_with_real_content_is_not_labelled_synthetic():
+    """A `serve` row whose text carries real information content must not be
+    discarded as a probe merely because the daemon stamped it `local-anonymous`.
+
+    serve.py:45 assigns LOCAL_ANONYMOUS as a *fixed identity for any TCP caller*,
+    so that caller value carries no discriminative information. Treating it as a
+    SYNTHETIC_CALLER made "no genuine query ever reached the daemon" true by
+    construction, and dropped 10 real queries -- including one
+    ("Prime Agent system prompt") that appears twice 2.5 minutes apart: once via
+    the extension's CLI fallback (caller=pi-extension, counted genuine) and once
+    via its HTTP primary path (client=serve, discarded). Same human, same intent.
+
+    alexandria.ts is HTTP-first with CLI as fallback, so client=serve is the
+    extension's *primary* surface -- precisely where genuine usage lands.
+    """
+    row = _row(
+        "d1",
+        "2026-08-14T01:50:00+00:00",
+        "why did pi-king dashboard render garbage characters in every row",
+        client="serve",
+    )
+    labels = demand_report.classify([row], golden=set(), callers={"d1": "local-anonymous"})
+    assert labels["d1"] == "genuine"
+
+
+def test_daemon_row_with_probe_text_is_still_synthetic():
+    """The converse guard: fingerprinted canary text on the daemon stays synthetic,
+    so the fix above widens the genuine bucket by content, not indiscriminately.
+    """
+    row = _row(
+        "d2",
+        "2026-08-13T13:06:00+00:00",
+        "obscure phrase 15942 zebra quantum ledger",
+        client="serve",
+    )
+    labels = demand_report.classify([row], golden=set(), callers={"d2": "local-anonymous"})
+    assert labels["d2"] == "synthetic_probe"
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))

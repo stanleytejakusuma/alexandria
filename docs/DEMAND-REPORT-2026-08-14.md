@@ -6,6 +6,31 @@ problem (nobody needs this) or a supply problem (nothing prompts the agent to
 use it)? Re-run weekly with `scripts/demand-report.py` to watch the trend —
 this doc is a snapshot, not a standing truth.
 
+> **CORRECTION (applied 2026-08-14, after review — read before the numbers below).**
+> This report's original classifier treated the audit-log caller `local-anonymous`
+> as proof of a synthetic probe. It is not: `serve.py:45` assigns that identity to
+> *any* TCP caller, so a canary and a real question are stamped identically. That
+> made the claim "no genuine query ever reached the daemon" true **by construction
+> rather than by measurement**, and discarded 10 real queries.
+>
+> `scripts/demand-report.py` now classifies daemon rows on their text content, and
+> two regression tests in `tests/test_demand_report.py` pin both directions. The
+> corrected headline is **genuine = 58, not 43/48**, of which **10 (17%) arrived
+> through the daemon**, not zero.
+>
+> The single clearest piece of evidence: the query *"Prime Agent system prompt"*
+> appears twice, 2.5 minutes apart on 08-14 — once via the extension's CLI fallback
+> (`caller=pi-extension`, counted genuine) and once via its HTTP primary path
+> (`client=serve`, discarded as synthetic). Same person, same intent, opposite
+> buckets. Since `alexandria.ts` is HTTP-first with CLI as fallback, `client=serve`
+> is the extension's *primary* surface — exactly where genuine usage lands.
+>
+> **Sections 1–4 below retain the original n=43 figures.** Their *direction* is
+> unchanged (eval traffic still dominates ~93%; the freshness falsifier is still
+> not observed), but treat the absolute genuine counts as a floor and re-run
+> `scripts/demand-report.py` for current numbers. The daemon-specific claims in
+> §1 and §4 are **superseded by this note**.
+
 **Source data:** `~/alexandria-corpus/.alexandria/queries.sqlite`, 3154 rows,
 2026-08-03 through 2026-08-14 (11 days), opened read-only throughout. Cross-
 referenced against `~/alexandria-corpus/.alexandria/audit/search.jsonl` (97
