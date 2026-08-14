@@ -111,15 +111,26 @@ class VectorStore:
         if table is None:
             return []
         search = table.search(query_vec)
-        # not_deleted_clause is unconditional -- applied with prefilter=True
-        # so a deleted row never occupies one of the k slots in the first
-        # place (a post-hoc filter after limit() would silently shrink the
-        # candidate pool instead). See index/filtering.py for why this is an
-        # allow-list, not a negated deny-list.
+        # not_deleted_clause is applied with prefilter=True so a deleted row
+        # never occupies one of the k slots in the first place (a post-hoc
+        # filter after limit() would silently shrink the candidate pool
+        # instead). See index/filtering.py for why this is an allow-list, not a
+        # negated deny-list.
+        #
+        # But a table that PREDATES the `deleted` column has no tombstones to
+        # hide -- the column's absence means nothing was ever soft-deleted, and
+        # referencing it would make the whole dense leg error and silently
+        # degrade retrieval to lexical-only. Skip the tombstone predicate in
+        # that case rather than fail a leg over a column that never existed.
         user_predicate = lancedb_where(where)
-        predicate = (f"{not_deleted_clause()} AND ({user_predicate})"
-                     if user_predicate else not_deleted_clause())
-        search = search.where(predicate, prefilter=True)
+        has_deleted = "deleted" in {field.name for field in table.schema}
+        if has_deleted:
+            predicate = (f"{not_deleted_clause()} AND ({user_predicate})"
+                         if user_predicate else not_deleted_clause())
+        else:
+            predicate = user_predicate
+        if predicate:
+            search = search.where(predicate, prefilter=True)
         rows = search.limit(k).to_list()
         return [_record_from_lance(row) for row in rows]
 
@@ -161,6 +172,39 @@ class VectorStore:
                 .limit(len(ids))
                 .to_list())
         return {row["chunk_id"]: _record_from_lance(row) for row in rows}
+
+    def mark_deleted(self, doc_id: str, deleted: bool) -> int:
+        """Flip `deleted` on every stored row belonging to doc_id, returning the
+        number of rows updated.
+
+        Selects the affected set by stable identity, not by current
+        content-derived chunk ids: `doc_id = doc_id` catches ordinary chunks
+        (including rows indexed under a PREVIOUS chunk_id after the document was
+        edited), and `parent_doc = doc_id` catches synthetic enrichment rows
+        whose target_chunk points back into the document. This is the whole of
+        SOL-01/SOL-02 -- delete must converge on every row a document ever
+        produced, not only the rows its current body regenerates.
+        """
+        if self._fallback is not None:
+            return self._fallback.mark_deleted(doc_id, deleted)
+        table = self._open_table()  # pragma: no cover - requires optional dependency at runtime
+        if table is None:
+            return 0
+        existing = {field.name for field in table.schema}
+        if "deleted" not in existing:
+            # A tombstone cannot be projected onto a table that predates the
+            # column; silently touching only the lexical leg would leave the
+            # dense leg serving the document. Fail loudly with the same
+            # rebuild instruction upsert() uses for the same schema gap.
+            raise RuntimeError(
+                "index schema predates the deleted column; run "
+                "`alexandria index --rebuild` before soft-deleting")
+        literal = json.dumps(str(doc_id))
+        result = table.update(
+            where=f"doc_id = {literal} OR parent_doc = {literal}",
+            values={"deleted": deleted_flag(deleted)},
+        )
+        return int(result.rows_updated)
 
     def count(self) -> int:
         if self._fallback is not None:
@@ -260,6 +304,15 @@ class _SQLiteVectorStore:
             f"SELECT {', '.join(ALL_FIELDS)} FROM chunks WHERE chunk_id = ?", (chunk_id,)
         ).fetchone()
         return _row_to_record(row) if row else None
+
+    def mark_deleted(self, doc_id: str, deleted: bool) -> int:
+        flag = deleted_flag(deleted)
+        with self.connection:
+            cur = self.connection.execute(
+                "UPDATE chunks SET deleted = ? WHERE doc_id = ? OR parent_doc = ?",
+                (flag, doc_id, doc_id),
+            )
+            return cur.rowcount
 
     def count(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
