@@ -53,6 +53,53 @@ def sqlite_where(where: Mapping[str, Any] | None, *, alias: str = "") -> tuple[s
     return (" AND ".join(clauses) or "1 = 1"), params
 
 
+def deleted_flag(value: Any) -> str:
+    """Normalise any write-time representation of the soft-delete flag to the
+    canonical stored string ("true" / "false"), defaulting missing or
+    unrecognised input to NOT deleted.
+
+    This is the WRITE-time default, and it is deliberately more permissive
+    than the READ-time predicate in `not_deleted_clause` below: almost every
+    chunk record that ever passes through here never touched deletion at all
+    (`chunk_doc_records`/`doc_frontmatter_metadata` in index/chunker.py is the
+    normal source and always supplies a real bool), so defaulting an absent
+    value to "false" cannot hide content nobody asked to delete. A read-time
+    default of "true" for an unrecognised value would do the opposite --
+    that asymmetry is intentional, not an oversight (see ARC-BRIEF's "fail
+    closed" requirement and `not_deleted_clause`'s docstring).
+
+    String input is compared case-insensitively against the literal "true"
+    so a record round-tripped back out of the store (`get`/`get_many` return
+    the stored string, not a bool) and passed back through `upsert` without
+    modification stores the same value it already had, instead of Python
+    truthiness flipping the stored string "false" (truthy!) into "true".
+    """
+    if isinstance(value, str):
+        return "true" if value.strip().lower() == "true" else "false"
+    return "true" if value else "false"
+
+
+def not_deleted_clause(alias: str = "") -> str:
+    """The one predicate fragment every retrieval path ANDs onto its query,
+    so a tombstoned chunk can never surface through one leg (dense or
+    lexical) while staying hidden on the other -- both `index/store.py`'s
+    `search_vector` and `index/bm25.py`'s `search` call this, never a
+    hand-written copy of the same string.
+
+    Positive allow-list (`= 'false'`), not a negated deny-list (`!= 'true'`):
+    a row whose `deleted` column is NULL, corrupted, or written by code that
+    predates this column is EXCLUDED, not shown. That is "fail closed" per
+    ARC-BRIEF: a document someone believed was deleted staying invisible when
+    its flag can't be positively confirmed is a far smaller failure than a
+    tombstone silently reappearing. (In SQL specifically, `NULL = 'false'`
+    and `NULL != 'true'` are equally NULL/excluded -- the two forms only
+    diverge for a non-null value that is neither "true" nor "false", which is
+    exactly the unreadable/malformed case this guards against.)
+    """
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}deleted = 'false'"
+
+
 def lancedb_where(where: Mapping[str, Any] | None) -> str | None:
     """Create a safe Lance predicate from a fixed field allow-list.
 
