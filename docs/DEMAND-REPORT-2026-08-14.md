@@ -31,6 +31,22 @@ this doc is a snapshot, not a standing truth.
 > `scripts/demand-report.py` for current numbers. The daemon-specific claims in
 > §1 and §4 are **superseded by this note**.
 
+> **RELABEL (2026-08-14, Sol audit SOL-05) — "genuine" now means something narrower.**
+> The correction above still over-claimed: it labeled every non-probe
+> `search`/`serve`/`answer` row "genuine", but `client` is a *code-path* label,
+> not evidence of who called. `scripts/demand-report.py` now reserves `genuine`
+> for the one positive caller identity — the pi extension self-labels
+> `ALEXANDRIA_CALLER=pi-extension` — and reports code-path-only rows as
+> `likely_genuine`. The audit log's default `caller="cli"` is also no longer
+> treated as genuine: it is the log's fallback, i.e. unattributed.
+>
+> Current run (2026-08-14, 3609 rows): `genuine` 8, `likely_genuine` 41,
+> `uncertain` 162. The honest real-usage estimate is **49 (8 confirmed + 41
+> likely)**, bounded below by 8 and above by ~211 (49 + 162 uncertain). Read
+> "58 genuine" anywhere below as "49 real-usage, 8 confirmed" under this taxonomy.
+> The direction of the report's verdict (invocation habit is the binding
+> constraint, not freshness) is unchanged.
+
 **Source data:** `~/alexandria-corpus/.alexandria/queries.sqlite`, 3154 rows,
 2026-08-03 through 2026-08-14 (11 days), opened read-only throughout. Cross-
 referenced against `~/alexandria-corpus/.alexandria/audit/search.jsonl` (97

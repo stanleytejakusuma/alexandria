@@ -73,9 +73,11 @@ faster daemon path already exists and is running.
 
 **Corrected premise (2026-08-14 review).** This section originally claimed
 genuine queries *never* reach the daemon (0/43). That was a classifier
-artifact, not a fact — see the CORRECTION at the top of the demand report.
-10 of 58 genuine queries (17%) did go through `client=serve`. Two consequences
-for this option, which survives but with smaller claimed upside:
+artifact, not a fact — see the CORRECTION and RELABEL notes at the top of the
+demand report. Under the current taxonomy the daemon carries 15 `likely_genuine`
+(code-path, unattributed) rows, not zero — so the gap is a *majority-of-traffic*
+problem rather than a total one. Two consequences for this option, which
+survives but with smaller claimed upside:
   - The gap is a *majority-of-traffic* problem, not a total one.
   - The daemon's own observed median on real queries is **~2.4s** (n=9,
     excluding one 196s cold-cache outlier), not "sub-5ms" — sub-5ms is the
