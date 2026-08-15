@@ -77,6 +77,15 @@ echo "### query-log review (7d)" >> "$DIGEST"
 "$REPO/.venv/bin/python" "$REPO/scripts/query-log-review.py" --corpus "$CORPUS" --since 7 \
   >> "$DIGEST" 2>&1 || echo "review FAILED" >> "$DIGEST"
 
+# Leg-ablation invariant (BACKLOG #47/#48): removing either retrieval leg must
+# not IMPROVE recall/MRR -- a leg whose removal helps is dead weight. Weekly, not
+# pre-commit, because each amputated pass is a full golden-set scoring (~60-90s).
+# Non-fatal like the other steps: a red leg-ablation is recorded here and read by
+# a human, not silently swallowed, but it must not stop the rest of the loop.
+echo "### leg-ablation (is either retrieval leg dead weight?)" >> "$DIGEST"
+"$REPO/.venv/bin/python" "$REPO/scripts/leg-ablation.py" --corpus "$CORPUS" \
+  >> "$DIGEST" 2>&1 || echo "leg-ablation FAILED" >> "$DIGEST"
+
 # keep the corpus weekly-snapshot-able (the quarterly contest needs it).
 # Only `sources` and `wiki`: `notes` does not exist, and `.alexandria/` is
 # gitignored as derived state. git add is ATOMIC across pathspecs, so naming

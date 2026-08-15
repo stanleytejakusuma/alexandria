@@ -20,9 +20,10 @@ no gate at all for everyone else: on a fresh clone or in CI, a retrieval change 
 measured by nothing. So a retrieval-relevant change now runs BOTH:
 
   1. scripts/synthetic-eval-gate.py -- unconditional, ~20s, over the synthetic corpus
-     committed in tests/fixtures/. Verifies the HARNESS: scoring, recall, the Wilson
-     interval, the significance bar, manifest/embed plumbing. It cannot see real
-     knowledge, so it can never tell you retrieval is GOOD.
+     committed in tests/fixtures/. Verifies the LEXICAL harness: scoring, recall, the
+     Wilson interval, the significance bar, manifest/FTS plumbing. Its dense leg is
+     deliberately disabled (BACKLOG #47), so it can never tell you retrieval is GOOD
+     and it says nothing about the dense leg -- that is the real gate's job.
   2. `alexandria eval --fail-on-regression` -- skipped without the private corpus.
      The only thing here that measures retrieval QUALITY.
 

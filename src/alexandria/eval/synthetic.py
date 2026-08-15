@@ -61,6 +61,38 @@ NEGATIVE_PATH = FIXTURES / "synthetic-negative-v1.jsonl"
 EMBED_PROVIDER = "hash"
 
 
+class NullQueryEmbedder:
+    """An embedder whose query embedding is None, so SearchEngine skips the dense
+    leg at query time while the corpus index still exists for hydration.
+
+    The synthetic gate's real embedder is `HashEmbedder`, which is deterministic
+    and dependency-free but semantically empty -- its dense leg is a noise channel
+    that REWARDS deleting the vector store (BACKLOG #47). The lexical-harness
+    configuration of the gate therefore disables the dense QUERY leg by returning
+    None from embed_queries, which `SearchEngine.search` already treats as "no
+    dense candidates" (it only submits a dense future when query_vector is not
+    None). Indexing still writes HashEmbedder vectors because the vector store's
+    record schema requires them; they are simply never queried.
+    """
+
+    def __init__(self, dim: int = 384) -> None:
+        self._hash = HashEmbedder(dim=dim)
+
+    @property
+    def name(self) -> str:
+        return self._hash.name
+
+    @property
+    def dim(self) -> int:
+        return self._hash.dim
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._hash.embed(texts)
+
+    def embed_queries(self, queries: list[str]) -> list[None]:
+        return [None for _ in queries]
+
+
 def copy_synthetic_corpus(destination: str | Path) -> Path:
     """Copy the fixture documents into `destination` and return that path.
 
@@ -77,8 +109,12 @@ def copy_synthetic_corpus(destination: str | Path) -> Path:
     return corpus
 
 
-def build_synthetic_engine(destination: str | Path) -> SearchEngine:
+def build_synthetic_engine(destination: str | Path, *, dense: bool = True) -> SearchEngine:
     """Index the synthetic corpus under `destination` and return a live engine.
+
+    `dense=False` builds the lexical-harness configuration: the corpus index and
+    vector store are still written (hydration needs them), but the query embedder
+    returns None so SearchEngine skips the dense leg. See NullQueryEmbedder.
 
     No query logger and no query cache: a cache would let a second identical
     query be answered from the first one's result, which turns a repeated
@@ -117,8 +153,9 @@ def build_synthetic_engine(destination: str | Path) -> SearchEngine:
     write_manifest(corpus, embedder, EMBED_PROVIDER)
     verify_manifest(corpus, embedder, EMBED_PROVIDER)
 
+    query_embedder = embedder if dense else NullQueryEmbedder()
     return SearchEngine(
-        embedder,
+        query_embedder,
         store,
         lexical,
         IdentityReranker(),

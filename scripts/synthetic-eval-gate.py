@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the eval harness against the in-repo synthetic corpus. No private data.
+"""Run the lexical-harness gate against the in-repo synthetic corpus. No private data.
 
 WHY THIS EXISTS (BACKLOG #20). Its sibling `eval-gate.py` scores retrieval against
 a golden set stored in a private corpus repo, and on any machine without that
@@ -12,20 +12,24 @@ This gate runs anywhere, because everything it needs is committed here:
 `tests/fixtures/synthetic-corpus/` (16 documents about a fictional public
 library), plus a golden set and a negative set over them.
 
-WHAT IT MEASURES: the instrument. Chunking, embedding plumbing, the vector store,
-BM25, RRF fusion, the manifest check, recall/MRR, the Wilson interval, the
+WHAT IT MEASURES: the LEXICAL harness. Chunking, FTS5/BM25, the vector store
+(hydration), the manifest check, recall/MRR scoring, the Wilson interval, the
 McNemar significance bar, and the negative/separation machinery.
 
-WHAT IT DOES NOT MEASURE: retrieval quality on real knowledge. The embedder is
-`HashEmbedder` -- deterministic and dependency-free, which is what makes this
-reproducible, and semantically empty, which means the dense leg is noise and
-every point of recall below is earned by BM25 plus fusion. The reranker is
-`IdentityReranker`, because the production cross-encoder requires a ~90MB model
-download and this gate must run on a network-free box.
+WHAT IT DOES NOT MEASURE, AND WHY (BACKLOG #47): retrieval quality on real
+knowledge, and -- deliberately -- the dense ranking leg. The reproducible embedder
+is `HashEmbedder`, which is semantically empty, so its dense leg is a noise
+channel that REWARDS deleting the vector store (measured: recall 0.950 -> 1.000
+with the dense leg forced empty; only BM25 death was caught). The gate therefore
+runs `dense=False` and is a lexical-harness check, not a quality measure. The
+dense leg's actual value is instead guarded by the real-gate leg-ablation check
+(`scripts/leg-ablation.py`). The reranker is `IdentityReranker`, because the
+production cross-encoder requires a ~90MB model download and this gate must run
+on a network-free box.
 
 So: two gates, two purposes. `eval-gate.py` answers "did retrieval quality
-move?". This one answers "does the measuring instrument still work?". Reporting a
-green run here as evidence that retrieval is healthy would be a category error.
+move?". This one answers "does the lexical measuring instrument still work?". A
+green run here is never evidence that retrieval is healthy.
 
 Usage:  python3 scripts/synthetic-eval-gate.py [--json]
 Exit 0 if the harness clears its floors, 1 otherwise.
@@ -51,9 +55,12 @@ from alexandria.eval.synthetic import (  # noqa: E402
 )
 
 # Kept identical to tests/test_synthetic_gate.py; see the rationale there. Floors,
-# not targets: measured 0.950 recall / 0.514 MRR when this fixture was written.
-RECALL_FLOOR = 0.90
-MRR_FLOOR = 0.45
+# not targets: the lexical-harness configuration (dense leg disabled per BACKLOG
+# #47) measures recall 1.000 / MRR 0.988. A broken BM25/scoring path drops recall
+# to ~0.28 and MRR to ~0.10, so these sit well above "broken" while leaving room
+# for the handful of genuinely discriminating cases to move without flaking.
+RECALL_FLOOR = 0.95
+MRR_FLOOR = 0.80
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -62,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     with tempfile.TemporaryDirectory(prefix="alexandria-synthetic-") as workspace:
-        engine = build_synthetic_engine(workspace)
+        engine = build_synthetic_engine(workspace, dense=False)
         entries = load_golden(GOLDEN_PATH)
 
         target_errors = verify_targets(entries, engine._corpus_root)
@@ -93,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
             "separation": separation_report,
             "n_negatives": len(negatives),
             "failures": failures,
-            "measures": "harness correctness only, not retrieval quality",
+            "measures": "lexical harness correctness only, not retrieval quality",
         }, ensure_ascii=False, sort_keys=True))
     else:
         low, high = summary.recall_ci
@@ -102,9 +109,12 @@ def main(argv: list[str] | None = None) -> int:
               f"[{low:.3f}, {high:.3f}] MRR={summary.mrr:.3f} errors={summary.errors}")
         if summary.misses:
             print(f"misses:   {', '.join(summary.misses)}")
+        # Observable, NOT an enforced check (BACKLOG #46): a score floor on
+        # negatives was disproven as the wrong instrument (spec §9 Q5), so
+        # `separable` is reported for visibility and must not be read as a pass.
         print(f"negative: n={len(negatives)} separable="
-              f"{separation_report['separable'] if separation_report else 'n/a'}")
-        print("measures the harness, NOT retrieval quality on real knowledge.")
+              f"{separation_report['separable'] if separation_report else 'n/a'} (observable, not gated)")
+        print("measures the lexical harness, NOT retrieval quality on real knowledge.")
 
     if failures:
         print("synthetic-eval-gate FAILED: " + "; ".join(failures), file=sys.stderr)
