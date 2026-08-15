@@ -114,8 +114,8 @@ def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
         llm_defaults={
             "base_url": os.environ.get("ALEXANDRIA_LLM_BASE_URL", "http://127.0.0.1:20128/v1"),
             "api_key_env": os.environ.get("ALEXANDRIA_LLM_KEY_ENV", "ALEXANDRIA_LLM_KEY"),
-            "llm_model": os.environ.get("ALEXANDRIA_LLM_MODEL", "openrouter/anthropic/claude-sonnet-5"),
-            "grader_a_model": os.environ.get("ALEXANDRIA_GRADER_A_MODEL", "openrouter/anthropic/claude-sonnet-5"),
+            "llm_model": os.environ.get("ALEXANDRIA_LLM_MODEL", "deepseek-v4-pro"),
+            "grader_a_model": os.environ.get("ALEXANDRIA_GRADER_A_MODEL", "deepseek-v4-flash"),
             "grader_b_model": os.environ.get("ALEXANDRIA_GRADER_B_MODEL", "deepseek-v4-pro"),
             "prompt_version": os.environ.get("ALEXANDRIA_PROMPT_VERSION", "v1"),
         },
