@@ -222,7 +222,21 @@ class SearchEngine:
             records = self.store.get_many(list(base_scores))
         except Exception as exc:
             lookup_errors["*"] = f"{type(exc).__name__}: {exc}"
-        base_scores = {chunk_id: score for chunk_id, score in base_scores.items() if chunk_id in records}
+        # Defense in depth (SOL-01/SOL-03): the leg queries filter `deleted`,
+        # but a candidate that slips through a stale or divergent leg must still
+        # be dropped here. get_many() is deliberately unfiltered (an
+        # administrative read), so the deleted check belongs at hydration, not
+        # in the store.
+        #
+        # Exclude ONLY an explicit tombstone ("true"). A record whose `deleted`
+        # field is absent predates the tombstone column entirely (the live Lance
+        # table is an old schema without it) and is NOT deleted, so it must stay
+        # visible. Fail-closed behaviour for corrupt/NULL values lives in the leg
+        # predicate (not_deleted_clause), not here.
+        base_scores = {
+            chunk_id: score for chunk_id, score in base_scores.items()
+            if chunk_id in records and records[chunk_id].get("deleted") != "true"
+        }
         layers = {chunk_id: record["layer"] for chunk_id, record in records.items()}
         before = _ordered(base_scores)
         boosted_scores = apply_layer_boost(base_scores, layers, wiki_boost=self.config.wiki_boost)
@@ -255,6 +269,13 @@ class SearchEngine:
             try:
                 for chunk_id, record in self.store.get_many(
                         list(missing_targets)).items():
+                    # SOL-01: a synthetic row routes to its real target via
+                    # get_many(); if the target is an explicit tombstone
+                    # (deleted == "true") the synthetic row must not resurrect
+                    # it. Drop, never boost. A missing field means the target
+                    # predates the tombstone column and stays routable.
+                    if record.get("deleted") == "true":
+                        continue
                     records[chunk_id] = record
                     collapsed[chunk_id] = max(
                         collapsed.get(chunk_id, 0.0),

@@ -440,3 +440,230 @@ def test_cmd_delete_before_first_index_still_writes_frontmatter(tmp_path: Path, 
 
     doc = Doc.read(path, root=corpus)
     assert doc.frontmatter["deleted"] is True
+
+
+# ---------------------------------------------------------------------------
+# delete path containment (SOL-04): a doc_id must name an indexable document
+# inside the corpus, never a file outside it.
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_delete_refuses_path_traversal(tmp_path: Path, capsys):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    victim = tmp_path / "victim.md"
+    victim.write_text("---\ntype: observation\ntitle: outside\n---\n\nSECRET outside body.\n",
+                      encoding="utf-8")
+    before = victim.read_bytes()
+
+    assert app(["--corpus", str(corpus), "delete", "../victim"]) == 1
+    assert "path traversal" in capsys.readouterr().err
+    assert victim.read_bytes() == before, "delete must never rewrite a file outside the corpus"
+
+
+def test_cmd_delete_refuses_absolute_path(tmp_path: Path, capsys):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    victim = tmp_path / "victim.md"
+    victim.write_text("---\ntype: observation\n---\n\noutside.\n", encoding="utf-8")
+    before = victim.read_bytes()
+
+    assert app(["--corpus", str(corpus), "delete", str(victim)]) == 1
+    assert "not a corpus-relative" in capsys.readouterr().err
+    assert victim.read_bytes() == before
+
+
+def test_cmd_delete_refuses_non_indexable_root(tmp_path: Path, capsys):
+    corpus = tmp_path / "corpus"
+    path = _write_note(corpus, "inbox/a.md", "a")  # top-level inbox/ is not indexed
+
+    assert app(["--corpus", str(corpus), "delete", "inbox/a"]) == 1
+    assert "not indexable" in capsys.readouterr().err
+
+    doc = Doc.read(path, root=corpus)
+    assert doc.frontmatter.get("deleted") is not True, "un-indexable file must not be tombstoned"
+
+
+# ---------------------------------------------------------------------------
+# SOL-01/SOL-02/SOL-03 regression guards: delete must converge on every row a
+# document ever produced (by stable doc_id), never resurrect via enrichment
+# routing or a divergent leg, and fail loudly rather than silently leak.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic(chunk_id: str, doc_id: str, vector: list[float], text: str,
+               target: str, *, deleted=False) -> dict:
+    """A synthetic enrichment row exactly as enrich.synthetic_records shapes it:
+    kind/parent_doc/target_chunk set explicitly, chunk_id `{base}::hqN`."""
+    return {
+        **record(chunk_id, doc_id, vector, text=text, deleted=deleted),
+        "kind": "synthetic",
+        "parent_doc": doc_id,
+        "target_chunk": target,
+    }
+
+
+def test_cmd_delete_hides_chunks_indexed_under_a_previous_body(tmp_path: Path, monkeypatch, capsys):
+    """SOL-02: chunk ids are content-derived, so editing a document changes them.
+    delete must tombstone the OLD rows by doc_id, not look up the NEW ids (which
+    would match nothing) and report success while the old content stays live."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    path = _write_note(corpus, "sources/a.md", "a")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    # Edit the body WITHOUT reindexing -- old chunk "Body a." stays in both stores.
+    path.write_text("---\ntype: observation\ntitle: a\n---\n\nCompletely different body now.\n",
+                    encoding="utf-8")
+
+    assert app(["--corpus", str(corpus), "delete", "sources/a"]) == 0
+    capsys.readouterr()
+
+    assert app(["--corpus", str(corpus), "search", "Body a"]) == 0
+    assert "sources/a" not in capsys.readouterr().out, (
+        "the OLD chunk must be tombstoned even though the current body no longer produces its id"
+    )
+
+
+def test_mark_deleted_tombstones_enrichment_synthetic_rows(tmp_path: Path):
+    """SOL-01 (root cause): synthetic rows carry parent_doc == doc_id but a
+    distinct chunk_id (`{base}::hqN`); mark_deleted must match them by
+    parent_doc (dense) and by the `{doc_id}#` prefix (lexical), not by
+    re-derived ordinary chunk ids."""
+    base = record("sources/a#abc", "sources/a", [1.0, 0.0], text="ordinary base body")
+    synth = _synthetic("sources/a#abc::hq1", "sources/a", [0.0, 1.0],
+                       "unique hypothetical deletion needle", "sources/a#abc")
+
+    store = VectorStore(tmp_path / "index")
+    store.upsert([base, synth])
+    assert store.mark_deleted("sources/a", True) == 2
+    assert store.get("sources/a#abc")["deleted"] == "true"
+    assert store.get("sources/a#abc::hq1")["deleted"] == "true"
+
+    lexical = BM25Index(tmp_path / "fts.sqlite")
+    lexical.index([base, synth])
+    assert lexical.mark_deleted("sources/a", True) == 2
+    for cid in ("sources/a#abc", "sources/a#abc::hq1"):
+        got = lexical.connection.execute(
+            "SELECT deleted FROM chunk_metadata WHERE chunk_id = ?", (cid,)).fetchone()[0]
+        assert got == "true", cid
+
+
+def test_synthetic_routing_cannot_resurrect_a_deleted_target(tmp_path: Path):
+    """SOL-01 (defense in depth): even if a synthetic row is left deleted=false,
+    routing it to its target via unfiltered get_many() must drop the target when
+    the target's stored deleted flag is not 'false'."""
+    embedder = HashEmbedder(dim=24)
+    base_vec = embedder.embed(["ordinary base body"])[0]
+    synth_vec = embedder.embed(["unique hypothetical deletion needle"])[0]
+
+    base = record("sources/a#abc", "sources/a", base_vec, text="ordinary base body", deleted=True)
+    synth = _synthetic("sources/a#abc::hq1", "sources/a", synth_vec,
+                       "unique hypothetical deletion needle", "sources/a#abc", deleted=False)
+
+    store = VectorStore(tmp_path / "index")
+    store.upsert([base, synth])
+    lexical = BM25Index(tmp_path / "fts.sqlite")
+    lexical.index([base, synth])
+    engine = SearchEngine(embedder, store, lexical, IdentityReranker(),
+                          SearchConfig(prefetch=5, top_k=5, wiki_boost=1.25))
+
+    results = engine.search("unique hypothetical deletion needle")
+    assert "sources/a#abc" not in {r.chunk_id for r in results}
+    assert all("::hq" not in r.chunk_id for r in results), "synthetic rows must never surface directly"
+
+
+def test_stale_lexical_leg_cannot_resurrect_via_hydration(tmp_path: Path):
+    """SOL-03 (defense in depth): after dense commits but lexical does not, a
+    lexical-only candidate hydrates from the dense record whose deleted is
+    'true' and must be dropped, so the divergent leg cannot leak the document."""
+    embedder = HashEmbedder(dim=24)
+    vec = embedder.embed(["sweep page lint"])[0]
+    row = record("sources/a#abc", "sources/a", vec, text="sweep page lint")
+
+    store = VectorStore(tmp_path / "index")
+    store.upsert([row])
+    lexical = BM25Index(tmp_path / "fts.sqlite")
+    lexical.index([row])
+
+    # dense tombstoned; lexical deliberately left stale (deleted='false').
+    store.mark_deleted("sources/a", True)
+
+    engine = SearchEngine(embedder, store, lexical, IdentityReranker(),
+                          SearchConfig(prefetch=5, top_k=5, wiki_boost=1.25))
+    results = engine.search("sweep page lint")
+    assert "sources/a#abc" not in {r.chunk_id for r in results}
+
+
+def test_cmd_delete_reports_partial_store_failure(tmp_path: Path, monkeypatch, capsys):
+    """SOL-03 (loud failure): if the lexical flip raises after the dense flip
+    commits, delete must return nonzero (never a silent success), keep the
+    frontmatter durable, and tell the operator how to converge."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    _write_note(corpus, "sources/a.md", "a")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    def boom(self, doc_id, deleted):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(BM25Index, "mark_deleted", boom)
+
+    assert app(["--corpus", str(corpus), "delete", "sources/a"]) == 1
+    err = capsys.readouterr().err
+    assert "failed partway" in err
+    assert "re-run `alexandria delete" in err
+
+    doc = Doc.read(corpus / "sources" / "a.md", root=corpus)
+    assert doc.frontmatter["deleted"] is True
+
+
+def test_dense_leg_survives_an_old_schema_without_deleted(tmp_path: Path):
+    """The live corpus's Lance table predates the `deleted` column. search_vector
+    must NOT error and silently degrade retrieval to lexical-only just because
+    that column does not exist -- a table without it has no tombstones to hide,
+    so the tombstone predicate is a no-op that must be skipped, not fatal."""
+    import lancedb
+    import pyarrow as pa
+
+    db = lancedb.connect(str(tmp_path / "index"))
+    db.create_table(
+        "chunks",
+        data=[{
+            "chunk_id": "row", "doc_id": "sources/a", "text": "sweep lint",
+            "heading_path": "H", "type": "observation", "project": "",
+            "status": "active", "source": "test", "layer": "sources",
+            "generated_at": "", "vector": [1.0, 0.0], "tags": [],
+            "entities": [], "enrichment": "", "kind": "", "parent_doc": "",
+            "target_chunk": "",
+        }],
+        schema=pa.schema([
+            pa.field("chunk_id", pa.string()), pa.field("doc_id", pa.string()),
+            pa.field("text", pa.string()), pa.field("heading_path", pa.string()),
+            pa.field("type", pa.string()), pa.field("project", pa.string()),
+            pa.field("status", pa.string()), pa.field("source", pa.string()),
+            pa.field("layer", pa.string()), pa.field("generated_at", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), 2)),
+            pa.field("tags", pa.list_(pa.string())), pa.field("entities", pa.list_(pa.string())),
+            pa.field("enrichment", pa.string()), pa.field("kind", pa.string()),
+            pa.field("parent_doc", pa.string()), pa.field("target_chunk", pa.string()),
+        ]),
+    )
+
+    store = VectorStore(tmp_path / "index")
+    results = store.search_vector([1.0, 0.0], k=5)
+    assert [r["chunk_id"] for r in results] == ["row"], (
+        "a table without a `deleted` column must still return dense candidates, "
+        "not error and degrade the whole dense leg"
+    )
+
+    # And the tombstone projection must fail loudly with a rebuild instruction,
+    # never silently tombstone only the lexical leg.
+    try:
+        store.mark_deleted("sources/a", True)
+    except RuntimeError as exc:
+        assert "index --rebuild" in str(exc)
+    else:
+        raise AssertionError("mark_deleted on an old schema must fail loudly")

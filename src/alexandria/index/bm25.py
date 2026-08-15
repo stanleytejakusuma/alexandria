@@ -161,6 +161,26 @@ class BM25Index:
         ).fetchall()
         return [(str(chunk_id), float(score)) for chunk_id, score in rows]
 
+    def mark_deleted(self, doc_id: str, deleted: bool) -> int:
+        """Flip `deleted` on every chunk_metadata row whose chunk_id belongs to
+        doc_id, returning the number of rows updated.
+
+        chunk_metadata has no doc_id column; chunk_id is `{doc_id}#{hash}`
+        (ordinary) or `{doc_id}#{hash}::hqN` (synthetic), both prefixed by
+        `{doc_id}#`. This prefix match is the lexical-leg half of SOL-01/SOL-02:
+        the affected set must come from the rows a document already produced,
+        not from re-chunking its current body (which yields different ids after
+        an edit and never yields synthetic ids at all).
+        """
+        flag = deleted_flag(deleted)
+        prefix = _like_escape(str(doc_id)) + "#%"
+        with self.connection:
+            cur = self.connection.execute(
+                "UPDATE chunk_metadata SET deleted = ? WHERE chunk_id LIKE ? ESCAPE '\\'",
+                (flag, prefix),
+            )
+            return cur.rowcount
+
     def drop(self) -> None:
         with self.connection:
             self.connection.execute("DELETE FROM chunks_fts")
@@ -200,6 +220,11 @@ def fts_query(query: str) -> str | None:
         return None
     # Quoted individual tokens keep FTS operators, quotes, and prefix markers literal.
     return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+
+
+def _like_escape(text: str) -> str:
+    """Escape LIKE metacharacters so a doc_id is matched as a literal prefix."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def json_dumps_list(value: Any) -> str:

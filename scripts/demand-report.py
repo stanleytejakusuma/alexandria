@@ -15,15 +15,15 @@ Classification methodology (see docs/DEMAND-REPORT-*.md "Methodology" for the fu
 rationale): a query row is classified as one of:
   - eval_infra     confirmed automated eval/test traffic
   - synthetic_probe confirmed canary/health-check/calibration traffic
-  - genuine         confirmed or high-confidence real human/agent usage
+  - genuine         confirmed real agent usage (a pi-extension caller)
+  - likely_genuine  a user-facing code path (search/serve/answer), unattributed
   - uncertain       could not be confidently classified either way
 
-The two "confirmed" buckets are established by direct evidence (exact text match to a
-committed golden/eval query set, or an audit-log caller identity known to be
-non-interactive). Everything else falls to burst-timing heuristics, which are
-probabilistic and explained in the doc -- do not treat "genuine" counts from the
-heuristic path as precise; treat them as an informed estimate bounded by the
-"uncertain" bucket.
+"genuine" is reserved for the one caller identity that is positive evidence of origin
+(the pi extension sets ALEXANDRIA_CALLER=pi-extension itself); a default `caller="cli"`
+or a bare `client` value is a code-path label, not evidence of who called, so those
+rows are `likely_genuine` at most. Do not treat "genuine" or "likely_genuine" counts
+as precise; treat them as an informed estimate bounded by the "uncertain" bucket.
 """
 from __future__ import annotations
 
@@ -71,8 +71,12 @@ SYNTHETIC_CALLERS = {"consumer-audit"}
 # pi-extension = the AlexandriaSearch/AlexandriaContext/AlexandriaAnswer tool bindings
 # in ~/.pi/agent/extensions/alexandria.ts (confirmed by reading that file: it sets
 # ALEXANDRIA_CALLER=pi-extension on every CLI-exec fallback call). This is exactly the
-# "agent retrieves proactively" surface the invocation proposal is about.
-GENUINE_CALLERS = {"pi-extension", "cli"}
+# "agent retrieves proactively" surface the invocation proposal is about, and it is
+# the ONLY caller identity that is positive evidence of origin: every other value is
+# either a known non-interactive probe (SYNTHETIC_CALLERS) or the audit log's own
+# default `caller="cli"` -- an UNSPECIFIED caller, not evidence of a human or agent.
+# A default "cli" caller is therefore treated as unattributed, never as confirmed.
+GENUINE_CALLERS = {"pi-extension"}
 
 BURST_GAP_SECONDS = 2.0  # gaps below this, for unattributed cli rows, match the
 # measured burst signature of confirmed eval traffic (median 0.54s, 69-76% < 2s)
@@ -100,6 +104,21 @@ GOLDEN_FILES = [
 FRONTMATTER_AT_RE = re.compile(r"^\s*at:\s*'?\"?([0-9]{4}-[0-9]{2}-[0-9]{2}[^'\"\n]*)'?\"?\s*$")
 
 
+def _parse_aware(ts: str) -> datetime.datetime:
+    """Parse an ISO timestamp to aware UTC.
+
+    The query log has always written offset-aware UTC, but the audit log's
+    historical rows used a local `+0700` offset and either could gain a naive
+    value from a legacy/foreign writer. Subtracting a naive datetime from an
+    aware one raises TypeError, so normalize to aware UTC at the boundary and
+    interpret a naive value as UTC (the least-wrong single convention).
+    """
+    dt = datetime.datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
 def load_queries(db_path: Path) -> list[dict]:
     uri = f"file:{db_path}?mode=ro"
     con = sqlite3.connect(uri, uri=True)
@@ -114,7 +133,7 @@ def load_queries(db_path: Path) -> list[dict]:
     out = []
     for r in rows:
         d = dict(r)
-        d["ts_dt"] = datetime.datetime.fromisoformat(d["ts"])
+        d["ts_dt"] = _parse_aware(d["ts"])
         try:
             d["retrieved_ids"] = json.loads(d["retrieved_ids"])
         except (json.JSONDecodeError, TypeError):
@@ -167,7 +186,7 @@ def load_audit_callers(audit_path: Path) -> list[tuple[datetime.datetime, str, s
             if ts is None or q is None:
                 continue
             try:
-                dt = datetime.datetime.fromisoformat(ts)
+                dt = _parse_aware(ts)
             except ValueError:
                 continue
             out.append((dt, q, caller))
@@ -236,7 +255,8 @@ def find_batch_replay_ids(queries: list[dict]) -> set[str]:
 
 
 def classify(queries: list[dict], golden: set[str], callers: dict[str, str]) -> dict[str, str]:
-    """Returns {query_id: label} where label in eval_infra/synthetic_probe/genuine/uncertain."""
+    """Returns {query_id: label} where label in
+    eval_infra/synthetic_probe/genuine/likely_genuine/uncertain."""
     labels: dict[str, str] = {}
     batch_ids = find_batch_replay_ids(queries)
 
@@ -260,8 +280,13 @@ def classify(queries: list[dict], golden: set[str], callers: dict[str, str]) -> 
         qid = row["query_id"]
         client = row["client"]
         q = row["q"]
+        caller = callers.get(qid)
 
-        if qid in batch_ids:
+        # A confirmed pi-extension caller is real usage; the batch-replay
+        # detector must not override it. A warm daemon can log several real
+        # requests back-to-back -- the exact shape the batch detector was built
+        # to catch -- but only for rows with no positive caller evidence.
+        if qid in batch_ids and caller != "pi-extension":
             labels[qid] = "eval_infra"
             continue
         if client in CONFIRMED_EVAL_CLIENTS:
@@ -271,7 +296,6 @@ def classify(queries: list[dict], golden: set[str], callers: dict[str, str]) -> 
             labels[qid] = "eval_infra"
             continue
 
-        caller = callers.get(qid)
         if caller in SYNTHETIC_CALLERS:
             labels[qid] = "synthetic_probe"
             continue
@@ -290,8 +314,11 @@ def classify(queries: list[dict], golden: set[str], callers: dict[str, str]) -> 
                 labels[qid] = "uncertain"
             continue
 
+        # A non-probe row on a user-facing code path (search/serve/answer) is
+        # NOT confirmed intent -- `client` is a code-path label, not evidence of
+        # who called. Report it as likely_genuine, never genuine.
         if client in ("search", "serve", "answer"):
-            labels[qid] = "genuine"
+            labels[qid] = "likely_genuine"
             continue
 
         labels[qid] = "uncertain"
@@ -395,17 +422,17 @@ def main() -> int:
 
     print("\n--- 1. VOLUME BY CLASSIFICATION ---")
     total = len(queries)
-    for label in ("eval_infra", "synthetic_probe", "genuine", "uncertain"):
+    for label in ("eval_infra", "synthetic_probe", "genuine", "likely_genuine", "uncertain"):
         n = label_counts.get(label, 0)
         print(f"  {label:16s} {n:5d}  ({n / total * 100:5.1f}%)")
     print("\n  by (client, classification):")
     for (client, label), n in sorted(client_label.items()):
         print(f"    {client:14s} {label:16s} {n:5d}")
 
-    print("\n--- 1b. GENUINE VOLUME BY DAY ---")
-    genuine_ids = {qid for qid, lab in labels.items() if lab == "genuine"}
-    genuine_rows = [r for r in queries if r["query_id"] in genuine_ids]
-    by_day = Counter(r["ts"][:10] for r in genuine_rows)
+    print("\n--- 1b. REAL-USAGE VOLUME BY DAY (genuine + likely_genuine) ---")
+    real_ids = {qid for qid, lab in labels.items() if lab in ("genuine", "likely_genuine")}
+    real_rows = [r for r in queries if r["query_id"] in real_ids]
+    by_day = Counter(r["ts"][:10] for r in real_rows)
     for day in sorted(by_day):
         print(f"    {day}  {by_day[day]}")
     uncertain_ids = {qid for qid, lab in labels.items() if lab == "uncertain"}
@@ -416,12 +443,12 @@ def main() -> int:
         for day in sorted(by_day_u):
             print(f"    {day}  {by_day_u[day]}")
 
-    print("\n--- 2. AGE OF RETRIEVED DOCUMENTS AT QUERY TIME (genuine queries only) ---")
+    print("\n--- 2. AGE OF RETRIEVED DOCUMENTS AT QUERY TIME (real-usage queries only) ---")
     date_cache: dict[str, datetime.datetime | None] = {}
     ages_hours: list[float] = []
     unresolved = 0
     total_ids = 0
-    for row in genuine_rows:
+    for row in real_rows:
         for rid in row["retrieved_ids"]:
             total_ids += 1
             doc_dt = resolve_doc_date(corpus, rid, date_cache)
@@ -441,18 +468,18 @@ def main() -> int:
         pct = n / len(ages_hours) * 100 if ages_hours else 0
         print(f"    {b:10s} {n:4d}  ({pct:5.1f}%)")
 
-    print("\n--- 3. FAILED / EMPTY RETRIEVALS (genuine queries only) ---")
-    empty = [r for r in genuine_rows if not r["retrieved_ids"]]
+    print("\n--- 3. FAILED / EMPTY RETRIEVALS (real-usage queries only) ---")
+    empty = [r for r in real_rows if not r["retrieved_ids"]]
     weak_threshold = None
-    all_top_scores = [max(r["scores"]) for r in genuine_rows if r["scores"]]
+    all_top_scores = [max(r["scores"]) for r in real_rows if r["scores"]]
     if all_top_scores:
         all_top_scores_sorted = sorted(all_top_scores)
         weak_threshold = all_top_scores_sorted[max(0, len(all_top_scores_sorted) // 10 - 1)]
-    weak = [r for r in genuine_rows if r["scores"] and weak_threshold is not None
+    weak = [r for r in real_rows if r["scores"] and weak_threshold is not None
             and max(r["scores"]) <= weak_threshold]
-    print(f"  empty retrieval (0 results): {len(empty)} / {len(genuine_rows)}")
+    print(f"  empty retrieval (0 results): {len(empty)} / {len(real_rows)}")
     if weak_threshold is not None:
-        print(f"  weak top-score (<= bottom decile, {weak_threshold:.3f}): {len(weak)} / {len(genuine_rows)}")
+        print(f"  weak top-score (<= bottom decile, {weak_threshold:.3f}): {len(weak)} / {len(real_rows)}")
     if empty:
         print("  empty-retrieval dates (query text withheld from report -- see raw db):")
         for r in empty:
@@ -466,9 +493,9 @@ def main() -> int:
         print(f"  {client}:")
         print(f"    cold: {fmt_dist(cold)}")
         print(f"    warm: {fmt_dist(warm)}")
-    print("  genuine-only:")
-    cold_g = [r["latency_ms"] for r in genuine_rows if not r["cache_hit"]]
-    warm_g = [r["latency_ms"] for r in genuine_rows if r["cache_hit"]]
+    print("  real-usage (genuine + likely_genuine):")
+    cold_g = [r["latency_ms"] for r in real_rows if not r["cache_hit"]]
+    warm_g = [r["latency_ms"] for r in real_rows if r["cache_hit"]]
     print(f"    cold: {fmt_dist(cold_g)}")
     print(f"    warm: {fmt_dist(warm_g)}")
 
@@ -479,13 +506,13 @@ def main() -> int:
             "date_range": [queries[0]["ts"], queries[-1]["ts"]] if queries else None,
             "label_counts": dict(label_counts),
             "client_label_counts": {f"{c}/{l}": n for (c, l), n in client_label.items()},
-            "genuine_by_day": dict(by_day),
+            "real_usage_by_day": dict(by_day),
             "age_distribution_hours": {
                 "n": len(ages_hours),
                 "buckets": dict(bucket_counts),
             } if ages_hours else None,
             "failed_retrievals": {"empty": len(empty), "weak": len(weak) if weak_threshold else None},
-            "latency_genuine_ms": {
+            "latency_real_usage_ms": {
                 "cold": fmt_dist(cold_g),
                 "warm": fmt_dist(warm_g),
             },

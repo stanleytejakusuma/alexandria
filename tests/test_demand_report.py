@@ -79,24 +79,37 @@ def test_find_batch_replay_ids_per_client_isolation():
     assert "search0" not in batch_ids
 
 
-def test_classify_batch_replay_overrides_pi_extension_caller():
-    # Even a row whose audit-matched caller looks genuine (pi-extension) must be
-    # classified eval_infra if it's part of a confirmed tight-burst replay window --
-    # this is the priority-ordering guarantee documented in classify()'s docstring.
+def test_classify_batch_does_not_override_pi_extension_caller():
+    # SOL-05: a confirmed pi-extension caller is real usage and must survive the
+    # batch-replay detector -- a warm daemon can log several real requests back to
+    # back, the exact shape the detector was built to catch, but only for rows with
+    # no positive caller evidence.
     rows = [
         _row(f"burst{i}", f"2026-08-12T17:57:34.{i:02d}0000+00:00", f"q{i}")
         for i in range(6)
     ]
     callers = {"burst0": "pi-extension"}
     labels = demand_report.classify(rows, golden=set(), callers=callers)
-    assert labels["burst0"] == "eval_infra"
-    assert all(v == "eval_infra" for v in labels.values())
+    assert labels["burst0"] == "genuine"
+    assert all(labels[r["query_id"]] == "eval_infra" for r in rows[1:])
 
 
-def test_classify_genuine_cli_caller_outside_burst():
+def test_classify_default_cli_caller_is_unattributed():
+    # SOL-05: `caller="cli"` is the audit log's DEFAULT, not positive evidence of a
+    # human or agent, so it must not be labelled genuine; a one-off cli row with no
+    # burst signature is unattributed.
     rows = [_row("g1", "2026-08-11T11:14:13+00:00", "a real one-off question")]
     labels = demand_report.classify(rows, golden=set(), callers={"g1": "cli"})
-    assert labels["g1"] == "genuine"
+    assert labels["g1"] == "uncertain"
+
+
+def test_classify_pi_extension_caller_is_genuine():
+    # The pi extension self-labels every CLI-exec fallback call; that IS positive
+    # evidence of origin and the only caller identity worth "genuine".
+    rows = [_row("p1", "2026-08-11T14:07:00+00:00",
+                 "how does the weekly loop verify its own completion")]
+    labels = demand_report.classify(rows, golden=set(), callers={"p1": "pi-extension"})
+    assert labels["p1"] == "genuine"
 
 
 def test_daemon_row_with_real_content_is_not_labelled_synthetic():
@@ -121,7 +134,7 @@ def test_daemon_row_with_real_content_is_not_labelled_synthetic():
         client="serve",
     )
     labels = demand_report.classify([row], golden=set(), callers={"d1": "local-anonymous"})
-    assert labels["d1"] == "genuine"
+    assert labels["d1"] == "likely_genuine"
 
 
 def test_daemon_row_with_probe_text_is_still_synthetic():
@@ -136,6 +149,20 @@ def test_daemon_row_with_probe_text_is_still_synthetic():
     )
     labels = demand_report.classify([row], golden=set(), callers={"d2": "local-anonymous"})
     assert labels["d2"] == "synthetic_probe"
+
+
+def test_parse_aware_normalizes_to_aware_utc():
+    # SOL-06: subtracting a naive datetime from an aware one raised TypeError and
+    # aborted the whole report; both loaders normalize to aware UTC at the boundary.
+    assert demand_report._parse_aware("2026-01-01T00:00:00").tzinfo is not None
+    assert demand_report._parse_aware("2026-01-01T00:00:00") == datetime.datetime(
+        2026, 1, 1, tzinfo=datetime.timezone.utc)
+    assert demand_report._parse_aware("2026-01-01T07:00:00+0700") == datetime.datetime(
+        2026, 1, 1, tzinfo=datetime.timezone.utc)
+    assert demand_report._parse_aware("2026-01-01T00:00:00+00:00") == datetime.datetime(
+        2026, 1, 1, tzinfo=datetime.timezone.utc)
+    assert demand_report._parse_aware("2026-01-01T00:00:00-05:00") == datetime.datetime(
+        2026, 1, 1, 5, 0, tzinfo=datetime.timezone.utc)
 
 
 if __name__ == "__main__":

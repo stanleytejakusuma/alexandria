@@ -416,9 +416,27 @@ def cmd_reconcile(args) -> int:
 
 def _doc_path_for(corpus: Path, doc_id: str) -> Path:
     """doc_id -> corpus-relative markdown path, inverting corpus.doc_id().
-    Lenient about a caller passing the trailing `.md` either way."""
+    Lenient about a caller passing the trailing `.md` either way.
+
+    Refuses to name anything outside the indexable tree. `delete` writes
+    frontmatter, so a doc_id that resolves outside `sources/`/`wiki/` -- via an
+    absolute path, `.`/`..` traversal, or a symlink escaping the corpus -- would
+    mutate a file `delete` has no business touching. `is_indexable_source` is
+    the same single source of truth the indexer and /health use, so a delete
+    target and an indexable document can never disagree."""
     stem = doc_id[:-3] if doc_id.endswith(".md") else doc_id
-    return corpus / f"{stem}.md"
+    rel = Path(stem)
+    if rel.is_absolute():
+        raise ValueError(f"not a corpus-relative document id: {doc_id!r}")
+    if not rel.parts or any(part in (".", "..") for part in rel.parts):
+        raise ValueError(f"document id must not contain path traversal: {doc_id!r}")
+    if not is_indexable_source(rel):
+        raise ValueError(
+            f"document id is not indexable (must be under sources/ or wiki/): {doc_id!r}")
+    path = corpus / f"{rel}.md"
+    if not path.resolve().is_relative_to(corpus.resolve()):
+        raise ValueError(f"document id resolves outside the corpus: {doc_id!r}")
+    return path
 
 
 def _cmd_list_deleted(corpus: Path) -> int:
@@ -475,7 +493,11 @@ def cmd_delete(args) -> int:
         print("alexandria: delete requires a doc_id (or --list)", file=sys.stderr)
         return 1
 
-    path = _doc_path_for(corpus, args.doc_id)
+    try:
+        path = _doc_path_for(corpus, args.doc_id)
+    except ValueError as exc:
+        print(f"alexandria: {exc}", file=sys.stderr)
+        return 1
     if not path.is_file():
         print(f"alexandria: no such document: {args.doc_id}", file=sys.stderr)
         return 1
@@ -490,54 +512,56 @@ def cmd_delete(args) -> int:
     doc.frontmatter["deleted"] = want_deleted
     doc.write(corpus)
 
-    records, error = chunk_doc_records(path, corpus, config)
-    if error:
-        print(f"alexandria: {error}", file=sys.stderr)
-        return 1
-
     verb = "undeleted" if args.undelete else "deleted"
-    ready: list[dict] = []
-    if records:
-        lock = write_lock(corpus)
-        if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
-            holder = lock.holder_pid()
-            print(f"alexandria: frontmatter updated ({args.doc_id} is now {verb}) but could "
-                  f"not acquire the corpus write lock within {DEFAULT_LOCK_TIMEOUT:.0f}s "
-                  f"(held by {holder or 'an unknown process'}) -- the index still reflects "
-                  f"the OLD state until the next `alexandria index` run.", file=sys.stderr)
-            return 1
-        try:
-            store = VectorStore(corpus / ".alexandria" / "index")
-            lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
-            # Reuse each chunk's EXISTING vector rather than re-embedding: the
-            # flag change never touches chunk text, so chunk_id (content-
-            # derived, see index/chunker.py's _make) is unchanged and the old
-            # vector is still correct. This is a metadata-only flip, and
-            # loading an embedding model to recompute an unchanged vector
-            # would be pure waste. A chunk_id get_many() can't find was never
-            # indexed (this document predates the corpus's first `index` run,
-            # or was never promoted) -- nothing to hide from search yet, and
-            # the frontmatter write above already guarantees the next
-            # `index`/`promote` will project the correct value.
-            existing = store.get_many([record["chunk_id"] for record in records])
-            for record in records:
-                vector = existing.get(record["chunk_id"], {}).get("vector")
-                if vector is not None:
-                    record["vector"] = vector
-                    ready.append(record)
-            if ready:
-                store.upsert(ready)
-                lexical.index(ready, append_only=False)
-                write_index_generation(corpus)
-        finally:
-            lock.release()
 
-    skipped = len(records) - len(ready)
-    note = f", {skipped} chunk(s) not yet indexed (will apply on the next `index`)" if skipped else ""
+    # Reproject the flag into BOTH physical stores by stable document identity
+    # (doc_id / parent_doc), NOT by chunk ids re-derived from the current body.
+    # Deriving from current content misses rows indexed under an OLD id after an
+    # edit (SOL-02) and never yields enrichment synthetic rows at all (SOL-01).
+    # mark_deleted updates rows in place, so no re-embedding is needed -- the
+    # flag change never touches chunk text.
+    lock = write_lock(corpus)
+    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+        holder = lock.holder_pid()
+        print(f"alexandria: frontmatter updated ({args.doc_id} is now {verb}) but could "
+              f"not acquire the corpus write lock within {DEFAULT_LOCK_TIMEOUT:.0f}s "
+              f"(held by {holder or 'an unknown process'}) -- the index still reflects "
+              f"the OLD state until the next `alexandria index` run.", file=sys.stderr)
+        return 1
+    updated = 0
+    try:
+        store = VectorStore(corpus / ".alexandria" / "index")
+        lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+        # Dense first. If the dense flip commits and the lexical flip then
+        # fails, the dense record's deleted='true' is still enforced at
+        # hydration in search.py, so a stale lexical candidate cannot surface
+        # the document.
+        dense_n = store.mark_deleted(doc.doc_id, want_deleted)
+        lexical_n = lexical.mark_deleted(doc.doc_id, want_deleted)
+        updated = max(dense_n, lexical_n)
+        write_index_generation(corpus)
+    except Exception as exc:
+        # SOL-03: the two stores are separate databases; there is no shared
+        # transaction. If the dense flip committed before the lexical flip
+        # raised, invalidate the generation anyway so a cached pre-delete
+        # result cannot resurrect the document. The durable frontmatter plus
+        # idempotent mark_deleted make the next `delete`/`index` converge.
+        try:
+            write_index_generation(corpus)
+        except Exception:
+            pass
+        print(f"alexandria: frontmatter updated ({args.doc_id} is now {verb}) but "
+              f"the index projection failed partway ({exc}); re-run `alexandria delete "
+              f"{args.doc_id}` or `alexandria index` to converge.", file=sys.stderr)
+        return 1
+    finally:
+        lock.release()
+
+    note = ", 0 chunk(s) not yet indexed (will apply on the next `index`)" if updated == 0 else ""
     if already == want_deleted:
         print(f"delete: {args.doc_id} was already {verb}{note}")
     else:
-        print(f"delete: {args.doc_id} {verb} -- {len(ready)} chunk(s) updated{note}")
+        print(f"delete: {args.doc_id} {verb} -- {updated} chunk(s) updated{note}")
     return 0
 
 
