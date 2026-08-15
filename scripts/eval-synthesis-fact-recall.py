@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pages", type=Path, default=None, help="dir with <cluster-id>.md (+ .skip-log.json)")
     p.add_argument("--gather", type=Path, default=None, help="dir with <cluster-id>.gather.json sidecars")
     p.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN)
-    p.add_argument("--model-a", default="claude-fable-5")
+    p.add_argument("--model-a", default="deepseek-v4-flash")
     p.add_argument("--model-b", default="deepseek-v4-pro")
     p.add_argument("--base-url", default="http://127.0.0.1:20128/v1",
                    help="OpenAI-compatible gateway base URL (remote unattended gateway "

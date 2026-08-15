@@ -37,11 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--retries", type=int, default=2)
     p.add_argument("--base-url", default="http://127.0.0.1:20128/v1")
     p.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY")
-    p.add_argument("--gather-model", default="openrouter/anthropic/claude-sonnet-5")
-    p.add_argument("--writer-model", default="openrouter/anthropic/claude-sonnet-5")
-    p.add_argument("--repair-model", default="openrouter/anthropic/claude-sonnet-5")
-    p.add_argument("--audit-model", default="openrouter/anthropic/claude-sonnet-5")
-    p.add_argument("--coverage-a", default="openrouter/anthropic/claude-sonnet-5")
+    p.add_argument("--gather-model", default="deepseek-v4-pro")
+    p.add_argument("--writer-model", default="deepseek-v4-pro")
+    p.add_argument("--repair-model", default="deepseek-v4-pro")
+    p.add_argument("--audit-model", default="deepseek-v4-flash")
+    p.add_argument("--coverage-a", default="deepseek-v4-flash")
     p.add_argument("--coverage-b", default="deepseek-v4-pro")
     return p
 

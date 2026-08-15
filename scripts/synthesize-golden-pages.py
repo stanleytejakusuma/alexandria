@@ -298,11 +298,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "gateway for long/unattended runs)")
     p.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY",
                    help="env var holding the gateway API key")
-    p.add_argument("--gather-model", default="claude-sonnet-5")
-    p.add_argument("--writer-model", default="claude-sonnet-5")
-    p.add_argument("--repair-model", default="claude-sonnet-5")
-    p.add_argument("--audit-model", default="claude-fable-5")
-    p.add_argument("--coverage-a", default="claude-fable-5")
+    p.add_argument("--gather-model", default="deepseek-v4-pro")
+    p.add_argument("--writer-model", default="deepseek-v4-pro")
+    p.add_argument("--repair-model", default="deepseek-v4-pro")
+    p.add_argument("--audit-model", default="deepseek-v4-flash")
+    p.add_argument("--coverage-a", default="deepseek-v4-flash")
     p.add_argument("--coverage-b", default="deepseek-v4-pro")
     return p
 

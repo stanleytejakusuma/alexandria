@@ -1368,7 +1368,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--journal-path",
                    default=str(Path.home() / "citadel/personal-finance/accountability.md"))
     s.add_argument("--base-url", default="http://127.0.0.1:20128/v1")
-    s.add_argument("--model", default="claude-haiku-4-5")
+    s.add_argument("--model", default="deepseek-v4-flash")
     s.add_argument("--limit", type=int, default=0)
     s.add_argument("--workers", type=int, default=6)
     s.add_argument("--dry-run", action="store_true")
@@ -1478,9 +1478,9 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("--k", type=int, default=8, help="gather seed depth")
     answer.add_argument("--base-url", default="http://127.0.0.1:20128/v1")
     answer.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY")
-    answer.add_argument("--llm-model", default="openrouter/anthropic/claude-sonnet-5",
+    answer.add_argument("--llm-model", default="deepseek-v4-pro",
                         help="gather/write/repair model (the measurement-proven config)")
-    answer.add_argument("--grader-a-model", default="openrouter/anthropic/claude-sonnet-5")
+    answer.add_argument("--grader-a-model", default="deepseek-v4-flash")
     answer.add_argument("--grader-b-model", default="deepseek-v4-pro")
     answer.add_argument("--prompt-version", default="v1")
     answer.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),

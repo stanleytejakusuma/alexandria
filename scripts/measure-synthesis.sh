@@ -14,7 +14,7 @@
 #                       a private network address that must not appear in this
 #                       repo, the leak scanner enforces that)
 #   ALEX_API_KEY_ENV   env var holding the gateway key (default ALEXANDRIA_AXIOM_KEY)
-#   ALEX_MODEL_A       grader/writer A (default openrouter/anthropic/claude-fable-5)
+#   ALEX_MODEL_A       grader/writer A (default deepseek-v4-flash)
 #   ALEX_MODEL_B       grader B (default deepseek-v4-pro)
 #   ALEX_RETRIES       pipeline retries per cluster (default 2)
 set -euo pipefail
@@ -25,7 +25,7 @@ GOLDEN="${ALEX_GOLDEN:-$CORPUS/.alexandria/golden/synthesis-clusters.jsonl}"
 OUT="${ALEX_OUT:-/tmp/alx/synth-run}"
 BASE_URL="${ALEX_BASE_URL:-}"
 API_KEY_ENV="${ALEX_API_KEY_ENV:-ALEXANDRIA_AXIOM_KEY}"
-MODEL_A="${ALEX_MODEL_A:-openrouter/anthropic/claude-fable-5}"
+MODEL_A="${ALEX_MODEL_A:-deepseek-v4-flash}"
 MODEL_B="${ALEX_MODEL_B:-deepseek-v4-pro}"
 RETRIES="${ALEX_RETRIES:-2}"
 REPORT_DIR="$CORPUS/.alexandria/golden"

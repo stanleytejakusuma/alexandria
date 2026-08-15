@@ -227,7 +227,7 @@ def report(results) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--path", type=Path, default=DEFAULT_PATH)
-    p.add_argument("--model", default="claude-sonnet-5")
+    p.add_argument("--model", default="deepseek-v4-flash")
     p.add_argument("--second-model", default=None,
                    help="if set, run borderline-via-disagreement mode: grade every "
                         "case with both --model and --second-model, report where "

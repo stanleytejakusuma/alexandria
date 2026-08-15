@@ -56,7 +56,7 @@ class LLMError(RuntimeError):
 @dataclass
 class LLMClient:
     base_url: str = "http://127.0.0.1:20128/v1"
-    model: str = "omni-claude-sonnet"
+    model: str = "deepseek-v4-pro"
     api_key_env: str = "ALEXANDRIA_LLM_KEY"
     timeout: int = 120
     max_retries: int = 4

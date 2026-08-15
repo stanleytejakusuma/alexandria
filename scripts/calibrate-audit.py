@@ -223,7 +223,7 @@ def report(results: list[tuple[dict, str, str | None, str | None]]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default="claude-sonnet-5")
+    p.add_argument("--model", default="deepseek-v4-flash")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     return p
