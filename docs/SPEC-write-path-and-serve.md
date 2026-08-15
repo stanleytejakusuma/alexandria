@@ -787,7 +787,9 @@ much further — the one item here that genuinely gets more expensive with time.
   against brittle `must_retrieve` ids) is not load-bearing here. No repair work.
 - **Serve host:** default is the operator's own machine; remote hosting on an always-on
   box is a supported topology, gated on the embedding-provider constraint in §5.8.
-  Building the server is not blocked on choosing a host.
+  Building the server is not blocked on choosing a host. **Decided 2026-08-15:** this
+  deployment moves serve + storage to the always-on NAS host — see
+  `DECISION-serve-host-remote-2026-08-15.md`.
 - **Session distillation:** out of this package; tracked separately.
 - **Extension routing:** in — the extension calls `serve` when reachable, CLI otherwise.
 - **Embedding cache in backup:** out (rebuildable), but it must first be *located* — the
