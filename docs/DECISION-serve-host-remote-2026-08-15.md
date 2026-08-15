@@ -1,15 +1,27 @@
-# Decision: serve and storage move to the always-on NAS host
+# Decision: this deployment runs on the always-on NAS host (remote topology)
 
 **Date:** 2026-08-15
 **Status:** decided (operator-ratified)
-**Supersedes:** SPEC-write-path-and-serve.md §11 "Serve host" bullet (default local).
+**Confirms:** SPEC-write-path-and-serve.md §5.8 / §11 — default local, remote supported.
+**Selects, for this deployment:** the remote (always-on NAS) topology.
+
+## Product principle (unchanged, restated for the record)
+
+**Default: the operator's own machine.** A single-user install is the whole story and
+needs no configuration. **Optional: a remote always-on host.** For an enterprise /
+fleet / production-grade environment, compute and storage move off the machine so the
+database is reachable fleet-wide, and access control becomes a real requirement.
+
+This decision does **not** change the default. It exercises the *optional* remote
+topology for the operator's own environment, which is being run as an
+enterprise-grade, fleet-accessible deployment.
 
 ## What
 
-alexandria's server, storage, and index move to the operator's always-on NAS host.
-The operator's own machine is demoted to the build machine. This executes the
-"remote supported" topology that §5.8 reserved and supersedes the "default local"
-for this deployment.
+For this deployment, alexandria's server, storage, and index move to the always-on NAS
+host. The operator's own machine is demoted to the build machine (it still embeds and
+queries as a client). A single-user, all-local install remains the out-of-the-box
+default.
 
 ## Drivers
 
@@ -17,7 +29,8 @@ for this deployment.
   growing) should not live there.
 - The operator's machine sleeps; a server reachable for the second-harness read
   path (BACKLOG #13) needs an always-on host.
-- The operator stated this as a requirement ("storage on the NAS, not local").
+- Fleet-wide accessibility: storage on the NAS is reachable by the home-lab fleet,
+  and it exercises the production/enterprise hosting path end to end.
 
 ## What moves
 

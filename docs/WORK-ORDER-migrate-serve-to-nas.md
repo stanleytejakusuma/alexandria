@@ -5,8 +5,9 @@
 ## 0. Why this exists / why scoped this way
 
 Operator-ratified decision (see `docs/DECISION-serve-host-remote-2026-08-15.md`):
-serve + storage + index move to the always-on NAS host; the operator's machine is
-demoted to build machine. This work order is **mostly an ops runbook**, not a code
+this deployment opts into the *optional* remote topology (serve + storage + index
+on the always-on NAS host); the operator's machine is demoted to build machine.
+The default remains local for a single user (§5.8). This work order is **mostly an ops runbook**, not a code
 feature — the engine already supports remote hosting (SPEC §5.8) and already has the
 `local` (torch) embedding provider. Deliberately excluded: the split topology
 (storage on NAS / compute on the laptop — rejected: query-time embedding runs on the
