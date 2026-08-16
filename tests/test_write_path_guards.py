@@ -112,6 +112,21 @@ def test_index_refuses_to_add_vectors_to_an_index_another_model_built(tmp_path, 
     assert json.loads(manifest_path.read_text())["provider"] == "some-other-provider"
 
 
+def test_rebuild_is_the_escape_hatch_when_the_manifest_mismatches(tmp_path, monkeypatch):
+    """The manifest error's own advice is "rebuild", but the write guard ran
+    BEFORE the --rebuild drop and refused it -- a self-contradiction. --rebuild
+    drops the table first, so there is no existing vector space to mix with and
+    a mismatched (or switched) provider must not block it."""
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)  # indexed with "hash"
+    manifest_path = corpus / ".alexandria" / "index" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["provider"] = "some-other-provider"
+    manifest_path.write_text(json.dumps(manifest))
+
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    assert read_manifest(corpus)["provider"] == "hash"
+
+
 def test_index_allows_a_fresh_corpus_that_has_no_manifest_yet(tmp_path, monkeypatch):
     """Absence is only a refusal when there are vectors to disagree with.
     An empty index must still be indexable, or nothing can ever bootstrap."""

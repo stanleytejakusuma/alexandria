@@ -672,7 +672,13 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
     # F4 must run before ANY embedding, and enrichment embeds too (it calls
     # _cached_embedder itself). Guarding only just before the main pipeline
     # made "refuse before embedding" true on the non-enrich path only.
-    embedder = _guarded_write_embedder(config, corpus)
+    # --rebuild drops the table first (below), so there is no existing vector
+    # space to mix with; guarding it would refuse the very provider switch that
+    # --rebuild is the documented way to perform.
+    if args.rebuild:
+        embedder = _cached_embedder(config, corpus)
+    else:
+        embedder = _guarded_write_embedder(config, corpus)
     if args.enrich:
         from .enrich import EnrichmentStore, enrich_docs_for_index, recipe_signature
         store = EnrichmentStore(corpus / ".alexandria" / "index")
