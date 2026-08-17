@@ -116,7 +116,7 @@ def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
             "api_key_env": os.environ.get("ALEXANDRIA_LLM_KEY_ENV", "ALEXANDRIA_LLM_KEY"),
             "llm_model": os.environ.get("ALEXANDRIA_LLM_MODEL", "deepseek-v4-pro"),
             "grader_a_model": os.environ.get("ALEXANDRIA_GRADER_A_MODEL", "deepseek-v4-flash"),
-            "grader_b_model": os.environ.get("ALEXANDRIA_GRADER_B_MODEL", "deepseek-v4-pro"),
+            "grader_b_model": os.environ.get("ALEXANDRIA_GRADER_B_MODEL", "deepseek-v4-flash"),
             "prompt_version": os.environ.get("ALEXANDRIA_PROMPT_VERSION", "v1"),
         },
     )

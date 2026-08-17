@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 from ..audit import AuditResult, grade_note
@@ -43,7 +44,8 @@ class JudgeVerdict:
 
 
 def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, coverage_llm_a,
-               coverage_llm_b, coverage_sample_per_stratum: int = 1) -> JudgeVerdict:
+               coverage_llm_b, coverage_sample_per_stratum: int = 1,
+               audit_concurrency: int = 4) -> JudgeVerdict:
     """Run no new grading logic: deterministic accounting plus the three existing judges."""
     normalized_page = _validate_chunk_accounting(gathered, page)
     errors: list[str] = []
@@ -53,14 +55,25 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
 
     chunks_by_id = {chunk.chunk_id: chunk for chunk in gathered.chunks}
     chunks_by_doc = {chunk.doc_id: chunk for chunk in gathered.chunks}
+    # Deterministic pre-pass: compute each claim's evidence locally, then run
+    # the (independent) per-claim entailment calls concurrently -- they share no
+    # state, so wall-clock drops from N*call to ~ceil(N/workers)*call while
+    # results stay in claim order. Model-agnostic: the same audit_llm client is
+    # used either way (LLMClient is stateless apart from diagnostic counters;
+    # the gateway owns concurrency). audit_concurrency=1 preserves the old
+    # strictly-sequential behavior for tests/determinism.
+    grade_jobs: list[tuple] = []  # (claim, evidence) pairs needing an LLM call
     for claim in normalized_page.claims:
         evidence, claim_errors = _claim_evidence(claim, chunks_by_id, chunks_by_doc)
         if claim_errors:
             errors.extend(claim_errors)
             failed_claim_ids.append(claim.id)
             continue
+        grade_jobs.append((claim, evidence))
+
+    def _grade_one(claim, evidence):
         try:
-            verdict = grade_note(
+            return grade_note(
                 audit_llm,
                 _transcript(evidence),
                 claim.id,
@@ -69,7 +82,18 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
                 clauses=True,
             )
         except LLMError as exc:
-            errors.append(str(exc))
+            return exc
+
+    workers = max(1, int(audit_concurrency))
+    if len(grade_jobs) > 1 and workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(lambda job: _grade_one(*job), grade_jobs))
+    else:
+        results = [_grade_one(claim, evidence) for claim, evidence in grade_jobs]
+
+    for (claim, _evidence), verdict in zip(grade_jobs, results):
+        if isinstance(verdict, LLMError):
+            errors.append(str(verdict))
             failed_claim_ids.append(claim.id)
             continue
         audit.verdicts.append(verdict)

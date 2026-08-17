@@ -57,7 +57,8 @@ class RepairResult:
 
 
 def repair_until_done(gathered: GatherResult, page: SynthesisPage, *, repair_llm, audit_llm,
-                      coverage_llm_a, coverage_llm_b) -> RepairResult:
+                      coverage_llm_a, coverage_llm_b,
+                      audit_concurrency: int = 4) -> RepairResult:
     """Judge the initial page, then make at most two repairs with full re-judging."""
     page = complete_skip_log(gathered, page)
     verdict = judge_page(
@@ -66,6 +67,7 @@ def repair_until_done(gathered: GatherResult, page: SynthesisPage, *, repair_llm
         audit_llm=audit_llm,
         coverage_llm_a=coverage_llm_a,
         coverage_llm_b=coverage_llm_b,
+        audit_concurrency=audit_concurrency,
     )
     current = verdict.page
     errors: list[str] = []
@@ -110,6 +112,7 @@ def repair_until_done(gathered: GatherResult, page: SynthesisPage, *, repair_llm
             audit_llm=audit_llm,
             coverage_llm_a=coverage_llm_a,
             coverage_llm_b=coverage_llm_b,
+            audit_concurrency=audit_concurrency,
         )
         current = verdict.page
     return RepairResult(current, verdict, iterations, tuple(errors),

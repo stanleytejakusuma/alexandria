@@ -935,7 +935,8 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
               llm_model: str, grader_a_model: str, grader_b_model: str,
               base_url: str | None, api_key_env: str | None, prompt_version: str,
               save_dir: str | None = None, caller: str | None = None,
-              user: str | None = None) -> AnswerOutcome:
+              user: str | None = None, max_follow_up_queries: int = 2,
+              audit_concurrency: int = 4) -> AnswerOutcome:
     """Run the full gather -> write -> judge -> repair pipeline (or replay a
     cached page) for one question against an already-built `engine`. No
     printing; side effects are exactly what the spec requires (response
@@ -976,6 +977,8 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
         audit_llm=grader_a, coverage_llm_a=grader_a, coverage_llm_b=grader_b,
         corpus_root=emit_root, seed_k=k, writer_model=llm_model,
         prompt_version=prompt_version,
+        max_follow_up_queries=max_follow_up_queries,
+        audit_concurrency=audit_concurrency,
     )
     total_ms = int((time.time() - _t_answer0) * 1000)
     logger = AuditLogger(corpus)
@@ -1023,6 +1026,8 @@ def cmd_answer(args) -> int:
         config, corpus, args.question, engine=engine, k=args.k,
         llm_model=args.llm_model, grader_a_model=args.grader_a_model,
         grader_b_model=args.grader_b_model, base_url=args.base_url,
+        max_follow_up_queries=getattr(args, "max_follow_up_queries", 2),
+        audit_concurrency=getattr(args, "audit_concurrency", 4),
         api_key_env=args.api_key_env, prompt_version=args.prompt_version,
         save_dir=args.save_dir, caller=args.caller, user=cli_identity())
     if outcome.cached:
@@ -1487,7 +1492,11 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("--llm-model", default="deepseek-v4-pro",
                         help="gather/write/repair model (the measurement-proven config)")
     answer.add_argument("--grader-a-model", default="deepseek-v4-flash")
-    answer.add_argument("--grader-b-model", default="deepseek-v4-pro")
+    answer.add_argument("--grader-b-model", default="deepseek-v4-flash")
+    answer.add_argument("--max-follow-up-queries", type=int, default=2,
+                        help="cap on gap-detector follow-up searches per answer")
+    answer.add_argument("--audit-concurrency", type=int, default=4,
+                        help="parallel per-claim entailment graders (1 = sequential)")
     answer.add_argument("--prompt-version", default="v1")
     answer.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
                        help="UNVERIFIED tool label recorded in the audit trail; not an identity")
