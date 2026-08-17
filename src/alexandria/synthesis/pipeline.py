@@ -42,7 +42,8 @@ def _timed(fn, *args, **kwargs) -> tuple[object, int]:
 def run_pipeline(engine, topic_query: str, *, gather_llm, writer_llm, repair_llm, audit_llm,
                  coverage_llm_a, coverage_llm_b, corpus_root: str | Path = "~/alexandria-corpus",
                  seed_k: int = 8, writer_model: str | None = None,
-                 prompt_version: str = "v1", seed_chunks: Sequence = ()) -> PipelineResult:
+                 prompt_version: str = "v1", seed_chunks: Sequence = (),
+                 max_follow_up_queries: int = 2, audit_concurrency: int = 4) -> PipelineResult:
     """Run a single page without any full-corpus scheduling or persistent gather state.
 
     seed_chunks: known-relevant chunks for the gather pool (a topic cluster's
@@ -54,14 +55,14 @@ def run_pipeline(engine, topic_query: str, *, gather_llm, writer_llm, repair_llm
     timings: dict[str, int] = {}
     gathered, timings["retrieve"] = _timed(
         gather, engine, topic_query, llm=gather_llm, seed_k=seed_k,
-        seed_chunks=seed_chunks)
+        seed_chunks=seed_chunks, max_follow_up_queries=max_follow_up_queries)
     page, timings["augment"] = _timed(
         write_page, gathered, topic_query, llm=writer_llm, model=writer_model,
         prompt_version=prompt_version)
     repair, timings["generate"] = _timed(
         repair_until_done, gathered, page, repair_llm=repair_llm,
         audit_llm=audit_llm, coverage_llm_a=coverage_llm_a,
-        coverage_llm_b=coverage_llm_b)
+        coverage_llm_b=coverage_llm_b, audit_concurrency=audit_concurrency)
     if not repair.passed:
         return PipelineResult(gathered, repair, False, None, None, timings)
     page_path, skip_log_path = _emit(repair.page, corpus_root)

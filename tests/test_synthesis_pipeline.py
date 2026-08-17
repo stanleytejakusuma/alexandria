@@ -354,3 +354,88 @@ def test_writer_prompt_demands_temporal_layering():
     text = WRITER_SYSTEM.lower()
     assert "temporal layering" in text
     assert "ship state" in text
+
+
+class _ByClaimClient:
+    """Returns the scripted verdict for whichever claim text is in the prompt,
+    so concurrent calls are order-independent and never race a shared index."""
+
+    def __init__(self, verdict_by_text):
+        self.verdict_by_text = verdict_by_text
+
+    def complete(self, system, user, temperature=0.0):
+        for text, verdict in self.verdict_by_text.items():
+            if text in user:
+                return json.dumps({"verdict": verdict, "reason": "scripted"})
+        raise AssertionError(f"no scripted verdict for prompt: {user[:120]!r}")
+
+
+def _three_claim_page():
+    gathered = _gathered(
+        SourceChunk("sources/a#1", "sources/a", "Evidence A.", 0.9),
+        SourceChunk("sources/b#1", "sources/b", "Evidence B.", 0.9),
+        SourceChunk("sources/c#1", "sources/c", "Evidence C.", 0.9),
+    )
+    page = SynthesisPage(
+        topic_query="topic",
+        text="Page",
+        claims=(
+            Claim("claim-1", "Claim about A.", (Citation("sources/a", "sources/a#1"),)),
+            Claim("claim-2", "Claim about B.", (Citation("sources/b", "sources/b#1"),)),
+            Claim("claim-3", "Claim about C.", (Citation("sources/c", "sources/c#1"),)),
+        ),
+        author="synthesis-sweep@writer@v1",
+        skip_log=(),
+    )
+    return gathered, page
+
+
+def test_judge_page_parallel_audit_matches_sequential_order_and_results():
+    """audit_concurrency must not change the verdict: parallel calls return in
+    claim order with identical pass/fail accounting as the sequential path."""
+    gathered, page = _three_claim_page()
+    audit = _ByClaimClient({
+        "Claim about A.": "supported",
+        "Claim about B.": "supported",
+        "Claim about C.": "supported",
+    })
+    verdict = judge_page(
+        gathered, page,
+        audit_llm=audit,
+        coverage_llm_a=ScriptedClient([]),
+        coverage_llm_b=ScriptedClient([]),
+        audit_concurrency=4,
+    )
+    assert verdict.entailment_passed is True
+    assert verdict.failed_claim_ids == ()
+    assert [v.note_id for v in verdict.audit.verdicts] == ["claim-1", "claim-2", "claim-3"]
+
+    seq = judge_page(
+        gathered, page,
+        audit_llm=_ByClaimClient(audit.verdict_by_text),
+        coverage_llm_a=ScriptedClient([]),
+        coverage_llm_b=ScriptedClient([]),
+        audit_concurrency=1,
+    )
+    assert [v.note_id for v in seq.audit.verdicts] == ["claim-1", "claim-2", "claim-3"]
+    assert seq.entailment_passed is True
+
+
+def test_judge_page_parallel_audit_reports_unsupported_claims_identically():
+    gathered, page = _three_claim_page()
+    verdict = judge_page(
+        gathered, page,
+        audit_llm=_ByClaimClient({
+            "Claim about A.": "supported",
+            "Claim about B.": "unsupported",
+            "Claim about C.": "supported",
+        }),
+        coverage_llm_a=ScriptedClient([]),
+        coverage_llm_b=ScriptedClient([]),
+        audit_concurrency=4,
+    )
+    assert verdict.entailment_passed is False
+    assert verdict.failed_claim_ids == ("claim-2",)
+    assert [v.verdict for v in verdict.audit.verdicts] == [
+        "supported", "unsupported", "supported",
+    ]

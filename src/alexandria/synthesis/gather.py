@@ -56,7 +56,8 @@ class GatherResult:
 
 
 def gather(engine, topic_query: str, *, llm, seed_k: int = 8,
-           seed_chunks: Sequence[SourceChunk] = ()) -> GatherResult:
+           seed_chunks: Sequence[SourceChunk] = (),
+           max_follow_up_queries: int = 2) -> GatherResult:
     """Retrieve a seed pool, make one gap pass, then retrieve one follow-up pool.
 
     ``llm`` is explicit rather than constructed here so every caller can inject a
@@ -76,8 +77,12 @@ def gather(engine, topic_query: str, *, llm, seed_k: int = 8,
     gap_response = llm.complete(GAP_SYSTEM, _gap_prompt(topic_query, round_one))
     queries = _parse_queries(gap_response)
 
+    # Cap the gap-detector's follow-up pool: each follow-up is another full
+    # search (embed + dense + lexical + rerank), so unbounded query expansion
+    # linearly grows retrieve latency. Model-agnostic -- the gap detector still
+    # returns whatever it wants; we just use fewer of its queries.
     round_two: list[SourceChunk] = []
-    for query in queries:
+    for query in queries[:max_follow_up_queries]:
         round_two.extend(
             SourceChunk.from_search_result(result)
             for result in engine.search(query, k=seed_k)
@@ -89,12 +94,13 @@ def gather(engine, topic_query: str, *, llm, seed_k: int = 8,
         if chunk.doc_id not in seen_doc_ids:
             seen_doc_ids.add(chunk.doc_id)
             merged.append(chunk)
+    used = queries[:max_follow_up_queries]
     return GatherResult(
         topic_query=topic_query,
         chunks=tuple(merged),
         round_one=round_one,
         round_two=tuple(round_two),
-        follow_up_queries=tuple(queries),
+        follow_up_queries=tuple(used),
         gap_response=gap_response,
     )
 

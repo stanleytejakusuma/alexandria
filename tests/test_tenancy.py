@@ -30,7 +30,7 @@ from alexandria.cli import build_parser, run_answer
 _ANSWER_ARGS_TODAY = frozenset({
     "help", "question", "k", "save_dir", "llm_model", "grader_a_model",
     "grader_b_model", "base_url", "api_key_env", "prompt_version", "caller",
-    "user", "func",
+    "user", "func", "max_follow_up_queries", "audit_concurrency",
 })
 
 

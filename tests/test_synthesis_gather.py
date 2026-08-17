@@ -83,3 +83,51 @@ def test_gather_includes_seed_chunks_in_pool():
     assert "sources/retrieved" in doc_ids
     assert doc_ids.count("sources/seed") == 1  # deduped against retrieval
     assert len(result.chunks) == 2
+
+
+def test_gather_caps_follow_up_queries_at_the_limit():
+    engine = FakeEngine({
+        "topic": [Result("sources/a#1", "sources/a", "A.")],
+        "q1": [Result("sources/b#1", "sources/b", "B.")],
+        "q2": [Result("sources/c#1", "sources/c", "C.")],
+        "q3": [Result("sources/d#1", "sources/d", "D.")],
+    })
+    llm = ScriptedClient([json.dumps({"queries": ["q1", "q2", "q3"]})])
+
+    result = gather(engine, "topic", llm=llm, max_follow_up_queries=2)
+
+    # topic + exactly q1 + q2 searched; q3 is capped even though the gap
+    # detector returned it (each follow-up is another full search).
+    assert [q for q, _ in engine.calls] == ["topic", "q1", "q2"]
+    assert result.follow_up_queries == ("q1", "q2")
+    assert [c.doc_id for c in result.round_two] == ["sources/b", "sources/c"]
+
+
+def test_gather_default_caps_follow_ups_at_two():
+    engine = FakeEngine({
+        "topic": [Result("sources/a#1", "sources/a", "A.")],
+        "q1": [Result("sources/b#1", "sources/b", "B.")],
+        "q2": [Result("sources/c#1", "sources/c", "C.")],
+        "q3": [Result("sources/d#1", "sources/d", "D.")],
+    })
+    llm = ScriptedClient([json.dumps({"queries": ["q1", "q2", "q3"]})])
+
+    result = gather(engine, "topic", llm=llm)  # default max_follow_up_queries=2
+
+    assert [q for q, _ in engine.calls] == ["topic", "q1", "q2"]
+    assert result.follow_up_queries == ("q1", "q2")
+
+
+def test_gather_unbounded_when_max_set_high():
+    engine = FakeEngine({
+        "topic": [Result("sources/a#1", "sources/a", "A.")],
+        "q1": [Result("sources/b#1", "sources/b", "B.")],
+        "q2": [Result("sources/c#1", "sources/c", "C.")],
+        "q3": [Result("sources/d#1", "sources/d", "D.")],
+    })
+    llm = ScriptedClient([json.dumps({"queries": ["q1", "q2", "q3"]})])
+
+    result = gather(engine, "topic", llm=llm, max_follow_up_queries=10)
+
+    assert [q for q, _ in engine.calls] == ["topic", "q1", "q2", "q3"]
+    assert result.follow_up_queries == ("q1", "q2", "q3")
