@@ -366,6 +366,19 @@ def test_reader_rides_out_a_brief_promote_but_still_refuses_a_long_writer(tmp_pa
     with index_read_lock(tmp_path, retry_for=2.0):
         pass  # rode out the brief writer instead of refusing
 
+    # Also exercise the SHIPPED default, not just a generous test value: the
+    # 250ms budget has to absorb a promote-sized hold to be worth having.
+    holder2 = write_lock(tmp_path)
+    assert holder2.acquire()
+
+    def release_promptly():
+        time.sleep(0.05)
+        holder2.release()
+
+    threading.Thread(target=release_promptly, daemon=True).start()
+    with index_read_lock(tmp_path):
+        pass
+
     long_writer = write_lock(tmp_path)
     assert long_writer.acquire()
     try:

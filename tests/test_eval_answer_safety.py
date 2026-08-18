@@ -344,10 +344,27 @@ def test_answer_cache_key_is_computed_once_and_reused_for_get_and_put():
                and any(getattr(t, "id", None) == "rkey" for t in n.targets)]
     assert len(assigns) == 1, "the response-cache key must be built exactly once"
 
-    gen_reads = [n for n in ast.walk(tree)
-                 if isinstance(n, ast.Call)
-                 and getattr(n.func, "id", None) == "read_index_generation"]
-    assert len(gen_reads) == 1, "the generation must be sampled once, before retrieval"
+    # Match BOTH bare-name and attribute forms: counting only `read_index_generation(...)`
+    # would let a second sample sneak in as `cache.read_index_generation(...)`.
+    def _is_gen_read(node):
+        if not isinstance(node, ast.Call):
+            return False
+        fn = node.func
+        return (getattr(fn, "id", None) == "read_index_generation"
+                or getattr(fn, "attr", None) == "read_index_generation")
+
+    gen_reads = [n for n in ast.walk(tree) if _is_gen_read(n)]
+    assert len(gen_reads) == 1, "the generation must be sampled exactly once"
+
+    # Count is not enough -- pin ORDER too. The whole point is that the sample
+    # precedes retrieval, so a rebuild finishing mid-synthesis cannot file
+    # G-epoch evidence under a G+1 key.
+    pipeline_calls = [n for n in ast.walk(tree)
+                      if isinstance(n, ast.Call)
+                      and getattr(n.func, "id", None) == "run_pipeline"]
+    assert len(pipeline_calls) == 1
+    assert gen_reads[0].lineno < pipeline_calls[0].lineno, (
+        "the generation is sampled AFTER retrieval -- reopens the PUT-poisoning window")
 
     calls = {n.func.attr: n for n in ast.walk(tree)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)

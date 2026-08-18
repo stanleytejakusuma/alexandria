@@ -366,20 +366,30 @@ def test_both_retrieval_legs_execute_while_the_shared_epoch_is_actually_held(tmp
 
     def probe(name, fn):
         def wrapper(*args, **kwargs):
+            # Explicitly try-once: if WriteLock's default ever became blocking,
+            # an implicit call here would turn each probe into a 30s stall that
+            # still passed, and this test would be blamed rather than fixed.
             writer = write_lock(tmp_path)
-            admitted = writer.acquire()
+            admitted = writer.acquire(blocking=False)
             if admitted:
                 writer.release()
             seen[name] = admitted
             return fn(*args, **kwargs)
         return wrapper
 
+    # Hydration is a real index read too (store.get_many), so it is probed
+    # alongside both legs -- Red round 3 correctly noted that instrumenting only
+    # the legs would leave a refactor free to move hydration after the epoch and
+    # resolve stale ids against a dropped-and-refilled table.
+    real_hydrate = engine.store.get_many
     engine.store.search_vector = probe("dense", real_dense)
     engine.bm25.search = probe("lexical", real_lexical)
+    engine.store.get_many = probe("hydrate", real_hydrate)
 
     assert engine.search("sweep page lint")
-    assert seen == {"dense": False, "lexical": False}, (
-        f"a retrieval leg ran OUTSIDE the shared epoch (writer was admitted): {seen}")
+    assert seen == {"dense": False, "lexical": False, "hydrate": False}, (
+        f"a retrieval/hydration step ran OUTSIDE the shared epoch "
+        f"(the writer lock was obtainable during it): {seen}")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")
@@ -425,6 +435,10 @@ def test_warm_engine_query_cache_cannot_replay_a_superseded_generation(tmp_path)
     assert replayed[0].trace.get("cache_hit") is not True, (
         "the warm engine replayed a cache entry keyed to a superseded generation")
 
+    # ...and the cache re-seeds under the new generation rather than being
+    # permanently bypassed after any rebuild.
+    assert engine.search("sweep page lint")[0].trace.get("cache_hit") is True
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")
 def test_reranking_happens_outside_the_shared_epoch_so_readers_cannot_starve_writers(tmp_path):
@@ -445,7 +459,7 @@ def test_reranking_happens_outside_the_shared_epoch_so_readers_cannot_starve_wri
         def rerank(self, query, candidates, k):
             # A writer must be able to get in the moment retrieval is done.
             probe = write_lock(tmp_path)
-            observed["writer_admitted_during_rerank"] = probe.acquire()
+            observed["writer_admitted_during_rerank"] = probe.acquire(blocking=False)
             if observed["writer_admitted_during_rerank"]:
                 probe.release()
             return list(candidates[:k])
