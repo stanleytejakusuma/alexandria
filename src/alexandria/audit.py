@@ -208,6 +208,16 @@ def grade_note(llm, transcript: str, title: str, body: str, note_id: str,
                     raise ValueError(f"bad clause verdict {v!r}")
                 parsed.append(ClauseVerdict(c, v, str(item.get("reason", ""))[:120]))
             clause_verdicts = tuple(parsed)
+            # A clause breakdown is extra evidence, never a way to launder a
+            # bad subclaim behind a top-level supported label. Preserve the
+            # documented permissiveness for a supported verdict with no clauses:
+            # older/terser graders legitimately omit the optional field.
+            non_supported = next((clause for clause in clause_verdicts
+                                  if clause.verdict != "supported"), None)
+            if verdict == "supported" and non_supported is not None:
+                raise ValueError(
+                    "contradictory clause verdict: top-level supported but "
+                    f"{non_supported.clause!r} is {non_supported.verdict}")
         return Verdict(note_id, verdict, str(data.get("reason", ""))[:120], title,
                        clause_verdicts)
     except (LLMError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:

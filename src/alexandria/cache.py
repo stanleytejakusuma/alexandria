@@ -24,7 +24,11 @@ RESPONSE_TTL = 7 * 24 * 3600   # 1 week: answers drift with the corpus
 # Red release-changes (2026-08-09): keys are versioned so a schema or
 # pipeline change invalidates old payloads instead of replaying them.
 QUERY_SCHEMA_VER = "q2"
-RESPONSE_SCHEMA_VER = "a2"
+# a3 adds an explicit answer-pipeline fingerprint.  a2 payloads lacked knobs
+# that change the gathered evidence and native judging, so they must miss rather
+# than be replayed under a different answer policy.
+RESPONSE_SCHEMA_VER = "a3"
+ANSWER_PIPELINE_SCHEMA_VER = "answer-pipeline-v1"
 GENERATION_FILE = ".alexandria/index/generation.json"
 
 _CACHE_DIR = ".alexandria/cache"
@@ -134,6 +138,30 @@ def normalize_query(query: str) -> str:
     return " ".join(query.split())
 
 
+def answer_pipeline_fingerprint(*, grader_a_model: str, grader_b_model: str,
+                                base_url: str | None, api_key_env: str | None,
+                                retrieval: object,
+                                max_follow_up_queries: int,
+                                audit_concurrency: int) -> dict[str, object]:
+    """Stable, reviewable answer semantics used by ``ResponseCache``.
+
+    Each member can change evidence gathered or whether the native synthesis
+    checks emit a page. ``base_url`` and the configured credential *name* select
+    the LLM service/account without storing a credential value. Caller identity
+    and output destination cannot affect page semantics, so remain outside it.
+    """
+    return {
+        "schema": ANSWER_PIPELINE_SCHEMA_VER,
+        "grader_a_model": grader_a_model,
+        "grader_b_model": grader_b_model,
+        "base_url": base_url,
+        "api_key_env": api_key_env,
+        "retrieval": retrieval,
+        "max_follow_up_queries": max_follow_up_queries,
+        "audit_concurrency": audit_concurrency,
+    }
+
+
 @dataclass
 class CacheStats:
     hits: int = 0
@@ -216,6 +244,16 @@ class ResponseCache(_Cache):
         super().__init__(corpus, "responses_cache.sqlite", RESPONSE_TTL)
 
     def key(self, question: str, model: str, k: int, prompt_version: str,
-            generation: int = 0) -> str:
+            generation: int = 0, *, pipeline: object = None) -> str:
+        """Key an answer by all stable policy that can change its evidence or gate.
+
+        ``pipeline`` is deliberately explicit rather than an ambient object: its
+        canonical serialization is deterministic, makes additions reviewable, and
+        lets a cache entry from an old policy miss safely.  The caller supplies
+        models and bounded controls that affect gathering and judging; request
+        transport/authentication and audit identity are intentionally excluded.
+        """
         return _key(RESPONSE_SCHEMA_VER, "a", normalize_query(question), model,
-                    str(k), prompt_version, str(generation))
+                    str(k), prompt_version, canonical(pipeline or {
+                        "schema": ANSWER_PIPELINE_SCHEMA_VER,
+                    }), str(generation))

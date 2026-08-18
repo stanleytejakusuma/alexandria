@@ -27,6 +27,7 @@ from .auditlog import AuditLogger, audit_summary
 from .cache import (
     QueryCache,
     ResponseCache,
+    answer_pipeline_fingerprint,
     read_index_generation,
     write_index_generation,
 )
@@ -59,7 +60,29 @@ from .reconcile import reconcile_inbox
 from .retrieval.rerank import CrossEncoderReranker
 from .retrieval.search import SearchConfig, SearchEngine
 from .schema import Severity, validate
+from .synthesis.gather import MAX_FOLLOW_UP_QUERIES
+from .synthesis.judge import MAX_AUDIT_CONCURRENCY
 from .writelock import DEFAULT_LOCK_TIMEOUT, write_lock
+
+
+def _bounded_non_negative_int(value: str, *, maximum: int) -> int:
+    """Argparse converter for a bounded count whose zero is meaningful."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 0 <= parsed <= maximum:
+        raise argparse.ArgumentTypeError(f"must be between 0 and {maximum}")
+    return parsed
+
+
+def _follow_up_query_count(value: str) -> int:
+    return _bounded_non_negative_int(value, maximum=MAX_FOLLOW_UP_QUERIES)
+
+
+def _audit_concurrency_count(value: str) -> int:
+    return _bounded_non_negative_int(value, maximum=MAX_AUDIT_CONCURRENCY)
+
 
 def cmd_migrate(args) -> int:
     report = migrate_kg_sync(args.vault, args.corpus, dry_run=args.dry_run)
@@ -945,10 +968,30 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
     from .llm import LLMClient
     from .synthesis.pipeline import run_pipeline
 
+    if (not isinstance(max_follow_up_queries, int) or isinstance(max_follow_up_queries, bool)
+            or not 0 <= max_follow_up_queries <= MAX_FOLLOW_UP_QUERIES):
+        raise ValueError(
+            f"max_follow_up_queries must be between 0 and {MAX_FOLLOW_UP_QUERIES}")
+    if (not isinstance(audit_concurrency, int) or isinstance(audit_concurrency, bool)
+            or not 0 <= audit_concurrency <= MAX_AUDIT_CONCURRENCY):
+        raise ValueError(
+            f"audit_concurrency must be between 0 and {MAX_AUDIT_CONCURRENCY}")
     answer_id = str(uuid.uuid4())
     response_cache = ResponseCache(corpus)
     generation = read_index_generation(corpus)
-    rkey = response_cache.key(question, llm_model, k, prompt_version, generation)
+    # These settings change either evidence selection (follow-ups) or which
+    # page passes the native judges. They are answer semantics, not diagnostics.
+    answer_pipeline = answer_pipeline_fingerprint(
+        grader_a_model=grader_a_model,
+        grader_b_model=grader_b_model,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        retrieval=_answer_retrieval_fingerprint(engine),
+        max_follow_up_queries=max_follow_up_queries,
+        audit_concurrency=audit_concurrency,
+    )
+    rkey = response_cache.key(question, llm_model, k, prompt_version, generation,
+                              pipeline=answer_pipeline)
 
     # RESPONSE CACHE: a previously-emitted answer for the same question/model
     # config is replayed verbatim (TTL 7d); the pipeline is skipped entirely.
@@ -1043,6 +1086,26 @@ def cmd_answer(args) -> int:
     return 0
 
 
+def _answer_retrieval_fingerprint(engine) -> dict[str, object]:
+    """Stable retrieval policy that determines the evidence an answer sees."""
+    config = getattr(engine, "config", None)
+    reranker = getattr(engine, "reranker", None)
+    return {
+        "embedder": str(getattr(getattr(engine, "embedder", None), "name", "unknown")),
+        "reranker": {
+            "model": str(getattr(reranker, "model_name", type(reranker).__name__)),
+            "half_precision": getattr(reranker, "half_precision", None),
+        },
+        "search": {
+            "depth": getattr(config, "depth", None),
+            "prefetch": getattr(config, "prefetch", None),
+            "top_k": getattr(config, "top_k", None),
+            "rrf_k": getattr(config, "rrf_k", None),
+            "wiki_boost": getattr(config, "wiki_boost", None),
+        },
+    }
+
+
 def _answer_trace(result) -> dict:
     """The route one answer took: retrieval rounds -> augmentation pool ->
     synthesis outcome. Stored in the audit row so the route can be mapped."""
@@ -1126,7 +1189,10 @@ def cmd_eval(args) -> int:
                   + ", ".join(target_errors), file=sys.stderr)
         return 2
 
-    engine = _build_search_engine(config, corpus)
+    # Quality evaluation must observe present retrieval, not replay cached
+    # results from before a ranking/config regression. Normal search keeps its
+    # query cache; this is an evaluation-only isolation boundary.
+    engine = _build_search_engine(config, corpus, query_cache=False)
     report = run_eval(engine, entries, k_override=args.k)
 
     # Negative cases (BACKLOG #21): queries the corpus cannot answer. Without
@@ -1495,10 +1561,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="gather/write/repair model (the measurement-proven config)")
     answer.add_argument("--grader-a-model", default="deepseek-v4-flash")
     answer.add_argument("--grader-b-model", default="deepseek-v4-flash")
-    answer.add_argument("--max-follow-up-queries", type=int, default=2,
-                        help="cap on gap-detector follow-up searches per answer")
-    answer.add_argument("--audit-concurrency", type=int, default=4,
-                        help="parallel per-claim entailment graders (1 = sequential)")
+    answer.add_argument("--max-follow-up-queries", type=_follow_up_query_count, default=2,
+                        help=f"follow-up cap, 0..{MAX_FOLLOW_UP_QUERIES} (0 disables follow-ups)")
+    answer.add_argument("--audit-concurrency", type=_audit_concurrency_count, default=4,
+                        help=f"grader workers, 0..{MAX_AUDIT_CONCURRENCY} (0 or 1 = sequential)")
     answer.add_argument("--prompt-version", default="v1")
     answer.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
                        help="UNVERIFIED tool label recorded in the audit trail; not an identity")

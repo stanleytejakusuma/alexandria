@@ -77,14 +77,19 @@ echo "### query-log review (7d)" >> "$DIGEST"
 "$REPO/.venv/bin/python" "$REPO/scripts/query-log-review.py" --corpus "$CORPUS" --since 7 \
   >> "$DIGEST" 2>&1 || echo "review FAILED" >> "$DIGEST"
 
-# Leg-ablation invariant (BACKLOG #47/#48): removing either retrieval leg must
-# not IMPROVE recall/MRR -- a leg whose removal helps is dead weight. Weekly, not
-# pre-commit, because each amputated pass is a full golden-set scoring (~60-90s).
-# Non-fatal like the other steps: a red leg-ablation is recorded here and read by
-# a human, not silently swallowed, but it must not stop the rest of the loop.
+# Leg-ablation invariant (BACKLOG #47/#48): only a significant positive recall
+# delta after removing a leg is red; MRR is context. Weekly, not pre-commit,
+# because each amputated pass is a full golden-set scoring (~60-90s).
+# The loop intentionally remains non-destructive: an ablation red must not hide
+# the later snapshot/verification. Unlike ordinary best-effort steps, however,
+# it has its own explicit notifier below so the red cannot be merely a digest line.
 echo "### leg-ablation (is either retrieval leg dead weight?)" >> "$DIGEST"
+LEG_ABLATION_STATUS=0
 "$REPO/.venv/bin/python" "$REPO/scripts/leg-ablation.py" --corpus "$CORPUS" \
-  >> "$DIGEST" 2>&1 || echo "leg-ablation FAILED" >> "$DIGEST"
+  >> "$DIGEST" 2>&1 || LEG_ABLATION_STATUS=$?
+if [ "$LEG_ABLATION_STATUS" -ne 0 ]; then
+  echo "[FAIL] leg-ablation exited $LEG_ABLATION_STATUS (distinct notifier queued)" >> "$DIGEST"
+fi
 
 # keep the corpus weekly-snapshot-able (the quarterly contest needs it).
 # Only `sources` and `wiki`: `notes` does not exist, and `.alexandria/` is
@@ -120,6 +125,15 @@ VERIFY_STATUS=0
 # which cannot see /opt/homebrew/bin, so a bare `terminal-notifier` here would
 # silently never fire -- a failure notifier that is itself an invisible no-op.
 NOTIFIER="${ALEXANDRIA_NOTIFIER:-/opt/homebrew/bin/terminal-notifier}"
+# Keep a red ablation nonfatal to the weekly maintenance run, but surface it via
+# a distinct alert even when the final freshness verification passes.
+if [ "$LEG_ABLATION_STATUS" -ne 0 ] && [ -x "$NOTIFIER" ]; then
+  "$NOTIFIER" \
+    -title "Alexandria weekly leg-ablation FAILED" \
+    -subtitle "exit $LEG_ABLATION_STATUS; retrieval review required" \
+    -message "$(grep '\[FAIL\] leg-ablation' "$DIGEST" | tail -1 | cut -c1-180)" \
+    -group alexandria-weekly-leg-ablation >/dev/null 2>&1 || true
+fi
 if [ "$VERIFY_STATUS" -ne 0 ] && [ -x "$NOTIFIER" ]; then
   "$NOTIFIER" \
     -title "Alexandria weekly loop FAILED" \

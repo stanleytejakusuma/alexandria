@@ -43,7 +43,8 @@ def test_eval_release_gate_fails_when_a_previous_hit_becomes_a_miss(tmp_path, mo
             return [FakeResult(doc_id) for doc_id in self.ids]
 
     engines = iter([FakeEngine(["sources/wanted"]), FakeEngine([])])
-    monkeypatch.setattr(cli, "_build_search_engine", lambda config, path: next(engines), raising=False)
+    monkeypatch.setattr(cli, "_build_search_engine",
+                        lambda config, path, **_kwargs: next(engines), raising=False)
 
     assert app(["--corpus", str(corpus), "eval"]) == 0
     assert app(["--corpus", str(corpus), "eval", "--fail-on-regression"]) == 1

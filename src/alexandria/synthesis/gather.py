@@ -9,6 +9,10 @@ from ..llm import LLMError
 
 __all__ = ["GatherResult", "SourceChunk", "gather"]
 
+# Each follow-up is a full hybrid retrieval pass. A cap bounds worst-case answer
+# latency/cost even when the gap detector returns an unexpectedly long list.
+MAX_FOLLOW_UP_QUERIES = 32
+
 
 GAP_SYSTEM = """You find gaps in a small candidate pool for a cited knowledge page.
 
@@ -70,6 +74,10 @@ def gather(engine, topic_query: str, *, llm, seed_k: int = 8,
     starts from the cluster's own documents. The gap pass sees them, and the
     judge's chunk accounting covers them like any gathered chunk.
     """
+    if (not isinstance(max_follow_up_queries, int) or isinstance(max_follow_up_queries, bool)
+            or not 0 <= max_follow_up_queries <= MAX_FOLLOW_UP_QUERIES):
+        raise ValueError(
+            f"max_follow_up_queries must be an integer between 0 and {MAX_FOLLOW_UP_QUERIES}")
     round_one = tuple(
         SourceChunk.from_search_result(result)
         for result in engine.search(topic_query, k=seed_k)

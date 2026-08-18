@@ -10,16 +10,18 @@ synthetic dense leg doing (recall 0.950 -> 1.000, MRR 0.514 -> 0.988).
 
 WHAT IT DOES. Builds the real engine once and scores the private golden set three
 times: both legs, dense-only (lexical amputated), and lexical-only (dense
-amputated). It fails if removing either leg produces a SIGNIFICANT recall/MRR
-improvement, using the same McNemar significance bar the real eval gate uses.
+amputated). It fails only if removing either leg produces a SIGNIFICANT positive
+recall change, using the same McNemar significance bar the real eval gate uses.
+MRR is reported as ranking context, not used as a second significance test.
 This is what finally makes that significance machinery gate something (#48: it
 was print-only decoration before -- mcnemar_exact was never called under
 scripts/).
 
-SIGNIFICANCE SEMANTICS. The bar is McNemar p<0.05 over recall transitions. MRR is
-checked alongside recall but only fails when the recall change is already
-significant: a leg whose removal moves MRR without moving recall cannot be
-distinguished from noise at n=49, so that case is reported, not gated.
+SIGNIFICANCE SEMANTICS. The bar is McNemar p<0.05 over recall transitions.
+Only a significant positive recall change fails: it directly shows that removing
+the leg retrieves more required documents. MRR is reported as ranking context,
+not a pass/fail predicate; a mixed-sign change (recall down, MRR up) must not
+be called dead weight.
 
 READ-ONLY. Builds nothing, appends nothing to eval history, and disables the
 query logger and result cache so the corpus's demand-report query log is not
@@ -34,7 +36,7 @@ WEEKLY, NOT PRE-COMMIT. Each amputated pass is a full golden-set scoring
 
 Usage: python3 scripts/leg-ablation.py [--corpus ~/alexandria-corpus] [--json]
 Exit 0 if neither leg is dead weight (or skipped), 1 if a leg's removal
-improves recall/MRR, 2 on setup error.
+significantly improves recall, 2 on setup error.
 """
 
 from __future__ import annotations
@@ -83,10 +85,10 @@ def _score(engine, entries):
 def dead_weight_verdict(baseline, variants: dict) -> tuple[list[str], dict]:
     """Decide whether removing a leg is dead weight.
 
-    A leg is dead weight if amputating it SIGNIFICANTLY IMPROVES recall or MRR.
+    A leg is dead weight if amputating it SIGNIFICANTLY IMPROVES recall.
     Significance is McNemar p<0.05 over recall transitions (the same bar the real
-    eval gate uses). An improvement that is not significant is reported, not
-    gated -- at n=49 it cannot be distinguished from noise.
+    eval gate uses). MRR stays visible as ranking context, but it is not a second
+    gate: recall down plus MRR up is not evidence that the leg is dead weight.
 
     Returns (failures, observations) where observations maps each variant name to
     the Delta dict plus an optional "note".
@@ -96,16 +98,20 @@ def dead_weight_verdict(baseline, variants: dict) -> tuple[list[str], dict]:
     for name, ablated in variants.items():
         delta = compare(baseline, ablated)
         observations[name] = delta.to_dict()
-        improved = delta.recall_at_k > 0 or delta.mrr > 0
-        if delta.significant and improved:
+        recall_improved = delta.recall_at_k > 0
+        if delta.significant and recall_improved:
             failures.append(
-                f"removing the {name} leg IMPROVED retrieval "
+                f"removing the {name} leg SIGNIFICANTLY improved recall "
                 f"(recall {delta.recall_at_k:+.3f}, MRR {delta.mrr:+.3f}, p={delta.p_value:.3f}) "
                 f"-- that leg is dead weight"
             )
-        elif improved:
+        elif recall_improved:
             observations[name]["note"] = (
-                "improved but not significant (n=49); reported, not gated"
+                "recall improved but not significant (n=49); reported, not gated"
+            )
+        elif delta.mrr > 0:
+            observations[name]["note"] = (
+                "MRR improved but recall did not; MRR is context only, not gated"
             )
     return failures, observations
 

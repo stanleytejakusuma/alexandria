@@ -32,7 +32,7 @@ def test_improvement_without_significance_is_reported_not_gated(monkeypatch):
                         lambda prev, cur: _delta(0.05, 0.10, 0.25, miss_to_hit=["a"]))
     failures, obs = leg_ablation.dead_weight_verdict(None, {"dense": None})
     assert failures == []
-    assert obs["dense"]["note"].startswith("improved but not significant")
+    assert obs["dense"]["note"].startswith("recall improved but not significant")
 
 
 def test_a_leg_that_hurts_is_not_dead_weight(monkeypatch):
