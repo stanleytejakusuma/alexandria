@@ -26,6 +26,7 @@ class _FakeUnnormalizedEmbedder:
 
     name = "fake-unnormalized"
     revision = ""
+    dim = 2
     normalization_policy = "none"
 
     def embed(self, texts):
@@ -39,6 +40,7 @@ class _ThresholdProbeEmbedder:
 
     name = "threshold-model"
     revision = "r1"
+    dim = 2
 
     def __init__(self, raw_probe_norm):
         self.raw_probe_norm = raw_probe_norm
@@ -109,10 +111,10 @@ def test_verify_manifest_passes_silently_when_config_matches(tmp_path):
     verify_manifest(tmp_path, embedder, "hash")  # must not raise
 
 
-def test_verify_manifest_refuses_a_missing_manifest_with_a_backfill_hint(tmp_path):
+def test_verify_manifest_refuses_a_missing_manifest_with_a_rebuild_hint(tmp_path):
     with pytest.raises(ManifestMissing) as exc_info:
         verify_manifest(tmp_path, _hash_embedder(tmp_path), "hash")
-    assert "--backfill-manifest" in str(exc_info.value)
+    assert "--rebuild" in str(exc_info.value)
 
 
 def test_verify_manifest_refuses_a_dimension_mismatch(tmp_path):
@@ -203,3 +205,33 @@ def test_verify_manifest_still_refuses_a_real_model_identity_mismatch(tmp_path):
 
     with pytest.raises(ManifestMismatch, match="model"):
         verify_manifest(tmp_path, embedder, "hash")
+
+
+@pytest.mark.parametrize("invalid", [None, [], "not a manifest", 7, {"provider": "hash"}])
+def test_read_manifest_rejects_structurally_invalid_json(tmp_path, invalid):
+    """Syntactically valid JSON must not turn into an uncaught AttributeError."""
+    import json
+
+    path = tmp_path / ".alexandria" / "index" / "manifest.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(invalid))
+
+    with pytest.raises(ManifestCorrupt):
+        read_manifest(tmp_path)
+
+
+@pytest.mark.parametrize("vector", [[1e308, 1e308], [1e-308, 1e-308]])
+def test_manifest_normalized_diagnostic_handles_extreme_finite_probe_values(tmp_path, vector):
+    """An extreme raw diagnostic is safe, without being mislabelled as unit."""
+    from alexandria.index.manifest import write_manifest
+
+    class ExtremeEmbedder:
+        name = "extreme-test"
+        dim = 2
+        normalization_policy = "l2"
+
+        def embed(self, texts):
+            return [vector for _ in texts]
+
+    manifest = write_manifest(tmp_path, ExtremeEmbedder(), "test")
+    assert manifest["normalized"] is False

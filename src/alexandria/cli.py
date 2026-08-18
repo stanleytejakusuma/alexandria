@@ -67,7 +67,8 @@ from .retrieval.search import SearchConfig, SearchEngine
 from .schema import Severity, validate
 from .synthesis.gather import MAX_FOLLOW_UP_QUERIES
 from .synthesis.judge import MAX_AUDIT_CONCURRENCY
-from .writelock import DEFAULT_LOCK_TIMEOUT, write_lock
+from .writelock import (DEFAULT_LOCK_TIMEOUT, IndexReadUnavailable, index_read_lock,
+                        rebuild_marker, write_lock)
 
 
 def _bounded_non_negative_int(value: str, *, maximum: int) -> int:
@@ -374,14 +375,13 @@ def cmd_promote(args) -> int:
     try:
         result = promote_pending(corpus, config, embedder, store, lexical)
     except ManifestMissing as exc:
-        # A corpus indexed before manifests existed has vectors but no manifest,
-        # so the write guard refuses. That is correct, but a bare traceback does
-        # not tell the operator the one-command way out.
+        # A corpus indexed before the declared L2 policy has stored vectors
+        # whose representation cannot be proven. The guard is intentional; do
+        # not offer an assertion-only escape hatch over a non-empty store.
         raise SystemExit(
             f"alexandria: {exc}\n"
-            "  this index predates the manifest, so its embedding provider cannot be\n"
-            "  verified. If you are certain --embed-provider matches what built it:\n"
-            "    alexandria --corpus <path> index --backfill-manifest") from exc
+            "  this index predates declared normalization policy and must be rebuilt:\n"
+            "    alexandria --corpus <path> index --rebuild") from exc
     if result.skipped_locked:
         print("promote: write lock held by another process, skipped this run")
         return 0
@@ -654,23 +654,11 @@ def cmd_index(args) -> int:
     """Chunk, embed, and persist the corpus in deterministic batches."""
     config = _config_for(args)
     corpus = config.corpus_path
-    if getattr(args, "backfill_manifest", False):
-        # SPEC F4 one-time backfill: an index built before manifests existed
-        # has no way to (re)derive which model produced its vectors from the
-        # vectors themselves, so this trusts the operator's assertion that
-        # --embed-provider matches what was actually used, without paying to
-        # re-embed the whole corpus.
-        embedder = _cached_embedder(config, corpus)
-        manifest = write_manifest(corpus, embedder, config.embed_provider)
-        print(f"index: manifest backfilled -> provider={manifest['provider']} "
-              f"model={manifest['model']} dim={manifest['dim']} "
-              f"normalized={manifest['normalized']} dtype={manifest['dtype']}")
-        return 0
 
     # BACKLOG #50: promote_pending is the only other writer of the FTS/vector
     # tables this command drops and rebuilds (--rebuild) or otherwise writes
-    # into. Neither `write_lock()`'s LOCK_NB default nor cmd_index taking no
-    # lock at all excludes the other -- a promote (CLI, or serve's 600s drain)
+    # into. `promote_pending` uses non-blocking acquisition while this command
+    # waits for the same lock -- so a promote (CLI, or serve's 600s drain)
     # can land its FTS insert after this run's chunk-record snapshot is taken
     # but before --rebuild's lexical.drop() wipes the table, which then never
     # gets that promote's row back (the rebuild only re-adds the pre-drop
@@ -698,6 +686,26 @@ def cmd_index(args) -> int:
 
 def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
     """The body of `index`, run while BACKLOG #50's write lock is held."""
+    if getattr(args, "backfill_manifest", False):
+        # A pre-policy manifest cannot establish that every persisted vector
+        # crossed CachedEmbedder's L2 boundary. Never relabel non-empty legacy
+        # storage as l2 by operator assertion: rebuild is the only safe migration.
+        # Empty storage has no vector representation to attest, so it may receive
+        # an initial manifest for a new writer.
+        store = VectorStore(corpus / ".alexandria" / "index")
+        if store.count() != 0:
+            raise SystemExit(
+                "alexandria: refusing to backfill normalization policy over a non-empty "
+                "legacy index; its stored vectors cannot be proven L2-normalized. "
+                "Rebuild explicitly: alexandria --corpus "
+                f"{corpus} index --rebuild")
+        embedder = _cached_embedder(config, corpus)
+        manifest = write_manifest(corpus, embedder, config.embed_provider)
+        print(f"index: manifest backfilled -> provider={manifest['provider']} "
+              f"model={manifest['model']} dim={manifest['dim']} "
+              f"normalized={manifest['normalized']} dtype={manifest['dtype']}")
+        return 0
+
     records, errors = _load_chunk_records(corpus, config, args.limit, args.workers)
     for error in errors:
         print(f"skip: {error}", file=sys.stderr)
@@ -996,6 +1004,7 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
         base_url=base_url,
         api_key_env=api_key_env,
         retrieval=_answer_retrieval_fingerprint(engine),
+        prompt_version=prompt_version,
         max_follow_up_queries=max_follow_up_queries,
         audit_concurrency=audit_concurrency,
     )
@@ -1160,7 +1169,10 @@ def cmd_wiki_site(args) -> int:
 
 
 def _rebuild_marker(corpus: Path) -> Path:
-    return corpus / ".alexandria" / "index" / ".rebuild-in-progress"
+    # Compatibility shim for internal callers/tests. One shared lock module owns
+    # the durable marker path so retrieval and mutation cannot drift apart.
+    from .writelock import rebuild_marker
+    return rebuild_marker(corpus)
 
 
 def cmd_eval(args) -> int:
@@ -1320,7 +1332,31 @@ def _require_index(corpus: Path) -> None:
 def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True,
                          corpus_root: Path | None = None, client: str = "cli",
                          embedding_cache_read_only: bool = False) -> SearchEngine:
+    # A rebuild writes its durable marker *before* dropping either projection.
+    # Check it before `_require_index`: after drop, the old "never indexed"
+    # error would otherwise hide a live/crashed writer and invite bad recovery.
+    if rebuild_marker(corpus).exists():
+        raise IndexReadUnavailable(
+            "index rebuild is in progress or was interrupted; retry after a successful rebuild")
     _require_index(corpus)
+    # Deliberately NOT holding the shared epoch lock across construction.
+    # Construction binds no epoch: `VectorStore.search_vector` re-opens its
+    # table per query and BM25 reads a live connection, so coherence is a
+    # property of each search's own SH epoch, not of when the engine was built.
+    # Locking here only added an outage -- `serve` (and every CLI read) would
+    # refuse to start while an ordinary promote/drain held the writer lock for
+    # a few seconds, which test_a_lock_skipped_drain_cycle_records_no_liveness_success
+    # pins as required behavior. The durable marker above is the construction-time
+    # guard, because a rebuild that has already dropped a projection leaves an
+    # index no amount of waiting makes readable.
+    return _build_search_engine_unlocked(
+        config, corpus, query_cache=query_cache, corpus_root=corpus_root,
+        client=client, embedding_cache_read_only=embedding_cache_read_only)
+
+
+def _build_search_engine_unlocked(config: AppConfig, corpus: Path, query_cache: bool = True,
+                                  corpus_root: Path | None = None, client: str = "cli",
+                                  embedding_cache_read_only: bool = False) -> SearchEngine:
     # §7: every invocation performs the liveness check and prints one line to
     # stderr if stale -- never raises, never blocks results (gate W7).
     live = liveness.check(corpus)
@@ -1604,9 +1640,24 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Deliberate, actionable exit code for "the index is momentarily unreadable"
+# -- distinct from 1 (the command ran and failed) and 2 (bad input/unusable
+# golden set), so a caller can retry rather than treat it as a hard error.
+EXIT_INDEX_UNAVAILABLE = 3
+
+
 def app(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except IndexReadUnavailable as exc:
+        # Engine CONSTRUCTION reads the index too, so this must be caught for
+        # the whole command, not just around the query call: catching narrowly
+        # left `search`/`answer` raising an uncaught RuntimeError (exit 1 plus a
+        # traceback) whenever a rebuild was already running at startup. One
+        # boundary here also covers every future read verb by default.
+        print(f"alexandria: index unavailable -- {exc}", file=sys.stderr)
+        return EXIT_INDEX_UNAVAILABLE
 
 
 if __name__ == "__main__":

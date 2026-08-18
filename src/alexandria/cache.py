@@ -140,7 +140,7 @@ def normalize_query(query: str) -> str:
 
 def answer_pipeline_fingerprint(*, grader_a_model: str, grader_b_model: str,
                                 base_url: str | None, api_key_env: str | None,
-                                retrieval: object,
+                                retrieval: object, prompt_version: str,
                                 max_follow_up_queries: int,
                                 audit_concurrency: int) -> dict[str, object]:
     """Stable, reviewable answer semantics used by ``ResponseCache``.
@@ -157,6 +157,9 @@ def answer_pipeline_fingerprint(*, grader_a_model: str, grader_b_model: str,
         "base_url": base_url,
         "api_key_env": api_key_env,
         "retrieval": retrieval,
+        # It is duplicated with the legacy top-level key intentionally: explicit
+        # pipeline identity makes any evidence/output semantic setting reviewable.
+        "prompt_version": prompt_version,
         "max_follow_up_queries": max_follow_up_queries,
         "audit_concurrency": audit_concurrency,
     }

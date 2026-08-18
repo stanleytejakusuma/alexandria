@@ -695,3 +695,63 @@ def test_startup_leaves_nothing_in_the_query_path_lazily_loaded(tmp_path, monkey
     assert loaded_during_startup, (
         "bind() returned with the reranker model still unloaded -- the first "
         "real query would pay the cold load that the warm-up exists to absorb")
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="flock contract is POSIX-only")
+def test_s10_active_serve_refuses_search_during_an_external_index_write(tmp_path, monkeypatch):
+    """A warm server cannot query a partially dropped/rebuilt index."""
+    from alexandria import serve as serve_mod
+    from alexandria.writelock import write_lock
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    writer = write_lock(corpus)
+    assert writer.acquire()
+    try:
+        status, raw, _ = serve_mod.dispatch(
+            ctx, "test", "POST", "/search", b'{"query":"gateway"}')
+        assert status == 503
+        assert "writer" in json.loads(raw)["error"]
+    finally:
+        writer.release()
+        tcp_server.server_close()
+        for server in uds_servers:
+            server.server_close()
+
+    status, raw, _ = serve_mod.dispatch(
+        ctx, "test", "POST", "/search", b'{"query":"gateway"}')
+    assert status == 200
+    assert json.loads(raw)["results"]
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="flock contract is POSIX-only")
+def test_health_stays_a_liveness_probe_during_a_rebuild_instead_of_flapping_503(tmp_path, monkeypatch):
+    """/health must not tell a supervisor the process is dead mid-rebuild.
+
+    503 on /health conflates readiness with liveness: any process supervisor
+    polling it would restart-loop the server for the entire duration of a
+    legitimate multi-minute rebuild. The honest answer is 200 with a degraded
+    status -- the server is alive, it just cannot report coherent counts yet.
+    /search keeps returning 503, which is the correct readiness signal.
+    """
+    from alexandria import serve as serve_mod
+    from alexandria.writelock import rebuild_marker
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    try:
+        rebuild_marker(corpus).write_text("rebuild in progress\n")
+
+        status, raw, _ = serve_mod.dispatch(ctx, "test", "GET", "/health", b"")
+        payload = json.loads(raw)
+        assert status == 200, "a live server mid-rebuild must not read as dead"
+        assert payload["status"] == "rebuilding"
+        assert "rebuild" in payload["reason"]
+
+        status, raw, _ = serve_mod.dispatch(ctx, "test", "POST", "/search", b'{"query":"gateway"}')
+        assert status == 503, "readiness must still refuse a partial index"
+    finally:
+        rebuild_marker(corpus).unlink(missing_ok=True)
+        tcp_server.server_close()
+        for server in uds_servers:
+            server.server_close()

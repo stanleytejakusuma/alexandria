@@ -24,10 +24,9 @@ like plausible results while being quietly wrong. Hardware non-determinism
 A MISSING manifest is not "compatible" -- it is the state of every index
 built before this module existed, and treating "absent" as "trust it" would
 leave the guard inert exactly where the failure mode is real. Missing and
-mismatched both fail loudly; a one-time backfill command
-(``alexandria index --backfill-manifest``) lets an operator assert "this
-existing index was in fact built with the current --embed-provider config"
-without paying to re-embed the whole corpus.
+mismatched both fail loudly. A non-empty pre-policy index must be rebuilt: no
+operator assertion or one-vector probe can establish that every stored vector
+crossed the declared L2 boundary.
 """
 
 from __future__ import annotations
@@ -93,7 +92,10 @@ def compute_manifest(embedder, provider: str) -> dict[str, Any]:
     """
     probe_embedder = getattr(embedder, "provider", embedder)
     vector = probe_embedder.embed([_PROBE_TEXT])[0]
-    norm = math.sqrt(sum(value * value for value in vector))
+    # This field remains only a diagnostic (compatibility uses the declared
+    # wrapper policy), but it must not turn finite extreme probe values into an
+    # overflowed false diagnostic.
+    norm = math.hypot(*vector)
     return {
         "provider": provider,
         "model": embedder.name,
@@ -140,9 +142,31 @@ def read_manifest(corpus: str | Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        manifest = json.loads(path.read_text())
     except (OSError, ValueError, TypeError) as exc:
         raise ManifestCorrupt(f"{path} exists but could not be parsed: {exc}") from exc
+    # A syntactically valid JSON scalar/list/partial object is still corrupt
+    # manifest data. Validate at this boundary so CLI/serve catch ManifestCorrupt
+    # rather than leaking AttributeError while calling ``.get`` below. Omitted
+    # normalization_policy remains the one intentional legacy representation.
+    required = {"provider": str, "model": str, "revision": str, "dim": int,
+                "normalized": bool, "dtype": str}
+    if not isinstance(manifest, dict):
+        raise ManifestCorrupt(f"{path} must contain a JSON object")
+    for field, expected_type in required.items():
+        value = manifest.get(field)
+        if (not isinstance(value, expected_type)
+                or (expected_type is int and isinstance(value, bool))):
+            raise ManifestCorrupt(
+                f"{path} has invalid or missing {field!r} field")
+    if manifest["dim"] <= 0:
+        raise ManifestCorrupt(f"{path} has invalid non-positive 'dim' field")
+    policy = manifest.get("normalization_policy")
+    if policy is not None and policy not in {"l2", "none"}:
+        raise ManifestCorrupt(f"{path} has invalid 'normalization_policy' field")
+    if manifest["dtype"] != DTYPE:
+        raise ManifestCorrupt(f"{path} has unsupported 'dtype' field")
+    return manifest
 
 
 def verify_manifest_for_write(corpus: str | Path, embedder, provider: str, store) -> None:
@@ -201,9 +225,8 @@ def verify_manifest(corpus: str | Path, embedder, provider: str) -> None:
             f"index at {corpus} has no manifest -- cannot verify which "
             f"embedding model produced its vectors, so mixing providers in "
             f"one index would silently corrupt similarity ranking. If this "
-            f"index predates manifests and was in fact built with the "
-            f"current --embed-provider config, run once: "
-            f"alexandria --corpus {corpus} index --backfill-manifest"
+            f"index predates declared normalization policy, rebuild it under "
+            f"the desired configuration: alexandria --corpus {corpus} index --rebuild"
         )
     fresh = _current_compatibility(embedder, provider)
     on_disk_policy = on_disk.get(

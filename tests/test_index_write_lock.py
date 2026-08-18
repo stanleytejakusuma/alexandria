@@ -305,3 +305,15 @@ def test_index_cli_succeeds_when_the_lock_is_released_before_the_timeout(tmp_pat
 
     assert result == 0, "index must succeed once the briefly-held lock is released"
     assert elapsed >= 0.25, f"returned in {elapsed:.3f}s -- it did not actually wait for the lock"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="flock contract is POSIX-only")
+def test_index_read_lock_excludes_a_writer_for_the_whole_read_epoch(tmp_path):
+    """A reader either sees one coherent epoch or refuses before any lookup."""
+    from alexandria.writelock import index_read_lock
+
+    writer = write_lock(tmp_path)
+    with index_read_lock(tmp_path):
+        assert not writer.acquire(), "writer entered while a reader held the shared epoch lock"
+    assert writer.acquire(), "writer did not resume after the reader released its snapshot"
+    writer.release()

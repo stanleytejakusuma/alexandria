@@ -118,7 +118,7 @@ def test_response_cache_answer_pipeline_fingerprint_separates_output_knobs(tmp_p
     common = dict(question="what changed?", model="writer", k=8, prompt_version="v1", generation=3)
     settings = dict(grader_a_model="grade-a", grader_b_model="grade-b",
                     base_url="http://grader", api_key_env="TEST_KEY", retrieval={"search": "v1"},
-                    max_follow_up_queries=2, audit_concurrency=4)
+                    max_follow_up_queries=2, audit_concurrency=4, prompt_version="v1")
     baseline = cache.key(**common, pipeline=answer_pipeline_fingerprint(**settings))
     equal_config = cache.key(**common, pipeline=answer_pipeline_fingerprint(**settings))
     cache.put(baseline, {"text": "cached equal-config answer"})
@@ -131,6 +131,7 @@ def test_response_cache_answer_pipeline_fingerprint_separates_output_knobs(tmp_p
         {"audit_concurrency": 1},
         {"retrieval": {"search": "v2"}},
         {"base_url": "http://other-grader"},
+        {"prompt_version": "v2"},
     ):
         pipeline = answer_pipeline_fingerprint(**(settings | changed))
         changed_key = cache.key(**common, pipeline=pipeline)
@@ -305,3 +306,19 @@ def test_weekly_loop_notifies_a_red_leg_ablation_without_changing_its_verify_exi
     alert = notifier_log.read_text()
     assert "weekly leg-ablation FAILED" in alert
     assert "alexandria-weekly-leg-ablation" in alert
+
+
+
+def test_run_answer_threads_prompt_version_into_its_pipeline_cache_fingerprint():
+    """A future refactor must not leave prompt version only in the legacy key."""
+    import ast
+    import inspect
+    from alexandria import cli
+
+    tree = ast.parse(inspect.getsource(cli.run_answer))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and getattr(node.func, "id", None) == "answer_pipeline_fingerprint"]
+    assert len(calls) == 1
+    supplied = {keyword.arg: keyword.value.id for keyword in calls[0].keywords
+                if isinstance(keyword.value, ast.Name)}
+    assert supplied["prompt_version"] == "prompt_version"

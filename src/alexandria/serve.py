@@ -36,6 +36,7 @@ from .config import AppConfig
 from .index.store import SCALAR_FIELDS
 from .pending import oldest_pending_age
 from .promote import promote_pending
+from .writelock import IndexReadUnavailable, index_read_lock
 
 MAX_BODY_BYTES = 65536
 MAX_TEXT_CHARS = 4000
@@ -416,25 +417,45 @@ def dispatch(ctx: ServeContext, identity: str, method: str, path: str, body: byt
     behavior (validation, routing, identity attribution) is testable without
     binding a real port (S5, S7's logic; S0/S2/S8/S9 need a real bound
     server and get one in test_serve.py)."""
-    if method == "GET" and path == "/health":
-        return _json_ok(200, _health_payload(ctx))
-    if method != "POST":
-        return _json_error(404, "not found")
-    if len(body) > MAX_BODY_BYTES:
-        return _json_error(413, "request body too large")
     try:
-        payload = json.loads(body) if body else {}
-    except json.JSONDecodeError:
-        return _json_error(400, "malformed JSON")
-    if not isinstance(payload, dict):
-        return _json_error(400, "expected a JSON object")
-    if path == "/search":
-        return _handle_search(ctx, identity, payload)
-    if path == "/answer":
-        return _handle_answer(ctx, identity, payload)
-    if path == "/remember":
-        return _handle_remember(ctx, identity, payload)
-    return _json_error(404, "not found")
+        if method == "GET" and path == "/health":
+            # Health independently reads both projections, so it needs the same
+            # coherent epoch as search rather than reporting a partial index --
+            # but it must stay a LIVENESS answer. Returning 503 here would tell
+            # every process supervisor the server is dead for the whole duration
+            # of a legitimate rebuild and get it restart-looped. Report 200 with
+            # an explicit degraded status instead; /search still returns 503,
+            # which is the correct READINESS signal.
+            try:
+                with index_read_lock(ctx.corpus):
+                    return _json_ok(200, _health_payload(ctx))
+            except IndexReadUnavailable as exc:
+                return _json_ok(200, {
+                    "status": "rebuilding",
+                    "reason": str(exc),
+                    "uptime_seconds": round(time.monotonic() - ctx.started_monotonic, 1),
+                })
+        if method != "POST":
+            return _json_error(404, "not found")
+        if len(body) > MAX_BODY_BYTES:
+            return _json_error(413, "request body too large")
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            return _json_error(400, "malformed JSON")
+        if not isinstance(payload, dict):
+            return _json_error(400, "expected a JSON object")
+        if path == "/search":
+            return _handle_search(ctx, identity, payload)
+        if path == "/answer":
+            return _handle_answer(ctx, identity, payload)
+        if path == "/remember":
+            return _handle_remember(ctx, identity, payload)
+        return _json_error(404, "not found")
+    except IndexReadUnavailable as exc:
+        # A warm server's request handler must turn a deliberate reader fence
+        # into an actionable availability response, never a socket-reset/500.
+        return _json_error(503, str(exc))
 
 
 def _make_handler_class(ctx: ServeContext, identity: str) -> type[BaseHTTPRequestHandler]:

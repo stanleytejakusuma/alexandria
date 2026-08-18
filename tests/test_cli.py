@@ -203,7 +203,7 @@ def test_searching_a_corpus_that_was_never_indexed_fails_loudly(tmp_path):
         "the guard must refuse BEFORE the store materialises an empty index"
 
 
-def test_searching_a_real_index_that_predates_manifests_fails_loudly_with_backfill_hint(tmp_path, monkeypatch):
+def test_searching_a_real_index_that_predates_manifests_fails_loudly_with_rebuild_hint(tmp_path, monkeypatch):
     """Gate F4: a real `index` run before this session's own manifest column
     existed is exactly the state of the shipped 2.2GB index -- must refuse,
     not silently treat 'absent' as 'compatible'."""
@@ -221,15 +221,58 @@ def test_searching_a_real_index_that_predates_manifests_fails_loudly_with_backfi
     with pytest.raises(SystemExit) as exc:
         app(["--corpus", str(corpus), "search", "anything"])
     assert "no manifest" in str(exc.value)
-    assert "--backfill-manifest" in str(exc.value)
+    assert "--rebuild" in str(exc.value)
 
 
-def test_backfill_manifest_writes_a_manifest_without_reindexing(tmp_path, monkeypatch, capsys):
-    import json
+def test_backfill_manifest_refuses_to_launder_a_nonempty_legacy_index(tmp_path, monkeypatch):
+    """A declared L2 policy cannot be asserted over vectors built pre-policy."""
+    from alexandria.index.store import VectorStore
 
     monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
     corpus = tmp_path / "corpus"
-    (corpus / ".alexandria" / "index" / "chunks.lance").mkdir(parents=True)
+    store = VectorStore(corpus / ".alexandria" / "index")
+    store.upsert([{
+        "chunk_id": "sources/legacy#1", "doc_id": "sources/legacy", "text": "legacy",
+        "heading_path": "", "vector": [1.0] * 384, "type": "observation",
+        "project": None, "status": "active", "source": "test", "tags": [],
+        "entities": [], "layer": "sources", "generated_at": None,
+        "enrichment": None, "kind": None, "parent_doc": None, "target_chunk": None,
+    }])
+
+    with pytest.raises(SystemExit, match="--rebuild"):
+        app(["--corpus", str(corpus), "index", "--backfill-manifest"])
+    assert not (corpus / ".alexandria" / "index" / "manifest.json").exists()
+
+
+def test_backfill_manifest_uses_the_same_writer_lock_as_index_and_promote(tmp_path, monkeypatch):
+    """Backfill's empty-store decision cannot race an index/promote writer."""
+    from alexandria import cli
+    from alexandria.index.store import VectorStore
+    from alexandria.writelock import write_lock
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    monkeypatch.setattr(cli, "DEFAULT_LOCK_TIMEOUT", 0.05)
+    corpus = tmp_path / "corpus"
+    VectorStore(corpus / ".alexandria" / "index")
+    holder = write_lock(corpus)
+    assert holder.acquire()
+    try:
+        with pytest.raises(SystemExit, match="could not acquire the corpus write lock"):
+            app(["--corpus", str(corpus), "index", "--backfill-manifest"])
+    finally:
+        holder.release()
+    assert not (corpus / ".alexandria" / "index" / "manifest.json").exists()
+
+
+def test_backfill_manifest_may_label_an_empty_new_index(tmp_path, monkeypatch, capsys):
+    """An empty store has no stored vectors to launder or mix."""
+    import json
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    from alexandria.index.store import VectorStore
+
+    corpus = tmp_path / "corpus"
+    VectorStore(corpus / ".alexandria" / "index")  # a real but empty index store
 
     assert app(["--corpus", str(corpus), "index", "--backfill-manifest"]) == 0
     out = capsys.readouterr().out
@@ -237,6 +280,72 @@ def test_backfill_manifest_writes_a_manifest_without_reindexing(tmp_path, monkey
     manifest = json.loads((corpus / ".alexandria" / "index" / "manifest.json").read_text())
     assert manifest["provider"] == "hash"
     assert manifest["normalized"] is True
+
+
+def test_build_search_engine_refuses_a_dropped_rebuild_but_tolerates_a_live_writer(tmp_path, monkeypatch):
+    """Construction guards on the durable marker only -- never on the writer lock.
+
+    Two-sided on purpose. A rebuild that has already dropped a projection is
+    unreadable no matter how long anyone waits, so construction must refuse it.
+    An ordinary promote/drain holding the writer lock for a few seconds is the
+    opposite case: blocking there would stop `alexandria serve` from booting
+    (test_serve.py's lock-skipped-drain test pins that), and it buys nothing,
+    because the engine binds no epoch -- each search takes its own shared epoch.
+    """
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    from alexandria.writelock import IndexReadUnavailable, rebuild_marker, write_lock
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\ncoherent reader fence\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+
+    writer = write_lock(corpus)
+    assert writer.acquire()
+    try:
+        assert _build_search_engine(cfg, corpus) is not None, (
+            "a transient writer must not stop an engine (or serve) from starting")
+    finally:
+        writer.release()
+
+    marker = rebuild_marker(corpus)
+    marker.write_text("interrupted rebuild\n")
+    try:
+        with pytest.raises(IndexReadUnavailable, match="rebuild"):
+            _build_search_engine(cfg, corpus)
+    finally:
+        marker.unlink()
+
+
+@pytest.mark.parametrize("argv, label", [
+    (["search", "anything"], "search"),
+    (["answer", "anything"], "answer"),
+])
+def test_cli_reports_exit_3_when_a_rebuild_holds_the_index_at_startup(tmp_path, monkeypatch, capsys, argv, label):
+    """The refusal must be an actionable exit code, not a raw traceback.
+
+    Engine CONSTRUCTION is itself a reader, so it raises IndexReadUnavailable
+    before the query call ever happens. Catching only around `engine.search`
+    left this startup case escaping as an uncaught RuntimeError -- exit 1 plus
+    a stack trace, not the documented exit 3. The catch therefore belongs at
+    the `app()` dispatch boundary, which also covers every future read verb.
+    """
+    from alexandria.writelock import rebuild_marker
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nreader fence exit contract\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    rebuild_marker(corpus).write_text("interrupted rebuild\n")
+    assert app(["--corpus", str(corpus), *argv]) == 3, label
+    assert "index unavailable" in capsys.readouterr().err
 
 
 def test_switching_embed_provider_between_index_runs_fails_loudly_instead_of_mixing_vectors(tmp_path, monkeypatch):
@@ -415,3 +524,42 @@ def test_eval_output_shows_the_interval_and_withholds_a_verdict_it_cannot_suppor
     assert "recall@k: 50.0% [9.5%-90.5%]" in out
     assert "NOT significant" in out
     assert "p=1.000" in out
+
+
+
+def test_promote_missing_manifest_guides_legacy_nonempty_index_to_rebuild(tmp_path, monkeypatch):
+    """The operator-facing promote error cannot suggest policy laundering."""
+    from types import SimpleNamespace
+    from alexandria import cli
+    from alexandria.index.manifest import ManifestMissing
+
+    monkeypatch.setattr(cli, "_config_for", lambda _args: SimpleNamespace(
+        corpus_path=tmp_path, embed_provider="hash"))
+    monkeypatch.setattr(cli, "_cached_embedder", lambda *_args: object())
+    monkeypatch.setattr(cli, "promote_pending", lambda *_args: (_ for _ in ()).throw(
+        ManifestMissing("missing manifest")))
+
+    with pytest.raises(SystemExit, match="--rebuild") as exc:
+        cli.cmd_promote(SimpleNamespace())
+    assert "--backfill-manifest" not in str(exc.value)
+
+
+def test_every_production_search_engine_is_built_with_a_corpus_root(tmp_path):
+    """The fence is skipped only when there is no corpus lock to share.
+
+    `_read_epoch` treats a missing corpus_root as "unfenced", which is correct
+    for synthetic/in-memory harnesses but would be a silent hole if a real
+    construction path ever omitted it. cli._build_search_engine is that single
+    production chokepoint, so pin the default here.
+    """
+    import ast
+    import inspect
+    from alexandria import cli
+
+    tree = ast.parse(inspect.getsource(cli._build_search_engine_unlocked))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "SearchEngine"]
+    assert len(calls) == 1
+    assert any(kw.arg == "corpus_root" for kw in calls[0].keywords), (
+        "the production engine builder stopped passing corpus_root -- every "
+        "search built through it would silently bypass the reader fence")

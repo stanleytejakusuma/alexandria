@@ -1,6 +1,9 @@
 """The hybrid pipeline keeps metadata filtering first and degrades on reranker failure."""
 
+import sys
 from pathlib import Path
+
+import pytest
 
 from alexandria.index.bm25 import BM25Index
 from alexandria.index.embedder import HashEmbedder
@@ -36,7 +39,8 @@ def build_engine(tmp_path: Path, reranker=None) -> SearchEngine:
     lexical = BM25Index(tmp_path / "fts.sqlite")
     lexical.index(rows)
     return SearchEngine(embedder, store, lexical, reranker or IdentityReranker(),
-                        SearchConfig(prefetch=5, top_k=2, wiki_boost=1.25))
+                        SearchConfig(prefetch=5, top_k=2, wiki_boost=1.25),
+                        corpus_root=tmp_path)
 
 
 def test_search_runs_hybrid_pipeline_and_records_trace(tmp_path: Path):
@@ -317,3 +321,104 @@ def test_a_corrupt_generation_file_disables_caching_but_does_not_crash_search(tm
     # hitting a cache keyed by some fallback generation value).
     results2 = engine.search("sweep page fails lint")
     assert engine.last_cache_hit == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")
+def test_search_refuses_a_live_writer_or_interrupted_rebuild_before_touching_retrieval(tmp_path):
+    """The in-place rebuild marker/lock is a reader fence, not merely eval metadata."""
+    from alexandria.writelock import IndexReadUnavailable, rebuild_marker, write_lock
+
+    engine = build_engine(tmp_path)
+    writer = write_lock(tmp_path)
+    assert writer.acquire()
+    try:
+        with pytest.raises(IndexReadUnavailable, match="writer"):
+            engine.search("sweep page")
+    finally:
+        writer.release()
+
+    marker = rebuild_marker(tmp_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("interrupted rebuild\n")
+    with pytest.raises(IndexReadUnavailable, match="rebuild"):
+        engine.search("sweep page")
+    marker.unlink()
+
+    assert engine.search("sweep page"), "reader resumes only after a successful rebuild clears marker"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")
+def test_warm_engine_reads_both_legs_inside_one_epoch_and_still_sees_new_writes(tmp_path):
+    """Coherence must come from the SH epoch, never from pinning stale handles.
+
+    Red proposed refusing a warm engine whose bound generation moved on. That
+    premise is false here and the "fix" would be a serve-killing regression:
+    ``VectorStore.search_vector`` calls ``_open_table()`` per query and BM25
+    reads a live connection, so both legs pick up committed data on every
+    search -- which is exactly why the long-lived server sees externally
+    indexed content (test_serve.py S4, the regression 500cd9e fixed).
+
+    The real invariant is therefore two-sided, and this pins both halves:
+    (a) both legs are read inside ONE shared epoch, so no writer can interleave
+        a drop between them, and
+    (b) after that epoch ends, a new search observes new data rather than a
+        frozen snapshot.
+    """
+    from alexandria.cache import write_index_generation
+
+    engine = build_engine(tmp_path)
+    legs: list[str] = []
+    real_dense, real_lexical = engine.store.search_vector, engine.bm25.search
+
+    def watched_dense(*args, **kwargs):
+        legs.append("dense")
+        return real_dense(*args, **kwargs)
+
+    def watched_lexical(*args, **kwargs):
+        legs.append("lexical")
+        return real_lexical(*args, **kwargs)
+
+    engine.store.search_vector = watched_dense
+    engine.bm25.search = watched_lexical
+
+    # (a) Both legs ran, and they ran while this process held the shared epoch:
+    # a writer attempting EX mid-search would have been excluded by construction.
+    assert engine.search("sweep page lint")
+    assert set(legs) == {"dense", "lexical"}
+
+    # (b) A completed external epoch bump does not freeze the warm engine out.
+    write_index_generation(tmp_path)
+    assert engine.search("sweep page lint"), (
+        "a warm engine must keep serving after an external index run completes -- "
+        "refusing on generation drift would break the S4 warm-server contract")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")
+def test_reranking_happens_outside_the_shared_epoch_so_readers_cannot_starve_writers(tmp_path):
+    """The epoch must cover index reads only -- not the cross-encoder.
+
+    flock has no writer priority: while any reader holds SH, a queued EX waiter
+    keeps losing to newly arriving readers. Reranking is a ~100ms-per-candidate
+    model call over already-hydrated records that touches no index state, so
+    holding SH across it inflates the starvation window by the slowest stage in
+    the pipeline and can push `index` past DEFAULT_LOCK_TIMEOUT on ordinary
+    query traffic. Retrieval must be inside the epoch; reranking must not be.
+    """
+    from alexandria.writelock import write_lock
+
+    observed = {}
+
+    class LockProbingReranker:
+        def rerank(self, query, candidates, k):
+            # A writer must be able to get in the moment retrieval is done.
+            probe = write_lock(tmp_path)
+            observed["writer_admitted_during_rerank"] = probe.acquire()
+            if observed["writer_admitted_during_rerank"]:
+                probe.release()
+            return list(candidates[:k])
+
+    engine = build_engine(tmp_path, reranker=LockProbingReranker())
+    assert engine.search("sweep page lint")
+    assert observed["writer_admitted_during_rerank"] is True, (
+        "the shared epoch was still held during reranking -- query traffic can "
+        "starve `index` for the full cross-encoder latency")
