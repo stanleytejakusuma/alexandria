@@ -45,12 +45,19 @@ def load_config(*, corpus_override: str | Path | None = None,
     raw = _read_toml(config_path)
     corpus = (corpus_override or os.environ.get("ALEXANDRIA_CORPUS_PATH")
               or _nested(raw, "corpus", "path") or "~/alexandria-corpus")
-    # mlx: measured 3.18x faster than pytorch/mps with cosine 0.9994 agreement on the
-    # real golden-set documents, and avoids a confirmed PyTorch MPS memory leak
-    # (pytorch/pytorch#154329) that grew system swap ~10GB per full index run.
-    # The live corpus index was built with this provider; changing it back to
-    # 'local' requires a full re-embed (different cache key = different model name).
-    provider = _env_or_file("ALEXANDRIA_EMBED_PROVIDER", raw, ("embed", "provider"), "mlx")
+    # The default must MATCH the index that ships with the corpus, not merely be
+    # the fastest backend. It was "mlx" (3.18x faster than pytorch/mps, cosine
+    # 0.9994 agreement, sidesteps the PyTorch MPS graph-cache leak
+    # pytorch/pytorch#154329) because the live index had been built with MLX.
+    #
+    # The 2026-08-18 re-embed rebuilt that index with the torch/`local` provider
+    # under the declared L2 normalization policy, so the manifest now records
+    # provider=local, model=Qwen/Qwen3-Embedding-0.6B. Leaving the default at
+    # "mlx" meant every CLI invocation without an explicit env var failed closed
+    # against its own corpus -- the refusal was correct, the default impossible.
+    # Kept identical to AppConfig's dataclass default so "what is the default?"
+    # has ONE answer regardless of which construction path you read.
+    provider = _env_or_file("ALEXANDRIA_EMBED_PROVIDER", raw, ("embed", "provider"), "local")
     if provider not in {"local", "hash", "mlx"}:
         raise ValueError("ALEXANDRIA_EMBED_PROVIDER must be local, mlx, or hash")
     return AppConfig(
