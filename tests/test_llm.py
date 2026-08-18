@@ -370,3 +370,113 @@ def test_total_timeout_zero_means_one_attempt_then_a_budget_error(monkeypatch):
     assert calls["n"] == 1, "a zero budget must still permit exactly one attempt"
     assert "total budget" in str(exc.value)
     assert getattr(exc.value, "retryable", False) is False
+
+
+# ---------------------------------------------------------------------------
+# #47: per-CALL caps do not compose into a per-REQUEST cap.
+#
+# total_timeout bounds one complete(). But one /answer chains ~15 sequential
+# stages (gather gap, write, per-claim audits, two coverage graders, up to two
+# repair iterations each re-judging), so a fully dead gateway still costs
+# ~15 x (300 + 120)s ~= 1.8 hours. Every unit is bounded; the total is not --
+# the exact composition error that made #28 look already-fixed when it wasn't.
+# ---------------------------------------------------------------------------
+
+def test_a_shared_deadline_makes_N_chained_calls_cost_ONE_budget(monkeypatch):
+    """The whole point: N stalled stages must cost one request budget, not N."""
+    from alexandria.llm import RequestDeadline
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    now = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+
+    def stalls(self, system, user, temperature=0.0):
+        now["t"] += self.timeout
+        err = LLMError("stall"); err.retryable = True
+        raise err
+
+    monkeypatch.setattr(LLMClient, "_once", stalls)
+
+    deadline = RequestDeadline(600)
+    # Three roles, as the answer pipeline builds them: writer + two graders.
+    clients = [LLMClient(timeout=100, max_retries=4, base_delay=0.0,
+                         total_timeout=300, deadline=deadline) for _ in range(3)]
+
+    failures = 0
+    for stage in range(15):                      # ~one /answer worth of stages
+        try:
+            clients[stage % 3].complete("sys", "user", temperature=0.1)
+        except LLMError:
+            failures += 1
+
+    assert failures == 15, "every stage should fail against a dead gateway"
+    assert now["t"] <= 600 + 100, (
+        f"15 stages burned {now['t']}s against a 600s request budget -- the "
+        f"deadline did not compose")
+
+
+def test_once_the_request_deadline_is_spent_later_calls_fail_fast_without_network(monkeypatch):
+    """A spent budget must short-circuit BEFORE touching the transport.
+
+    Otherwise each later stage still pays one attempt deadline, and 15 stages
+    cost 15 x timeout even though the request was already over.
+    """
+    from alexandria.llm import RequestDeadline
+
+    now = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+    attempts = {"n": 0}
+
+    def counting(self, system, user, temperature=0.0):
+        attempts["n"] += 1
+        now["t"] += self.timeout
+        err = LLMError("stall"); err.retryable = True
+        raise err
+
+    monkeypatch.setattr(LLMClient, "_once", counting)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    # 100s budget, 100s attempt: one attempt spends it exactly.
+    deadline = RequestDeadline(100)
+    client = LLMClient(timeout=100, max_retries=0, base_delay=0.0, deadline=deadline)
+
+    with pytest.raises(LLMError):
+        client.complete("s", "u", temperature=0.1)      # burns the whole budget
+    spent = attempts["n"]
+    assert spent == 1
+
+    with pytest.raises(LLMError) as exc:
+        client.complete("s", "u", temperature=0.1)      # budget gone: no network
+
+    assert attempts["n"] == spent, "a spent request budget still hit the transport"
+    assert "request budget" in str(exc.value)
+    assert getattr(exc.value, "retryable", False) is False
+
+
+def test_the_per_call_cap_is_clamped_to_whatever_the_request_has_left(monkeypatch):
+    """A 300s call cap must not overrun a request with 50s remaining."""
+    from alexandria.llm import RequestDeadline
+
+    now = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    def stalls(self, system, user, temperature=0.0):
+        now["t"] += 20
+        err = LLMError("stall"); err.retryable = True
+        raise err
+
+    monkeypatch.setattr(LLMClient, "_once", stalls)
+
+    deadline = RequestDeadline(50)
+    client = LLMClient(timeout=20, max_retries=10, base_delay=0.0,
+                       total_timeout=300, deadline=deadline)
+    with pytest.raises(LLMError):
+        client.complete("s", "u", temperature=0.1)
+
+    assert now["t"] <= 50 + 20, f"call ran to {now['t']}s against a 50s request remainder"
+
+
+def test_no_deadline_means_unchanged_behaviour():
+    """Backward compatible: every existing caller passes no deadline."""
+    assert LLMClient().deadline is None

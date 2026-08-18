@@ -56,7 +56,7 @@ from .index.manifest import (ManifestCorrupt, ManifestMismatch, ManifestMissing,
 from .index.store import VectorStore
 from . import liveness
 from .backup import backup_state, restore_state
-from .llm import LLMClient
+from .llm import LLMClient, RequestDeadline
 from .migrate import migrate_kg_sync
 from .monitor import QueryLogger
 from .pending import create_pending, list_pending, oldest_pending_age
@@ -971,12 +971,21 @@ class AnswerOutcome:
     failed_claims: list = None  # type: ignore[assignment]
 
 
+
+# #47: wall-clock ceiling for ONE /answer, shared by every LLM stage in it.
+# Sized from measurement, not guesswork: a healthy cold answer is ~3.3 min
+# (200s) and the bridge measured 122s typical with >300s under concurrent
+# writes, so 900s leaves ample headroom for a slow-but-alive gateway while
+# bounding a dead one to minutes instead of the ~1.8h an unbounded chain cost.
+DEFAULT_ANSWER_TIMEOUT = 900.0
+
 def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int,
               llm_model: str, grader_a_model: str, grader_b_model: str,
               base_url: str | None, api_key_env: str | None, prompt_version: str,
               save_dir: str | None = None, caller: str | None = None,
               user: str | None = None, max_follow_up_queries: int = 2,
-              audit_concurrency: int = 4) -> AnswerOutcome:
+              audit_concurrency: int = 4,
+              answer_timeout: float = DEFAULT_ANSWER_TIMEOUT) -> AnswerOutcome:
     """Run the full gather -> write -> judge -> repair pipeline (or replay a
     cached page) for one question against an already-built `engine`. No
     printing; side effects are exactly what the spec requires (response
@@ -1028,9 +1037,18 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
     save_path = Path(save_dir).expanduser() if save_dir else None
     emit_root = save_path if save_path else Path(tempfile.mkdtemp(prefix="alexandria-answer-"))
 
-    writer = LLMClient(model=llm_model, base_url=base_url, api_key_env=api_key_env)
-    grader_a = LLMClient(model=grader_a_model, base_url=base_url, api_key_env=api_key_env)
-    grader_b = LLMClient(model=grader_b_model, base_url=base_url, api_key_env=api_key_env)
+    # #47: ONE wall-clock budget shared by every stage of this answer. Capping
+    # each call individually did not compose -- a single answer chains ~15
+    # sequential stages, so a dead gateway still cost ~1.8h even with every call
+    # bounded. All three clients draw down the same deadline, and once it is
+    # spent the remaining stages fail fast instead of each paying an attempt.
+    deadline = RequestDeadline(answer_timeout)
+    writer = LLMClient(model=llm_model, base_url=base_url, api_key_env=api_key_env,
+                       deadline=deadline)
+    grader_a = LLMClient(model=grader_a_model, base_url=base_url, api_key_env=api_key_env,
+                         deadline=deadline)
+    grader_b = LLMClient(model=grader_b_model, base_url=base_url, api_key_env=api_key_env,
+                         deadline=deadline)
     _t_answer0 = time.time()
     result = run_pipeline(
         engine, question,
@@ -1090,6 +1108,7 @@ def cmd_answer(args) -> int:
         max_follow_up_queries=getattr(args, "max_follow_up_queries", 2),
         audit_concurrency=getattr(args, "audit_concurrency", 4),
         api_key_env=args.api_key_env, prompt_version=args.prompt_version,
+        answer_timeout=(getattr(args, "answer_timeout", DEFAULT_ANSWER_TIMEOUT) or None),
         save_dir=args.save_dir, caller=args.caller, user=cli_identity())
     if outcome.cached:
         print("[cached] " + outcome.text)
@@ -1610,6 +1629,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"follow-up cap, 0..{MAX_FOLLOW_UP_QUERIES} (0 disables follow-ups)")
     answer.add_argument("--audit-concurrency", type=_audit_concurrency_count, default=4,
                         help=f"grader workers, 0..{MAX_AUDIT_CONCURRENCY} (0 or 1 = sequential)")
+    answer.add_argument("--answer-timeout", type=float, default=DEFAULT_ANSWER_TIMEOUT,
+                        help=f"wall-clock budget in seconds for ALL LLM stages of one answer "
+                             f"(default {DEFAULT_ANSWER_TIMEOUT:.0f}; 0 disables the budget). "
+                             f"Bounds a dead/stalled gateway; a healthy cold answer is ~200s.")
     answer.add_argument("--prompt-version", default="v1")
     answer.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
                        help="UNVERIFIED tool label recorded in the audit trail; not an identity")

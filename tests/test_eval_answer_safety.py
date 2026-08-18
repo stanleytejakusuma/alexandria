@@ -373,3 +373,94 @@ def test_answer_cache_key_is_computed_once_and_reused_for_get_and_put():
         assert name in calls, f"response_cache.{name} disappeared"
         assert any(getattr(a, "id", None) == "rkey" for a in calls[name].args), (
             f"response_cache.{name} no longer uses the single precomputed key")
+
+
+def test_run_answer_gives_every_stage_ONE_shared_request_deadline():
+    """#47: the per-call cap only composes if all three clients share a budget.
+
+    If a refactor built any client without the deadline -- or built a fresh
+    deadline per client -- a dead gateway would again cost N budgets instead of
+    one, silently restoring the ~1.8h worst case that motivated this. Pinned
+    structurally: exactly one RequestDeadline is constructed, and every
+    LLMClient in run_answer receives that same name.
+    """
+    import ast
+    import inspect
+    from alexandria import cli
+
+    tree = ast.parse(inspect.getsource(cli.run_answer))
+
+    deadlines = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", None) == "RequestDeadline"]
+    assert len(deadlines) == 1, "the answer must build exactly one shared deadline"
+
+    clients = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "LLMClient"]
+    assert len(clients) == 3, "writer + two graders"
+    for call in clients:
+        passed = [kw for kw in call.keywords if kw.arg == "deadline"]
+        assert passed, "an LLM client was built without the shared request deadline"
+        assert getattr(passed[0].value, "id", None) == "deadline", (
+            "a client got its own deadline instead of the shared one")
+
+
+def test_the_default_answer_budget_is_finite_and_generous_enough_for_a_healthy_answer():
+    """An infinite default is the bug; a too-tight one breaks slow-but-alive."""
+    from alexandria.cli import DEFAULT_ANSWER_TIMEOUT
+
+    assert DEFAULT_ANSWER_TIMEOUT is not None
+    # A healthy cold answer measured ~200s, and the bridge saw >300s under
+    # concurrent writes. Anything at/below that would fail real answers.
+    assert DEFAULT_ANSWER_TIMEOUT > 300
+    assert DEFAULT_ANSWER_TIMEOUT <= 1800
+
+
+def test_all_three_answer_clients_share_the_SAME_deadline_object(monkeypatch, tmp_path):
+    """Identity, not spelling -- Red: the AST test pins the wrong thing.
+
+    The AST guard asserts three LLMClient calls each pass a name spelled
+    `deadline`. It breaks on a benign refactor (extract construction into a
+    helper) and passes on an adversarial one (rebinding `deadline` between
+    constructions). The invariant that actually matters is OBJECT IDENTITY: if
+    each client got its own budget, N chained stages would again cost N budgets
+    and the ~1.8h worst case would silently return.
+    """
+    from alexandria import cli
+
+    built = []
+
+    class SpyClient:
+        def __init__(self, **kwargs):
+            self.deadline = kwargs.get("deadline")
+            built.append(self)
+
+    from alexandria import llm as llm_mod
+    from alexandria.synthesis import pipeline as pipeline_mod
+
+    # Both names are imported INSIDE run_answer, so patch them at their source
+    # modules -- patching cli.LLMClient would silently miss the local import.
+    monkeypatch.setattr(llm_mod, "LLMClient", SpyClient)
+    # run_pipeline is imported inside run_answer, so patch it at its source.
+    monkeypatch.setattr(pipeline_mod, "run_pipeline",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop after wiring")))
+
+    class FakeEngine:
+        embedder = type("E", (), {"name": "hash-24"})()
+        reranker = type("R", (), {"model_name": "fake", "half_precision": True})()
+        config = type("C", (), {"prefetch": 8, "top_k": 5, "rrf_k": 60, "wiki_boost": 1.25})()
+        logger = type("L", (), {"log_usage": lambda self, **kw: None})()
+
+    with pytest.raises(RuntimeError, match="stop after wiring"):
+        cli.run_answer(
+            cli.AppConfig(corpus_path=tmp_path), tmp_path, "q",
+            engine=FakeEngine(), k=5, llm_model="m",
+            grader_a_model="a", grader_b_model="b",
+            base_url=None, api_key_env=None, prompt_version="v1",
+        )
+
+    assert len(built) == 3, "writer + two graders"
+    deadlines = [c.deadline for c in built]
+    assert all(d is not None for d in deadlines), "a client was built with no budget"
+    assert deadlines[0] is deadlines[1] is deadlines[2], (
+        "clients got separate budgets -- N stages would cost N budgets again")

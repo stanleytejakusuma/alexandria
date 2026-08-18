@@ -31,6 +31,14 @@ _ANSWER_ARGS_TODAY = frozenset({
     "help", "question", "k", "save_dir", "llm_model", "grader_a_model",
     "grader_b_model", "base_url", "api_key_env", "prompt_version", "caller",
     "user", "func", "max_follow_up_queries", "audit_concurrency",
+    # Added #47. Consciously classified, which is the whole point of this list:
+    # answer_timeout is a wall-clock budget for the LLM stages, NOT a way to
+    # scope a question to a subset of documents. It cannot select which
+    # documents an answer sees, so it does not belong in the response-cache key
+    # and cannot enable the cross-tenant leak this gate exists to catch. (It is
+    # deliberately absent from answer_pipeline_fingerprint for the same reason:
+    # a budget changes how long we wait, never which evidence is used.)
+    "answer_timeout",
 })
 
 

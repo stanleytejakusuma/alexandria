@@ -119,6 +119,8 @@ def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
             "grader_a_model": os.environ.get("ALEXANDRIA_GRADER_A_MODEL", "deepseek-v4-flash"),
             "grader_b_model": os.environ.get("ALEXANDRIA_GRADER_B_MODEL", "deepseek-v4-flash"),
             "prompt_version": os.environ.get("ALEXANDRIA_PROMPT_VERSION", "v1"),
+            # Operator surface for the #47 request budget. 0 disables it.
+            "answer_timeout": os.environ.get("ALEXANDRIA_ANSWER_TIMEOUT", ""),
         },
     )
 
@@ -356,6 +358,8 @@ def _handle_answer(ctx: ServeContext, identity: str, payload: dict) -> tuple[int
         grader_b_model=payload.get("grader_b_model") or defaults["grader_b_model"],
         base_url=defaults["base_url"], api_key_env=defaults["api_key_env"],
         prompt_version=defaults["prompt_version"],
+        **({"answer_timeout": float(defaults["answer_timeout"]) or None}
+           if defaults.get("answer_timeout") else {}),
         # §5.3: identity is derived from the socket, never from the body --
         # a "caller"/"user" field in the request is not honored here.
         caller=identity, user=identity,

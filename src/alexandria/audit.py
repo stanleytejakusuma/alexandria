@@ -20,7 +20,7 @@ import random
 import re
 from dataclasses import dataclass, field
 
-from .llm import LLMError
+from .llm import BudgetExhausted, LLMError
 
 __all__ = ["Verdict", "AuditResult", "grade_note", "GRADER_SYSTEM"]
 
@@ -220,6 +220,12 @@ def grade_note(llm, transcript: str, title: str, body: str, note_id: str,
                     f"{non_supported.clause!r} is {non_supported.verdict}")
         return Verdict(note_id, verdict, str(data.get("reason", ""))[:120], title,
                        clause_verdicts)
+    except BudgetExhausted:
+        # A spent time budget is not a grader failure. Re-wrapping it as a plain
+        # LLMError here is what let judge_page absorb it into a failed CLAIM id,
+        # so an answer could name claims that no grader ever actually saw.
+        # Propagate the type so the caller aborts on the real cause: time.
+        raise
     except (LLMError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise LLMError(f"grader failed on {note_id}: {type(exc).__name__}: {exc}") from exc
 

@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 
 from ..audit import AuditResult, grade_note
 from ..coverage import AgreementResult, grade_skip_twice
-from ..llm import LLMError
+from ..llm import BudgetExhausted, LLMError
 from .gather import GatherResult, SourceChunk
 from .write import Claim, SynthesisPage
 
@@ -89,6 +89,13 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
                 claim.id,
                 clauses=True,
             )
+        except BudgetExhausted:
+            # NOT a content verdict. Absorbing this would record a claim as
+            # failing its entailment check when it was never actually judged --
+            # the answer would then name failed_claims that no grader ever saw,
+            # and repair would spend its remaining iterations "fixing" them.
+            # Propagate so the caller aborts on the real cause: time.
+            raise
         except LLMError as exc:
             return exc
 

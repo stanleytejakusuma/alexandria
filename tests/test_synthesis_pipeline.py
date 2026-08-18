@@ -439,3 +439,33 @@ def test_judge_page_parallel_audit_reports_unsupported_claims_identically():
     assert [v.verdict for v in verdict.audit.verdicts] == [
         "supported", "unsupported", "supported",
     ]
+
+
+def test_a_budget_expiry_mid_audit_is_not_recorded_as_a_failed_CLAIM():
+    """#47 / Red: "we ran out of time" must not masquerade as "this claim is bad".
+
+    `_grade_one` catches LLMError and the caller turns it into a failed claim id.
+    A budget expiry arriving as a plain LLMError therefore got recorded as a
+    CONTENT-quality failure: the answer would report claims that were never
+    actually judged, and a repair loop could burn its remaining iterations
+    trying to fix claims whose only problem was that the clock ran out.
+    BudgetExhausted is a distinct type precisely so this path can tell them
+    apart -- it must abort the judgement, not be absorbed into the verdict.
+    """
+    from alexandria.llm import BudgetExhausted
+
+    gathered, page = _three_claim_page()
+
+    class OutOfTime:
+        def complete(self, system, user, temperature=0.0):
+            raise BudgetExhausted("request budget exhausted (900s) after 1 attempt(s)")
+
+    with pytest.raises(BudgetExhausted):
+        judge_page(
+            gathered,
+            page,
+            audit_llm=OutOfTime(),
+            coverage_llm_a=ScriptedClient([]),
+            coverage_llm_b=ScriptedClient([]),
+            audit_concurrency=2,
+        )

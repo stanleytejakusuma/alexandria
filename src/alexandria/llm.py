@@ -16,7 +16,47 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 
-__all__ = ["LLMClient", "ScriptedClient", "LLMError"]
+__all__ = ["BudgetExhausted", "LLMClient", "RequestDeadline", "ScriptedClient", "LLMError"]
+
+
+class RequestDeadline:
+    """One wall-clock budget shared by every LLM call in a single request.
+
+    #28 capped a single `complete()`. That does NOT compose: one /answer chains
+    ~15 sequential stages (gather gap, write, per-claim audits, two coverage
+    graders, up to two repair iterations each re-judging), so a fully dead
+    gateway still cost ~15 x (total_timeout + timeout) ~= 1.8 hours. Every unit
+    was bounded and the total was not -- the same composition error that made
+    backlog #28 look already-fixed when it wasn't.
+
+    Passed to every client the pipeline builds, so the writer and both graders
+    draw down ONE budget. Once it is spent, later stages fail fast without
+    touching the transport instead of each paying another attempt deadline.
+
+    Deliberately monotonic-clock based and thread-safe by construction: it
+    holds a fixed start time and reads `time.monotonic()`, so parallel claim
+    audits sharing one instance need no lock.
+    """
+
+    def __init__(self, budget_seconds: float | None) -> None:
+        # None disables the budget, matching total_timeout's convention from
+        # #28 (where None means unlimited). Without this, answer_timeout=None
+        # would TypeError inside remaining() -- a silent contradiction of the
+        # convention the operator already learned one change earlier.
+        if budget_seconds is not None and budget_seconds < 0:
+            raise ValueError("request budget must be non-negative, or None to disable")
+        self.budget_seconds = budget_seconds
+        self.started = time.monotonic()
+
+    def remaining(self) -> float | None:
+        """Seconds left (floored at 0), or None when no budget is set."""
+        if self.budget_seconds is None:
+            return None
+        return max(0.0, self.budget_seconds - (time.monotonic() - self.started))
+
+    def expired(self) -> bool:
+        remaining = self.remaining()
+        return remaining is not None and remaining <= 0.0
 
 
 def _open_with_deadline(req, timeout: int) -> bytes:
@@ -53,6 +93,18 @@ class LLMError(RuntimeError):
     pass
 
 
+class BudgetExhausted(LLMError):
+    """A call stopped because a time budget ran out, not because of its content.
+
+    A distinct TYPE, not a message prefix: the per-claim audit path treats an
+    LLMError as "this claim failed its check", so a budget expiry that arrives
+    as a plain LLMError would be recorded as a CONTENT-quality failure -- the
+    answer would then report failed_claims that were never actually judged, and
+    a repair loop could burn iterations against a budget that is already spent.
+    Callers must be able to tell "we ran out of time" from "this claim is bad".
+    """
+
+
 @dataclass
 class LLMClient:
     base_url: str = "http://127.0.0.1:20128/v1"
@@ -79,6 +131,9 @@ class LLMClient:
     #    worse than a bounded overrun -- it turns would-succeed responses into
     #    guaranteed failures.
     total_timeout: float | None = 300.0
+    # #47: an optional request-scoped budget SHARED across clients. None keeps
+    # the pre-existing per-call behaviour for every caller that does not opt in.
+    deadline: "RequestDeadline | None" = None
     min_interval: float = 0.0     # floor between calls from one client; be a good citizen
     _last_call: float = field(default=0.0, repr=False)
     # Reserve rate-limit start slots and update diagnostic usage under small
@@ -124,6 +179,16 @@ class LLMClient:
                 f"unrelated earlier requests at temperature=0 (see llm.py comment). "
                 f"Use a nonzero temperature or a different model.")
         system = self._with_cache_buster(system)
+        # #47: refuse before touching the transport when the REQUEST budget is
+        # already spent. Without this each later stage still pays one attempt
+        # deadline, so 15 stages cost 15 x timeout even though the request was
+        # over -- the per-call cap composing into nothing.
+        if self.deadline is not None and self.deadline.expired():
+            err = BudgetExhausted(
+                f"request budget exhausted ({self.deadline.budget_seconds:.0f}s) before "
+                f"this call started (spent by earlier stages in this request)")
+            err.retryable = False
+            raise err
         last: Exception | None = None
         started = time.monotonic()
         for attempt in range(self.max_retries + 1):
@@ -175,12 +240,20 @@ class LLMClient:
         Covering only the first left the last-attempt path escaping as retryable,
         which is precisely the case the flag exists to defend against.
         """
+        if self.deadline is not None and self.deadline.expired():
+            # The shared request budget binds first: report THAT, since retrying
+            # this call under a spent request budget is pointless.
+            err = BudgetExhausted(
+                f"request budget exhausted ({self.deadline.budget_seconds:.0f}s) after "
+                f"{attempts} attempt(s); last error: {last}")
+            err.retryable = False
+            return err
         if self.total_timeout is None:
             return None
         elapsed = time.monotonic() - started
         if elapsed < self.total_timeout:
             return None
-        err = LLMError(
+        err = BudgetExhausted(
             f"call exceeded its {self.total_timeout:.0f}s total budget after "
             f"{attempts} attempt(s) ({elapsed:.0f}s elapsed); last error: {last}")
         err.retryable = False
