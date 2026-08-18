@@ -275,6 +275,16 @@ INDEX_ROOTS = frozenset({"sources", "wiki"})
 QUARANTINED_PARTS = frozenset({".alexandria", "_unparsed"})
 
 
+def is_appledouble_metadata(path: Path) -> bool:
+    """Whether ``path`` is a macOS AppleDouble sidecar, not user content.
+
+    Finder writes resource-fork metadata as a sibling whose *final basename*
+    starts ``._``. The final-name rule deliberately leaves ordinary documents
+    below a similarly named directory alone.
+    """
+    return path.name.startswith("._")
+
+
 def is_indexable_source(relative: Path) -> bool:
     """Whether a corpus-relative path is one the indexer will actually ingest.
 
@@ -283,10 +293,14 @@ def is_indexable_source(relative: Path) -> bool:
     /health once walked `sources/`+`wiki/` itself and reported
     `source_documents_agree: false` forever, because it counted the 25
     quarantined files in `sources/_unparsed/` that the indexer skips by design.
-    A health signal that is always false is not a signal.
+    A health signal that is always false is not a signal. AppleDouble sidecars
+    are excluded here too: they are filesystem metadata, not malformed source
+    documents to index, count, or lint.
     """
     parts = relative.parts
     if not parts or parts[0] not in INDEX_ROOTS:
+        return False
+    if is_appledouble_metadata(relative):
         return False
     return not (QUARANTINED_PARTS & set(parts))
 

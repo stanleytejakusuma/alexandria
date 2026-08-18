@@ -169,6 +169,22 @@ def test_s1_quarantined_files_do_not_create_a_permanent_phantom_shortfall(tmp_pa
         f"{body['distinct_documents_indexed']} indexed")
 
 
+def test_s1_appledouble_metadata_is_not_a_phantom_source_document(tmp_path, monkeypatch):
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    (corpus / "sources" / "._note.md").write_bytes(b"Finder metadata is not markdown\x00")
+    wiki = corpus / "wiki"
+    wiki.mkdir()
+    (wiki / "._overview.md").write_bytes(b"Finder metadata is not markdown\x00")
+
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    with _running(tcp_server, uds_servers):
+        status, body = _request(tcp_server.server_address, "GET", "/health")
+
+    assert status == 200
+    assert body["source_document_count"] == 1
+    assert body["source_documents_agree"] is True
+
+
 def test_s1_the_source_document_walk_actually_catches_a_frozen_index(tmp_path, monkeypatch):
     """Proves source_documents_agree is a REAL check, not decoration: add a
     second source document on disk WITHOUT reindexing, and the independent
@@ -484,16 +500,19 @@ def test_s8_a_slow_answer_does_not_block_a_concurrent_search(tmp_path, monkeypat
 # ---------------------------------------------------------------------------
 
 def test_s9_a_manifest_mismatched_provider_refuses_to_start(tmp_path, monkeypatch):
+    """Keep S9 offline: mutate the persisted manifest like the analogous CLI
+    gate, rather than selecting MLX and accidentally importing an optional
+    Apple-only dependency in CI."""
     from alexandria import serve as serve_mod
     corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)  # indexed with "hash"
+    manifest_path = corpus / ".alexandria" / "index" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["provider"] = "mlx"
+    manifest_path.write_text(json.dumps(manifest))
 
-    # Now request a server whose configured provider does not match the
-    # manifest the index was actually built with.
-    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "mlx")
-    mismatched_config = load_config(corpus_override=corpus)
-
-    with pytest.raises(SystemExit):
-        serve_mod.bind(corpus, config=mismatched_config, host="127.0.0.1", port=0)
+    matching_hash_config = load_config(corpus_override=corpus)
+    with pytest.raises(SystemExit, match="provider"):
+        serve_mod.bind(corpus, config=matching_hash_config, host="127.0.0.1", port=0)
 
 
 # ---------------------------------------------------------------------------

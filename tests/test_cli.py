@@ -85,6 +85,25 @@ def test_index_and_search_use_offline_provider_and_show_trace(tmp_path, monkeypa
     assert "metadata_filter" in capsys.readouterr().out
 
 
+def test_index_skips_appledouble_metadata_in_sources_and_wiki(tmp_path, monkeypatch, capsys):
+    """Metadata sidecars must not become index errors or phantom source docs."""
+    corpus = tmp_path / "corpus"
+    for relative in ("sources/real.md", "wiki/real.md"):
+        path = corpus / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\nsource: test\n---\n\nreal document body\n")
+    for relative in ("sources/._real.md", "wiki/._real.md"):
+        path = corpus / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"Finder metadata is not markdown\x00")
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    captured = capsys.readouterr()
+    assert "2 chunks from 2 documents" in captured.out
+    assert "._real.md" not in captured.err
+
+
 def test_lint_passes_on_a_clean_corpus(tmp_path, capsys):
     d = tmp_path / "sources" / "pi-sessions"
     d.mkdir(parents=True)
@@ -93,6 +112,27 @@ def test_lint_passes_on_a_clean_corpus(tmp_path, capsys):
         "  at: '2026-07-31T00:00:00Z'\nsource: pi-sessions\nsource_id: '1'\n---\nbody\n")
     assert app(["--corpus", str(tmp_path), "lint"]) == 0
     assert "0 error(s)" in capsys.readouterr().out
+
+
+def test_lint_skips_appledouble_metadata_in_sources_and_wiki(tmp_path, capsys):
+    """The lint walk is independent from indexing, so it must use the same
+    source eligibility rule rather than reporting Finder sidecars as malformed
+    documents forever."""
+    source = tmp_path / "sources" / "pi-sessions"
+    source.mkdir(parents=True)
+    (source / "real.md").write_text(
+        "---\ntype: observation\ntitle: T\ngenerated:\n  by: connector/pi-sessions\n"
+        "  at: '2026-07-31T00:00:00Z'\nsource: pi-sessions\nsource_id: '1'\n---\nbody\n")
+    (source / "._real.md").write_bytes(b"Finder metadata is not markdown\x00")
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "._summary.md").write_bytes(b"Finder metadata is not markdown\x00")
+
+    assert app(["--corpus", str(tmp_path), "lint"]) == 0
+    out = capsys.readouterr().out
+    assert "lint: 1 documents, 0 error(s)" in out
+    assert "._real.md" not in out
+    assert "._summary.md" not in out
 
 
 def test_lint_fails_on_a_schema_violation(tmp_path, capsys):

@@ -9,14 +9,17 @@ vectors from a different model into a column that already holds another
 model's vectors: not a crash, not a visibly wrong answer, just quietly
 degraded similarity ranking.
 
-The manifest records the six fields that determine whether two batches of
-vectors are comparable: provider, model, revision, dimension, normalization,
-and dtype. Normalization and dtype are measured, not assumed -- a raw vs.
-L2-normalized index silently diverges on cosine ranking, and a float32 vs.
-int8-quantized index computes distance in a different numeric space; both
-look like plausible results while being quietly wrong. Hardware
-non-determinism (CPU vs. GPU low-bit differences) is deliberately not
-recorded: it sits far below the ranking noise floor.
+The manifest records the compatibility identity for every vector batch:
+provider, model, revision, dimension, declared normalization policy, and
+dtype. The policy is not an optimistic provider claim: CachedEmbedder is the
+common production boundary and L2-normalizes every nonzero finite vector before
+it reaches indexing or retrieval. The probe's observed ``normalized`` value is
+still recorded for diagnostics, but device-level floating-point variation must
+not change compatibility when that wrapper contract is the same. A raw vs.
+L2-normalized index silently diverges on distance ranking, and a float32 vs.
+int8-quantized index computes distance in a different numeric space; both look
+like plausible results while being quietly wrong. Hardware non-determinism
+(CPU vs. GPU low-bit differences) is deliberately not an identity field.
 
 A MISSING manifest is not "compatible" -- it is the state of every index
 built before this module existed, and treating "absent" as "trust it" would
@@ -39,8 +42,18 @@ from typing import Any
 MANIFEST_FILE = "manifest.json"
 
 # The fields compared between the on-disk manifest and a freshly computed one.
-# created_at is provenance, not identity -- deliberately excluded.
-IDENTITY_FIELDS = ("provider", "model", "revision", "dim", "normalized", "dtype")
+# ``normalized`` is a raw provider-probe diagnostic, not identity: device-level
+# arithmetic can move it across a tolerance even while CachedEmbedder guarantees
+# the same L2 vectors at the index/retrieval boundary. ``normalization_policy``
+# is identity because it declares that enforced boundary. ``created_at`` is
+# provenance, not identity.
+IDENTITY_FIELDS = ("provider", "model", "revision", "dim", "normalization_policy", "dtype")
+
+# Old manifests predate this explicit field. Their single raw probe cannot
+# prove that every persisted vector passed through a wrapper, so they remain
+# readable but are deliberately unverified and cannot be incrementally mixed
+# with a new declared policy. Rebuild to establish that representation.
+UNVERIFIED_LEGACY_NORMALIZATION_POLICY = "unverified_legacy"
 
 # All vectors in this codebase end up as plain Python float lists (`float()`
 # cast in CachedEmbedder.embed and every provider's embed()) -- there is no
@@ -69,15 +82,17 @@ def _manifest_path(corpus: str | Path) -> Path:
 
 
 def compute_manifest(embedder, provider: str) -> dict[str, Any]:
-    """Measure the current embedder's identity by embedding one probe string.
+    """Measure the backend probe and record the enforced vector contract.
 
-    Dimension and normalization are *measured* (embed a probe, check its
-    length and L2 norm) rather than read from provider metadata, because
-    ``.dim`` itself forces a model load for the local/MLX providers -- there
-    is no cheaper way to know either fact honestly, and the load is about to
-    happen anyway for any real query on this engine.
+    The raw provider probe supplies the model's observed dimension and a useful
+    ``normalized`` diagnostic. It cannot define compatibility: CPU/GPU/device
+    arithmetic can move a norm across the former 1e-3 threshold. Production
+    callers use CachedEmbedder, whose explicit ``normalization_policy`` is
+    enforced in code before any vector reaches the index or query path. That
+    declared policy, not the diagnostic probe boolean, is the identity field.
     """
-    vector = embedder.embed([_PROBE_TEXT])[0]
+    probe_embedder = getattr(embedder, "provider", embedder)
+    vector = probe_embedder.embed([_PROBE_TEXT])[0]
     norm = math.sqrt(sum(value * value for value in vector))
     return {
         "provider": provider,
@@ -85,13 +100,25 @@ def compute_manifest(embedder, provider: str) -> dict[str, Any]:
         "revision": getattr(embedder, "revision", ""),
         "dim": len(vector),
         "normalized": abs(norm - 1.0) < 1e-3,
+        "normalization_policy": getattr(
+            embedder, "normalization_policy",
+            getattr(probe_embedder, "normalization_policy", "none"),
+        ),
         "dtype": DTYPE,
     }
 
 
 def write_manifest(corpus: str | Path, embedder, provider: str) -> dict[str, Any]:
-    """Compute and atomically persist the manifest for the current index."""
+    """Compute and atomically persist the manifest for the current index.
+
+    ``compute_manifest`` records the raw backend probe diagnostic. Also put the
+    wrapper-normalized probe in its cache, so later read-side compatibility
+    checks can inspect the declared boundary without an avoidable provider
+    load during server startup.
+    """
     manifest = compute_manifest(embedder, provider)
+    if hasattr(embedder, "normalization_policy"):
+        embedder.embed([_PROBE_TEXT])
     manifest["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     path = _manifest_path(corpus)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,8 +163,32 @@ def verify_manifest_for_write(corpus: str | Path, embedder, provider: str, store
     verify_manifest(corpus, embedder, provider)
 
 
+def _current_compatibility(embedder, provider: str) -> dict[str, Any]:
+    """Return only current vector-space identity, not raw probe diagnostics.
+
+    Calling through CachedEmbedder both verifies the vector width at the actual
+    L2 boundary and reuses the probe write_manifest cached. It deliberately
+    does not compare/re-measure the raw norm: that value is operational
+    diagnostics, and can drift across devices without changing wrapper output.
+    """
+    vector = embedder.embed([_PROBE_TEXT])[0]
+    return {
+        "provider": provider,
+        "model": embedder.name,
+        "revision": getattr(embedder, "revision", ""),
+        "dim": len(vector),
+        "normalization_policy": getattr(embedder, "normalization_policy", "none"),
+        "dtype": DTYPE,
+    }
+
+
 def verify_manifest(corpus: str | Path, embedder, provider: str) -> None:
     """Refuse loudly on a missing or mismatched manifest (gate F4).
+
+    Provider/model/revision/dimension/declared-policy/dtype are strict
+    identities. ``normalized`` is deliberately absent from that comparison:
+    it is a raw probe diagnostic, while CachedEmbedder's L2 policy is enforced
+    on every vector that reaches index or retrieval.
 
     Raises ManifestMissing / ManifestMismatch / ManifestCorrupt; callers on
     the CLI/serve boundary should catch these and exit with the message
@@ -154,9 +205,12 @@ def verify_manifest(corpus: str | Path, embedder, provider: str) -> None:
             f"current --embed-provider config, run once: "
             f"alexandria --corpus {corpus} index --backfill-manifest"
         )
-    fresh = compute_manifest(embedder, provider)
-    diffs = [f"{field}: index={on_disk.get(field)!r} current={fresh[field]!r}"
-              for field in IDENTITY_FIELDS if on_disk.get(field) != fresh[field]]
+    fresh = _current_compatibility(embedder, provider)
+    on_disk_policy = on_disk.get(
+        "normalization_policy", UNVERIFIED_LEGACY_NORMALIZATION_POLICY)
+    on_disk_identity = on_disk | {"normalization_policy": on_disk_policy}
+    diffs = [f"{field}: index={on_disk_identity.get(field)!r} current={fresh[field]!r}"
+              for field in IDENTITY_FIELDS if on_disk_identity.get(field) != fresh[field]]
     if diffs:
         raise ManifestMismatch(
             f"embedding config does not match the index manifest at "

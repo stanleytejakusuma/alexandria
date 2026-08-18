@@ -185,18 +185,24 @@ incomparable similarity scores: not a crash, not a visibly wrong answer, just qu
 degraded ranking.
 
 Fix: write an index manifest at index time recording **provider, model name, revision,
-embedding dimension, normalization, and dtype**, plus creation time. Both the CLI and
-`serve` verify it on open and refuse to proceed on mismatch. This is the precondition for
-gate S9, and therefore for safe remote hosting — without it there is nothing to compare
-against.
+embedding dimension, declared normalization policy, raw-probe normalization diagnostic,
+and dtype**, plus creation time. Both the CLI and `serve` verify the compatibility
+identity on open and refuse to proceed on a provider/model/revision/dimension/policy/dtype
+mismatch. This is the precondition for gate S9, and therefore for safe remote hosting —
+without it there is nothing to compare against.
 
 > Normalization and dtype are not padding. If one index stores L2-normalized vectors and
-> another stores raw ones, cosine and dot-product rankings silently diverge; if one is
-> float32 and another int8-quantized, distances are computed in different numeric spaces.
-> Both produce plausible-looking results that are quietly wrong — the exact class of
-> failure the manifest exists to prevent, so recording only the model name would leave
-> the door half open. Hardware non-determinism (CPU vs GPU low-bit differences) is *not*
-> recorded: it sits far below the ranking noise floor.
+> another stores raw ones, distance ranking silently diverges; if one is float32 and
+> another int8-quantized, distances are computed in different numeric spaces. Both
+> produce plausible-looking results that are quietly wrong. The policy is therefore a
+> strict identity, but it cannot safely be inferred from one floating-point probe:
+> CPU/GPU arithmetic can put the same backend on opposite sides of a tolerance.
+> `CachedEmbedder`, the production boundary used by indexing and retrieval, explicitly
+> L2-normalizes every finite, nonzero vector before returning or writing it. Its declared
+> `l2` policy is the safety proof; the probe's historical `normalized` boolean is retained
+> for diagnostics only. Old manifests without the policy remain readable, but their one
+> probe cannot prove every persisted vector used a wrapper; they fail closed as
+> `unverified_legacy` and require a rebuild before incremental mixing.
 
 ### 3.4 `cache_hit` metric correctness
 
@@ -617,8 +623,9 @@ Each gate is a test, not a claim.
 - **F3** `cache_hit` distinguishes query-cache hits from answer-path retrieval hits; a
   sub-10 ms fast-path hit is separable in the logs.
 - **F4** An index carries a manifest naming its embedding provider, model, revision,
-  dimension, normalization, and dtype; opening it with a mismatch on any of them fails
-  loudly instead of mixing vector spaces in one column. **A missing manifest — which is
+  dimension, declared normalization policy, probe diagnostic, and dtype; opening it with
+  a provider/model/revision/dimension/policy/dtype mismatch fails loudly instead of
+  mixing vector spaces in one column. **A missing manifest — which is
   the state of the existing 2.2 GB index today — must also refuse**, with a one-time
   backfill command provided; otherwise "absent" silently reads as "compatible" and the
   guard is inert exactly where it is first needed.

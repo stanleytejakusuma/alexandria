@@ -44,7 +44,12 @@ from .eval.history import append_run, compare, load_runs, regressions
 from .eval.metrics import by_overlap_band
 from .eval.runner import EvalReport, run_eval
 from .index.bm25 import BM25Index, searchable_text
-from .index.chunker import chunk_doc_records, chunk_document, is_indexable_source
+from .index.chunker import (
+    chunk_doc_records,
+    chunk_document,
+    is_appledouble_metadata,
+    is_indexable_source,
+)
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
 from .index.manifest import (ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest,
                              verify_manifest_for_write, write_manifest)
@@ -98,7 +103,11 @@ def cmd_lint(args) -> int:
     errors = checked = 0
     for path in sorted(corpus.rglob("*.md")):
         rel = path.relative_to(corpus)
-        if "_unparsed" in rel.parts or ".alexandria" in rel.parts or "inbox" == rel.parts[0]:
+        # This is an independent validation walk, but Finder's ``._`` sidecars
+        # have the same central metadata exclusion as indexing/health: they
+        # are not malformed corpus documents to report.
+        if ("_unparsed" in rel.parts or ".alexandria" in rel.parts
+                or "inbox" == rel.parts[0] or is_appledouble_metadata(rel)):
             continue
         try:
             doc = Doc.read(path, root=corpus)
