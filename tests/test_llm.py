@@ -224,3 +224,119 @@ def test_a_complete_response_is_returned_untouched(monkeypatch):
                                      "message": {"content": "full answer"}}]})
     monkeypatch.setattr(_llm, "_open_with_deadline", lambda req, timeout: body)
     assert LLMClient(base_url="http://x/v1", model="m")._once("s", "u") == "full answer"
+
+
+def test_a_stalling_gateway_cannot_exceed_the_total_call_budget(monkeypatch):
+    """#28: the per-attempt deadline is not the same as a bound on complete().
+
+    `_open_with_deadline` (2026-08-07) bounds ONE urlopen+read, so a single
+    silent stall costs one deadline. But complete() then retries it: with the
+    shipped defaults a fully stalled gateway burns
+    (max_retries + 1) x timeout = 5 x 120s of wall clock, plus backoff, for ONE
+    complete() call -- and a single /answer chains many of them (gather gap,
+    write, per-claim audits, two coverage graders). That is how a stalled
+    gateway still turns into a multi-hour request even though every individual
+    read was bounded. total_timeout caps the whole call, retries included.
+    """
+    slept = {"total": 0.0}
+    monkeypatch.setattr(time, "sleep", lambda s: slept.__setitem__("total", slept["total"] + s))
+
+    now = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+
+    def always_stalls(self, system, user, temperature=0.0):
+        now["t"] += self.timeout          # each attempt burns its full deadline
+        err = LLMError(f"urlopen+read exceeded {self.timeout}s deadline")
+        err.retryable = True
+        raise err
+
+    monkeypatch.setattr(LLMClient, "_once", always_stalls)
+
+    client = LLMClient(timeout=120, max_retries=4, base_delay=2.0, total_timeout=300)
+    with pytest.raises(LLMError) as exc:
+        client.complete("sys", "user", temperature=0.1)
+
+    assert "total budget" in str(exc.value)
+    assert now["t"] <= 300 + 120, (
+        f"call ran {now['t']}s against a 300s budget -- the aggregate cap did not hold")
+    assert now["t"] < 600, "budget did not stop the full 5-attempt retry cycle"
+
+
+def test_the_total_budget_does_not_interfere_with_a_healthy_call(monkeypatch):
+    """A bounded budget must not break the ordinary retry-then-succeed path."""
+    calls = {"n": 0}
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    def flaky(self, system, user, temperature=0.0):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            err = LLMError("HTTP 429: slow down"); err.retryable = True
+            raise err
+        return "ok"
+
+    monkeypatch.setattr(LLMClient, "_once", flaky)
+    assert LLMClient(base_delay=0.0).complete("sys", "user", temperature=0.1) == "ok"
+    assert calls["n"] == 3
+
+
+def test_total_timeout_defaults_to_a_bounded_multiple_of_the_attempt_deadline():
+    """The default must be finite: an unbounded default is the bug itself."""
+    client = LLMClient()
+    assert client.total_timeout is not None
+    assert 0 < client.total_timeout < client.timeout * (client.max_retries + 1)
+
+
+def test_budget_expiry_on_the_FINAL_attempt_still_reports_a_non_retryable_budget_error(monkeypatch):
+    """Red round 1 on #28: the flag contract broke exactly where it matters.
+
+    The budget check originally sat AFTER `attempt == self.max_retries: raise`,
+    so when the budget expired on the last attempt the escaping error was the
+    per-attempt RETRYABLE one, not the non-retryable budget error. The wall-clock
+    bound still held, but any wrapper trusting `retryable` would retry a call
+    that had already spent its whole budget -- nullifying the invariant in the
+    one case the flag exists to defend.
+    """
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    now = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+
+    def always_stalls(self, system, user, temperature=0.0):
+        now["t"] += self.timeout
+        err = LLMError(f"urlopen+read exceeded {self.timeout}s deadline")
+        err.retryable = True
+        raise err
+
+    monkeypatch.setattr(LLMClient, "_once", always_stalls)
+
+    # 2 retries x 100s = 300s: the budget lands exactly on the final attempt.
+    client = LLMClient(timeout=100, max_retries=2, base_delay=0.0, total_timeout=300)
+    with pytest.raises(LLMError) as exc:
+        client.complete("sys", "user", temperature=0.1)
+
+    assert "total budget" in str(exc.value)
+    assert getattr(exc.value, "retryable", False) is False, (
+        "a budget-exhausted call escaped as retryable -- a wrapper would retry it")
+
+
+def test_backoff_sleep_is_clamped_so_it_cannot_itself_overrun_the_budget(monkeypatch):
+    """The clamp was implemented but nothing pinned it (Red: silently removable)."""
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    now = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+
+    def stall_briefly(self, system, user, temperature=0.0):
+        now["t"] += 1.0
+        err = LLMError("stall"); err.retryable = True
+        raise err
+
+    monkeypatch.setattr(LLMClient, "_once", stall_briefly)
+
+    # base_delay 60s would dwarf the 5s budget if the clamp were removed.
+    client = LLMClient(timeout=1, max_retries=5, base_delay=60.0, total_timeout=5)
+    with pytest.raises(LLMError):
+        client.complete("sys", "user", temperature=0.1)
+
+    assert slept, "no backoff was attempted, so the clamp was never exercised"
+    for i, s in enumerate(slept):
+        assert s <= 5.0, f"backoff #{i} slept {s}s against a 5s total budget"

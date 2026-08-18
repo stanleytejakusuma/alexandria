@@ -61,6 +61,24 @@ class LLMClient:
     timeout: int = 120
     max_retries: int = 4
     base_delay: float = 2.0
+    # #28: `_open_with_deadline` bounds ONE urlopen+read, so a single silent
+    # stall costs one deadline -- but complete() retries it, so a fully stalled
+    # gateway still burns (max_retries + 1) * timeout plus backoff for ONE call,
+    # and a single /answer chains many calls (gather gap, write, per-claim
+    # audits, two coverage graders). That is how bounded reads still added up to
+    # a multi-hour request. This caps the WHOLE call, retries included. Chosen
+    # as ~2 attempt-deadlines: long enough that one slow-but-alive response plus
+    # a retry succeeds, short enough that a dead gateway fails in minutes.
+    # None disables the cap; 0 means "one attempt, then budget error" (not
+    # "disabled"). Two properties are deliberate, not oversights:
+    #  - a slow-but-alive attempt that SUCCEEDS past the budget is still
+    #    returned: the budget is enforced on the failure path only, so
+    #    `timeout` stays the binding constraint for a legitimately slow model;
+    #  - a call may overrun the budget by up to `timeout` (plus any
+    #    `min_interval` reserve wait), because abandoning an in-flight read is
+    #    worse than a bounded overrun -- it turns would-succeed responses into
+    #    guaranteed failures.
+    total_timeout: float | None = 300.0
     min_interval: float = 0.0     # floor between calls from one client; be a good citizen
     _last_call: float = field(default=0.0, repr=False)
     # Reserve rate-limit start slots and update diagnostic usage under small
@@ -107,20 +125,60 @@ class LLMClient:
                 f"Use a nonzero temperature or a different model.")
         system = self._with_cache_buster(system)
         last: Exception | None = None
+        started = time.monotonic()
         for attempt in range(self.max_retries + 1):
+            # Budget check at loop TOP so it dominates the last-attempt raise
+            # below: with the check only in the backoff path, a budget expiring
+            # on the FINAL attempt escaped as the per-attempt RETRYABLE error,
+            # and a wrapper trusting that flag would retry an already-spent call.
+            # Checking here also refuses to START an attempt with no budget left.
+            if attempt:
+                budget_error = self._budget_error(started, attempt, last)
+                if budget_error is not None:
+                    raise budget_error from last
             self._reserve_call_slot()
             try:
                 out = self._once(system, user, temperature)
                 return out
             except LLMError as exc:
                 last = exc
-                if not getattr(exc, "retryable", False) or attempt == self.max_retries:
+                if not getattr(exc, "retryable", False):
                     raise
+                if attempt == self.max_retries:
+                    # Retries are exhausted. If the budget is ALSO spent, say so
+                    # and make it non-retryable: otherwise a call that burned its
+                    # whole budget escapes as retryable and a wrapper retries it.
+                    raise self._budget_error(started, attempt + 1, exc) or exc
                 # Exponential backoff with full jitter: synchronized retries from a
                 # worker pool are how one rate limit becomes a thundering herd.
                 delay = self.base_delay * (2 ** attempt)
+                # Never sleep past the budget: a long jittered backoff must not
+                # be the thing that overruns it. The loop-top check then converts
+                # an exhausted budget into the non-retryable budget error.
+                elapsed = time.monotonic() - started
+                if self.total_timeout is not None:
+                    delay = min(delay, max(0.0, self.total_timeout - elapsed))
                 time.sleep(random.uniform(0, delay))
         raise last if last else LLMError("unreachable")
+
+    def _budget_error(self, started: float, attempts: int, last: Exception | None) -> "LLMError | None":
+        """The non-retryable error for a call that spent its whole budget, or None.
+
+        Shared by BOTH exits -- the loop-top check (refuse to start another
+        attempt) and retry exhaustion (the budget landed on the final attempt).
+        Covering only the first left the last-attempt path escaping as retryable,
+        which is precisely the case the flag exists to defend against.
+        """
+        if self.total_timeout is None:
+            return None
+        elapsed = time.monotonic() - started
+        if elapsed < self.total_timeout:
+            return None
+        err = LLMError(
+            f"call exceeded its {self.total_timeout:.0f}s total budget after "
+            f"{attempts} attempt(s) ({elapsed:.0f}s elapsed); last error: {last}")
+        err.retryable = False
+        return err
 
     def _reserve_call_slot(self) -> None:
         """Reserve one outbound-call start time without holding a network lock.
