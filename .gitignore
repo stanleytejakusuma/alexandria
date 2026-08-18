@@ -32,3 +32,6 @@ build/
 
 # A worktree .venv is a symlink; the trailing-slash form above does not match one.
 .venv
+
+# Local agent handoff notes -- operational state, never part of the engine repo
+.claude/
