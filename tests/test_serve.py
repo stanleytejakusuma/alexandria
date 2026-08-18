@@ -755,3 +755,29 @@ def test_health_stays_a_liveness_probe_during_a_rebuild_instead_of_flapping_503(
         tcp_server.server_close()
         for server in uds_servers:
             server.server_close()
+
+
+def test_health_exposes_the_drain_heartbeat_so_a_monitor_can_watch_the_async_half(tmp_path, monkeypatch):
+    """`remember` is a two-stage write; /health must make stage 2 observable.
+
+    Without this, the only evidence the promotion drain still runs is a user's
+    entry going visibly late -- i.e. the monitor fires after the damage. The
+    heartbeat age is reported directly, alongside the interval it should be
+    compared against, so a caller needs no hardcoded threshold.
+    """
+    from alexandria import serve as serve_mod
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    try:
+        status, raw, _ = serve_mod.dispatch(ctx, "test", "GET", "/health", b"")
+        payload = json.loads(raw)
+        assert status == 200
+        assert "drain_heartbeat_age_seconds" in payload
+        assert payload["drain_interval_seconds"] == 600
+        age = payload["drain_heartbeat_age_seconds"]
+        assert age is None or age >= 0
+    finally:
+        tcp_server.server_close()
+        for server in uds_servers:
+            server.server_close()

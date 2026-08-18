@@ -46,6 +46,11 @@ STATE_FILE = "liveness.json"
 DEFAULT_DRAIN_INTERVAL_SECONDS = 600.0
 WARN_MULTIPLE = 2.0
 
+# How many drain intervals may pass with NO completed cycle before the drain is
+# reported dead. 3 tolerates a skipped tick (lock contention) plus jitter while
+# still catching a genuinely dead thread inside ~30 min at the default interval.
+STALE_CYCLES = 3.0
+
 
 def _state_path(corpus: str | Path) -> Path:
     return Path(corpus).expanduser() / ".alexandria" / STATE_FILE
@@ -105,10 +110,73 @@ def check(corpus: str | Path, *, drain_interval: float = DEFAULT_DRAIN_INTERVAL_
         return LivenessCheck(
             True, f"{state_path} does not exist -- fail closed", age, False)
     try:
-        json.loads(state_path.read_text())
+        state = json.loads(state_path.read_text())
     except (OSError, ValueError):
         return LivenessCheck(
             True, f"{state_path} exists but could not be parsed -- fail closed",
             age, True)
 
+    # HEARTBEAT: the pending-age check above only fires once real user data is
+    # already late, so a drain thread that died silently stayed invisible for as
+    # long as the queue happened to be empty -- which is most of the time. The
+    # asynchronous half writes last_success_at on EVERY completed cycle (a cycle
+    # that found nothing is still a datapoint), so the age of that stamp is a
+    # direct liveness signal for the drain itself, independent of the workload.
+    #
+    # STALE_CYCLES, not 1: promote_pending records no success when it skips on
+    # lock contention (W5), so an ordinary index run legitimately costs a tick.
+    # Alarming on a single miss would train operators to ignore this line -- the
+    # same cry-wolf failure reconcile deliberately avoids.
+    stamp = state.get("last_success_at")
+    heartbeat_age = _heartbeat_age(stamp, state_path)
+    if heartbeat_age is None:
+        return LivenessCheck(
+            True,
+            f"{state_path} has no readable last_success_at -- cannot confirm the "
+            f"drain has run; fail closed", age, True)
+    if heartbeat_age > STALE_CYCLES * drain_interval:
+        return LivenessCheck(
+            True,
+            f"no completed drain cycle for {heartbeat_age:.0f}s (> {STALE_CYCLES:.0f}x "
+            f"the {drain_interval:.0f}s interval) -- the promotion drain looks dead, "
+            f"so `remember` writes will stay unsearchable; restart `alexandria serve` "
+            f"or run `alexandria promote`", age, True)
+
     return LivenessCheck(False, "", age, True)
+
+
+def heartbeat_age(corpus: str | Path) -> float | None:
+    """Seconds since the drain last completed a cycle, or None if unknown.
+
+    Public counterpart to the internal check: /health exposes this so a monitor
+    can watch the asynchronous half directly rather than inferring its health
+    from how late user data happens to be.
+    """
+    path = _state_path(Path(corpus).expanduser())
+    try:
+        stamp = json.loads(path.read_text()).get("last_success_at")
+    except (OSError, ValueError):
+        stamp = None
+        if not path.exists():
+            return None
+    return _heartbeat_age(stamp, path)
+
+
+def _heartbeat_age(stamp: object, state_path: Path) -> float | None:
+    """Seconds since the last completed cycle, or None if undeterminable.
+
+    Prefers the recorded timestamp; falls back to the file mtime, because a
+    heartbeat whose CONTENT is unreadable but whose file is being rewritten is
+    still evidence the drain is running. Returns None only when neither source
+    can be read -- the caller fails closed on that.
+    """
+    if isinstance(stamp, str):
+        try:
+            recorded = time.mktime(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+            return max(0.0, time.time() - recorded)
+        except (ValueError, OverflowError):
+            pass
+    try:
+        return max(0.0, time.time() - state_path.stat().st_mtime)
+    except OSError:
+        return None

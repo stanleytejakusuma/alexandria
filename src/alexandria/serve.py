@@ -279,6 +279,11 @@ def _health_payload(ctx: ServeContext) -> dict:
         "liveness_stale": live.stale,
         "liveness_reason": live.reason,
         "oldest_pending_age_seconds": live.oldest_pending_age_seconds,
+        # The asynchronous half, made observable: seconds since the drain last
+        # COMPLETED a cycle. A monitor can alert on this directly instead of
+        # waiting for a user's `remember` to age out and become visibly late.
+        "drain_heartbeat_age_seconds": liveness.heartbeat_age(ctx.corpus),
+        "drain_interval_seconds": liveness.DEFAULT_DRAIN_INTERVAL_SECONDS,
     }
 
 
