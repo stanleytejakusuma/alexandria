@@ -317,3 +317,61 @@ def test_index_read_lock_excludes_a_writer_for_the_whole_read_epoch(tmp_path):
         assert not writer.acquire(), "writer entered while a reader held the shared epoch lock"
     assert writer.acquire(), "writer did not resume after the reader released its snapshot"
     writer.release()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="flock contract is POSIX-only")
+def test_rebuild_mutates_projections_in_place_so_warm_handles_stay_valid(tmp_path, monkeypatch):
+    """Red round 2, condition 2: pin the file-identity assumption explicitly.
+
+    The reader fence is safe partly BECAUSE a rebuild mutates the same files:
+    BM25's long-lived connection pins an open-file description, so an in-place
+    DELETE+refill is visible to it, while a write-temp-and-rename refactor
+    would leave a warm server reading the OLD inode's lexical rows against the
+    NEW dense vectors -- permanently, silently, with the marker cleared and the
+    shared epoch held. That failure is invisible to every other test, so the
+    assumption is pinned here rather than left as a comment.
+    """
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nledger reconciliation runs nightly\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    fts = corpus / ".alexandria" / "index" / "fts.sqlite"
+    before = fts.stat()
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    after = fts.stat()
+
+    assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), (
+        "--rebuild replaced the lexical projection file instead of mutating it; "
+        "a warm server's open connection would now serve a superseded inode")
+    assert not (corpus / ".alexandria" / "index" / ".rebuild-in-progress").exists(), (
+        "a successful rebuild must clear its durable marker")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="flock contract is POSIX-only")
+def test_reader_rides_out_a_brief_promote_but_still_refuses_a_long_writer(tmp_path):
+    """The reader's wait absorbs a drain; it must never wait out a rebuild."""
+    from alexandria.writelock import IndexReadUnavailable, index_read_lock
+
+    holder = write_lock(tmp_path)
+    assert holder.acquire()
+
+    def release_soon():
+        time.sleep(0.1)
+        holder.release()
+
+    threading.Thread(target=release_soon, daemon=True).start()
+    with index_read_lock(tmp_path, retry_for=2.0):
+        pass  # rode out the brief writer instead of refusing
+
+    long_writer = write_lock(tmp_path)
+    assert long_writer.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(IndexReadUnavailable, match="writer"):
+            index_read_lock(tmp_path, retry_for=0.2).acquire()
+        assert time.monotonic() - started < 2.0, "reader waited far past its bound"
+    finally:
+        long_writer.release()

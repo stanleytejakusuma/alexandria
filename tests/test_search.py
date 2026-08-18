@@ -348,49 +348,82 @@ def test_search_refuses_a_live_writer_or_interrupted_rebuild_before_touching_ret
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")
-def test_warm_engine_reads_both_legs_inside_one_epoch_and_still_sees_new_writes(tmp_path):
-    """Coherence must come from the SH epoch, never from pinning stale handles.
+def test_both_retrieval_legs_execute_while_the_shared_epoch_is_actually_held(tmp_path):
+    """Probe the span, do not narrate it.
 
-    Red proposed refusing a warm engine whose bound generation moved on. That
-    premise is false here and the "fix" would be a serve-killing regression:
-    ``VectorStore.search_vector`` calls ``_open_table()`` per query and BM25
-    reads a live connection, so both legs pick up committed data on every
-    search -- which is exactly why the long-lived server sees externally
-    indexed content (test_serve.py S4, the regression 500cd9e fixed).
+    Red round 2, condition 1: asserting only that both legs *ran* proves
+    nothing about whether they ran *under* the shared epoch -- a refactor
+    moving either leg (or hydration) outside the `with` block would keep the
+    suite green while un-fencing the exact interleaving this design exists to
+    prevent. So each leg actively probes the corpus write lock and must find it
+    unavailable, which is the mirror of the rerank probe that must find it free.
+    """
+    from alexandria.writelock import write_lock
 
-    The real invariant is therefore two-sided, and this pins both halves:
-    (a) both legs are read inside ONE shared epoch, so no writer can interleave
-        a drop between them, and
-    (b) after that epoch ends, a new search observes new data rather than a
-        frozen snapshot.
+    seen: dict[str, bool] = {}
+    engine = build_engine(tmp_path)
+    real_dense, real_lexical = engine.store.search_vector, engine.bm25.search
+
+    def probe(name, fn):
+        def wrapper(*args, **kwargs):
+            writer = write_lock(tmp_path)
+            admitted = writer.acquire()
+            if admitted:
+                writer.release()
+            seen[name] = admitted
+            return fn(*args, **kwargs)
+        return wrapper
+
+    engine.store.search_vector = probe("dense", real_dense)
+    engine.bm25.search = probe("lexical", real_lexical)
+
+    assert engine.search("sweep page lint")
+    assert seen == {"dense": False, "lexical": False}, (
+        f"a retrieval leg ran OUTSIDE the shared epoch (writer was admitted): {seen}")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")
+def test_warm_engine_still_sees_new_writes_after_an_external_epoch_completes(tmp_path):
+    """Coherence must come from the epoch, never from pinning stale handles.
+
+    Red round 1 proposed refusing a warm engine whose bound generation drifted.
+    That premise is false here and the "fix" would be a serve-killing
+    regression: ``VectorStore.search_vector`` re-opens its table per query and
+    BM25 reads a live connection, which is exactly why the long-lived server
+    sees externally indexed content (test_serve.py S4, regression 500cd9e).
     """
     from alexandria.cache import write_index_generation
 
     engine = build_engine(tmp_path)
-    legs: list[str] = []
-    real_dense, real_lexical = engine.store.search_vector, engine.bm25.search
-
-    def watched_dense(*args, **kwargs):
-        legs.append("dense")
-        return real_dense(*args, **kwargs)
-
-    def watched_lexical(*args, **kwargs):
-        legs.append("lexical")
-        return real_lexical(*args, **kwargs)
-
-    engine.store.search_vector = watched_dense
-    engine.bm25.search = watched_lexical
-
-    # (a) Both legs ran, and they ran while this process held the shared epoch:
-    # a writer attempting EX mid-search would have been excluded by construction.
     assert engine.search("sweep page lint")
-    assert set(legs) == {"dense", "lexical"}
-
-    # (b) A completed external epoch bump does not freeze the warm engine out.
     write_index_generation(tmp_path)
     assert engine.search("sweep page lint"), (
         "a warm engine must keep serving after an external index run completes -- "
         "refusing on generation drift would break the S4 warm-server contract")
+
+
+def test_warm_engine_query_cache_cannot_replay_a_superseded_generation(tmp_path):
+    """Red round 2, condition 2: the surviving epoch-fusion channel.
+
+    If the generation used to key the query cache were captured at construction
+    rather than re-read per call, a warm engine would take a clean shared epoch
+    after a completed rebuild, see no marker, rebuild the SAME pre-rebuild cache
+    key, and replay stale results against the new corpus for the cache TTL --
+    fully "inside a coherent epoch" and invisible to every other test here.
+    """
+    from alexandria.cache import QueryCache, write_index_generation
+
+    engine = build_engine(tmp_path)
+    engine.query_cache = QueryCache(tmp_path)
+    first = engine.search("sweep page lint")
+    assert first
+    assert engine.search("sweep page lint")[0].trace.get("cache_hit") is True
+
+    write_index_generation(tmp_path)  # an external rebuild completed
+
+    replayed = engine.search("sweep page lint")
+    assert replayed[0].trace.get("cache_hit") is not True, (
+        "the warm engine replayed a cache entry keyed to a superseded generation")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")

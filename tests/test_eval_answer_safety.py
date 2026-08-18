@@ -322,3 +322,37 @@ def test_run_answer_threads_prompt_version_into_its_pipeline_cache_fingerprint()
     supplied = {keyword.arg: keyword.value.id for keyword in calls[0].keywords
                 if isinstance(keyword.value, ast.Name)}
     assert supplied["prompt_version"] == "prompt_version"
+
+
+def test_answer_cache_key_is_computed_once_and_reused_for_get_and_put():
+    """Red round 2, condition 3: a re-read at PUT would poison the cache.
+
+    If the key (which embeds the corpus generation) were recomputed after
+    synthesis, this interleaving poisons it: retrieval runs against generation
+    G, an external rebuild completes during a slow LLM synthesis, and the PUT
+    then files G-epoch evidence under the G+1 key -- replayed to every later
+    caller for the TTL. The defence is structural: read the generation once,
+    build the key once, reuse that exact name at both get() and put().
+    """
+    import ast
+    import inspect
+    from alexandria import cli
+
+    tree = ast.parse(inspect.getsource(cli.run_answer))
+    assigns = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", None) == "rkey" for t in n.targets)]
+    assert len(assigns) == 1, "the response-cache key must be built exactly once"
+
+    gen_reads = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", None) == "read_index_generation"]
+    assert len(gen_reads) == 1, "the generation must be sampled once, before retrieval"
+
+    calls = {n.func.attr: n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and getattr(n.func.value, "id", None) == "response_cache"}
+    for name in ("get", "put"):
+        assert name in calls, f"response_cache.{name} disappeared"
+        assert any(getattr(a, "id", None) == "rkey" for a in calls[name].args), (
+            f"response_cache.{name} no longer uses the single precomputed key")

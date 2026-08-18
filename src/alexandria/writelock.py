@@ -59,6 +59,11 @@ DEFAULT_LOCK_TIMEOUT = 30.0
 # a core busy-waiting on lock files that are typically held for seconds.
 _POLL_INTERVAL = 0.05
 
+# How long a READER rides out a writer before refusing. Deliberately ~2 orders
+# of magnitude below DEFAULT_LOCK_TIMEOUT: it exists only to absorb a routine
+# promote/drain (a few hundred ms), never to wait out a rebuild.
+DEFAULT_READ_RETRY = 0.25
+
 # fs types known to make flock unreliable-to-no-op. Anything NOT in this set is
 # treated as local -- deliberately permissive on unknown/unusual types (e.g. a
 # CI runner's overlay fs) rather than blocking every filesystem this wasn't
@@ -264,10 +269,12 @@ class IndexReadLock:
     after an in-place ``drop()`` where no process still owns the flock.
     """
 
-    def __init__(self, corpus: str | Path, *, check_filesystem: bool = True) -> None:
+    def __init__(self, corpus: str | Path, *, check_filesystem: bool = True,
+                 retry_for: float = DEFAULT_READ_RETRY) -> None:
         self.corpus = Path(corpus).expanduser()
         self.path = self.corpus / ".alexandria" / "index" / ".write.lock"
         self._check_filesystem = check_filesystem
+        self.retry_for = retry_for
         self._fh = None
 
     def acquire(self) -> None:
@@ -278,12 +285,22 @@ class IndexReadLock:
                 "index rebuild is in progress or was interrupted; retry after a successful rebuild")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(self.path, "a+")
-        try:
-            fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except OSError as exc:
-            fh.close()
-            raise IndexReadUnavailable(
-                "index writer is active; retry after the current mutation completes") from exc
+        # Short bounded retry, NOT the writer's 30s wait. A promote/drain holds
+        # the lock for a few hundred ms, so riding that out turns a spurious
+        # refusal into a normal answer; a real rebuild runs for minutes, where
+        # waiting would only convert a fast, actionable "retry" into a hang.
+        deadline = time.monotonic() + self.retry_for
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    fh.close()
+                    raise IndexReadUnavailable(
+                        "index writer is active; retry after the current mutation "
+                        "completes") from exc
+                time.sleep(_POLL_INTERVAL)
         # A writer creates the marker only while holding EX. Recheck after SH
         # acquisition so a prior crashed rebuild cannot slip through a stale
         # pre-lock observation. Holding SH proves no live EX holder exists, so a
@@ -314,8 +331,9 @@ class IndexReadLock:
         self.release()
 
 
-def index_read_lock(corpus: str | Path, *, check_filesystem: bool = True) -> IndexReadLock:
-    return IndexReadLock(corpus, check_filesystem=check_filesystem)
+def index_read_lock(corpus: str | Path, *, check_filesystem: bool = True,
+                    retry_for: float = DEFAULT_READ_RETRY) -> IndexReadLock:
+    return IndexReadLock(corpus, check_filesystem=check_filesystem, retry_for=retry_for)
 
 
 def write_lock(corpus: str | Path, *, check_filesystem: bool = True) -> WriteLock:
