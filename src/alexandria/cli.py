@@ -969,6 +969,8 @@ class AnswerOutcome:
     cached: bool = False
     error: str | None = None
     failed_claims: list = None  # type: ignore[assignment]
+    # #48: True when this text is a write-stage draft no judge ever saw.
+    salvaged: bool = False
 
 
 
@@ -1064,6 +1066,27 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
     )
     total_ms = int((time.time() - _t_answer0) * 1000)
     logger = AuditLogger(corpus)
+
+    # #48 salvage: the write stage finished but the budget died before any
+    # judge saw the draft. This is a DISTINCT outcome, not a variant of the
+    # success path: emitted stays FALSE (nothing was verified or emitted to
+    # disk) with an explicit salvaged flag, and it is NEVER written to the
+    # response cache -- an unaudited draft replayed as a full answer would be
+    # worse than no answer. Branch FIRST, before any result.repair access.
+    if getattr(result, "budget_exhausted", False) and result.salvaged_page is not None:
+        draft = result.salvaged_page
+        if writer.last_usage:
+            engine.logger.log_usage(query_id=answer_id, model=llm_model, **writer.last_usage)
+        logger.answer(query=question, total_ms=total_ms, emitted=False,
+                      model=llm_model, n_claims=len(draft.claims),
+                      error="budget exhausted: UNAUDITED draft (no judge ran)",
+                      stages=getattr(result, "timings_ms", {}),
+                      caller=caller, user=user,
+                      trace={"salvaged": True}, id=answer_id)
+        return AnswerOutcome(False, draft.text, len(draft.claims), answer_id,
+                             error="budget exhausted: unaudited draft",
+                             salvaged=True)
+
     verdict = getattr(result.repair, "verdict", None)
     failed_ids = list(getattr(verdict, "failed_claim_ids", ()) or ())
     page = getattr(result.repair, "page", None)
@@ -1116,6 +1139,15 @@ def cmd_answer(args) -> int:
     if outcome.cached:
         print("[cached] " + outcome.text)
         return 0
+    if getattr(outcome, "salvaged", False):
+        # Distinct, NONZERO status: a caller checking only the exit code must
+        # not mistake an unverified draft for a real answer. The draft is still
+        # printed -- it may contain useful work -- but the status says "partial".
+        print("answer: BUDGET EXHAUSTED -- verification incomplete; draft below "
+              "was NOT approved by any judge. Do not treat as verified.",
+              file=sys.stderr)
+        print(outcome.text)
+        return 4
     if not outcome.emitted:
         print("answer: synthesis failed its native checks; no page emitted.",
               file=sys.stderr)

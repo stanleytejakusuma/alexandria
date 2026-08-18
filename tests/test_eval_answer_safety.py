@@ -501,3 +501,118 @@ def test_a_budget_exhausted_answer_never_reaches_the_response_cache(monkeypatch,
         )
 
     assert puts == [], "a budget-exhausted answer was written to the response cache"
+
+
+def test_a_SALVAGED_answer_is_returned_but_never_emitted_or_cached(monkeypatch, tmp_path):
+    """#48 / Red: a salvaged draft must not replay as a full answer.
+
+    The whole tenancy exemption for answer_timeout now rests on this line: a
+    low-budget unverified draft, cached under a key that omits the budget,
+    would replay to a default-budget request as if it were a verified answer.
+    So the rule is structural: salvage returns text, but never reaches put(),
+    and emitted stays false so no consumer conflates it with a real answer.
+    """
+    from alexandria import cli
+    from alexandria.synthesis.pipeline import PipelineResult
+    from alexandria.synthesis.write import SynthesisPage
+
+    puts = []
+    monkeypatch.setattr(cli.ResponseCache, "put",
+                        lambda self, key, value: puts.append(key), raising=False)
+    monkeypatch.setattr(cli, "_answer_retrieval_fingerprint",
+                        lambda engine: {"fake": True}, raising=False)
+
+    draft = SynthesisPage(topic_query="q", text="Unaudited draft text.",
+                          claims=(), author="synthesis-sweep@writer@v1", skip_log=())
+    result = PipelineResult(
+        gathered=None, repair=None, emitted=False, page_path=None, skip_log_path=None,
+        timings_ms={}, budget_exhausted=True, salvaged_page=draft)
+    import alexandria.synthesis.pipeline as pipeline_mod
+
+    # run_pipeline is imported INSIDE run_answer, so patch at its source module.
+    monkeypatch.setattr(pipeline_mod, "run_pipeline",
+                        lambda *a, **k: result, raising=False)
+
+    class FakeEngine:
+        embedder = type("E", (), {"name": "hash-24"})()
+        reranker = type("R", (), {"model_name": "fake", "half_precision": True})()
+        config = type("C", (), {"prefetch": 8, "top_k": 5, "rrf_k": 60, "wiki_boost": 1.25})()
+        logger = type("L", (), {"log_usage": lambda self, **kw: None})()
+
+    out = cli.run_answer(
+        cli.AppConfig(corpus_path=tmp_path), tmp_path, "q",
+        engine=FakeEngine(), k=5, llm_model="m",
+        grader_a_model="a", grader_b_model="b",
+        base_url=None, api_key_env=None, prompt_version="v1",
+    )
+
+    assert out.emitted is False, (
+        "salvage must NOT reuse the success signal -- a consumer checking "
+        "emitted would treat an unverified draft as a real answer")
+    assert out.salvaged is True
+    assert out.text is not None and "Unaudited draft text." in out.text
+    assert puts == [], "a salvaged, unaudited draft was written to the response cache"
+
+
+def test_cli_reports_SALVAGE_with_a_nonzero_exit_while_still_printing_the_draft(tmp_path, monkeypatch, capsys):
+    """Red round 3: exit code must not look like success, even though text prints."""
+    from alexandria import cli
+    from alexandria.synthesis.pipeline import PipelineResult
+    from alexandria.synthesis.write import SynthesisPage
+
+    import alexandria.synthesis.pipeline as pipeline_mod
+
+    draft = SynthesisPage(topic_query="q", text="Draft text.", claims=(),
+                          author="synthesis-sweep@writer@v1", skip_log=())
+    result = PipelineResult(
+        gathered=None, repair=None, emitted=False, page_path=None, skip_log_path=None,
+        timings_ms={}, budget_exhausted=True, salvaged_page=draft)
+    monkeypatch.setattr(pipeline_mod, "run_pipeline", lambda *a, **k: result, raising=False)
+    monkeypatch.setattr(cli, "_build_search_engine",
+                        lambda *a, **k: type("E", (), {
+                            "embedder": type("E", (), {"name": "x"})(),
+                            "reranker": type("R", (), {"model_name": "x", "half_precision": True})(),
+                            "config": type("C", (), {"prefetch": 8, "top_k": 5, "rrf_k": 60,
+                                                     "wiki_boost": 1.25})(),
+                            "logger": type("L", (), {"log_usage": lambda self, **kw: None})(),
+                            "search": lambda *a, **k: []})(), raising=False)
+    monkeypatch.setattr(cli, "read_index_generation", lambda *a: 1, raising=False)
+
+    code = cli.cmd_answer(cli.build_parser().parse_args(
+        ["--corpus", str(tmp_path), "answer", "q"]))
+
+    assert code == 4, "salvage must exit nonzero so status-only callers see partial"
+    captured = capsys.readouterr()
+    assert "verification incomplete" in captured.err
+    assert "Draft text." in captured.out
+
+
+def test_serve_reports_SALVAGE_as_503_with_emitted_false(tmp_path, monkeypatch):
+    """Red round 3: the HTTP status must not look like a verified 200 answer."""
+    from alexandria import serve as serve_mod
+    from alexandria.cli import AnswerOutcome
+
+    ctx = type("Ctx", (), {
+        "config": None, "corpus": tmp_path, "engine": None,
+        "locked_engine": None, "embedder": None, "store": None, "lexical": None,
+        "engine_lock": None, "started_monotonic": 0.0,
+        "llm_defaults": {"base_url": None, "api_key_env": None, "llm_model": "m",
+                         "grader_a_model": "a", "grader_b_model": "b",
+                         "prompt_version": "v1", "answer_timeout": ""},
+    })()
+    from alexandria import cli as cli_mod
+
+    # serve's _handle_answer does `from .cli import run_answer`, so patch the
+    # SOURCE module, not serve_mod.run_answer -- the local-import trap again.
+    monkeypatch.setattr(cli_mod, "run_answer", lambda *a, **k: AnswerOutcome(
+        False, "Draft text.", 1, "id-1", error="budget exhausted: unaudited draft",
+        salvaged=True), raising=False)
+
+    status, raw, _ = serve_mod.dispatch(ctx, "test", "POST", "/answer",
+                                        b'{"question":"q"}')
+    payload = json.loads(raw)["error"]
+
+    assert status == 503, "salvage must be a non-2xx so HTTP-status callers see partial"
+    assert payload["emitted"] is False
+    assert payload["salvaged"] is True
+    assert payload["text"] == "Draft text."

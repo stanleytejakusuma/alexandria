@@ -11,6 +11,7 @@ from pathlib import Path
 from ..corpus import render, slugify
 from .gather import GatherResult, gather
 from .repair import RepairResult, repair_until_done
+from ..llm import BudgetExhausted
 from .write import SynthesisPage, write_page
 
 __all__ = ["PipelineResult", "run_pipeline"]
@@ -19,11 +20,15 @@ __all__ = ["PipelineResult", "run_pipeline"]
 @dataclass(frozen=True)
 class PipelineResult:
     gathered: GatherResult
-    repair: RepairResult
+    repair: RepairResult | None          # None when the budget died before judgement
     emitted: bool
     page_path: Path | None
     skip_log_path: Path | None
     timings_ms: dict[str, int] = field(default_factory=dict)
+    # #48 partial-result salvage: when the request budget died DURING judging,
+    # the write stage's draft is returned instead of being thrown away.
+    budget_exhausted: bool = False
+    salvaged_page: SynthesisPage | None = None
 
 
 # Stage mapping for the audit trail: the user-visible names are
@@ -59,10 +64,22 @@ def run_pipeline(engine, topic_query: str, *, gather_llm, writer_llm, repair_llm
     page, timings["augment"] = _timed(
         write_page, gathered, topic_query, llm=writer_llm, model=writer_model,
         prompt_version=prompt_version)
-    repair, timings["generate"] = _timed(
-        repair_until_done, gathered, page, repair_llm=repair_llm,
-        audit_llm=audit_llm, coverage_llm_a=coverage_llm_a,
-        coverage_llm_b=coverage_llm_b, audit_concurrency=audit_concurrency)
+    try:
+        repair, timings["generate"] = _timed(
+            repair_until_done, gathered, page, repair_llm=repair_llm,
+            audit_llm=audit_llm, coverage_llm_a=coverage_llm_a,
+            coverage_llm_b=coverage_llm_b, audit_concurrency=audit_concurrency)
+    except BudgetExhausted as exc:
+        if getattr(exc, "scope", "call") == "request":
+            # The write stage completed, so a draft exists -- but verification
+            # was incomplete (one or more judge/repair calls may have run).
+            # Salvage it, clearly marked, and do NOT emit to disk: a page that
+            # was never approved must not enter a wiki/corpus. (A budget death
+            # during gather/write propagates normally: no draft to salvage.)
+            return PipelineResult(
+                gathered, None, False, None, None, timings,
+                budget_exhausted=True, salvaged_page=page)
+        raise
     if not repair.passed:
         return PipelineResult(gathered, repair, False, None, None, timings)
     page_path, skip_log_path = _emit(repair.page, corpus_root)

@@ -503,3 +503,68 @@ def test_a_single_slow_CALL_does_not_abort_an_answer_that_still_has_request_budg
 
     assert not verdict.passes, "unjudged claims must not silently pass"
     assert verdict.failed_claim_ids, "a call-scope expiry stays a per-claim failure"
+
+
+class _OutOfTimeClient:
+    """A client whose request budget expires on its first audit call."""
+
+    def complete(self, system, user, temperature=0.0):
+        from alexandria.llm import BudgetExhausted
+        raise BudgetExhausted("request budget exhausted (900s) after 1 attempt(s)",
+                              scope="request")
+
+
+def test_pipeline_salvages_a_written_but_unjudged_page_on_request_budget_exhaustion(tmp_path):
+    """#48: 890s of work must not be thrown away at 900s.
+
+    If write_page completed but the budget died during judging, the draft
+    exists and is worth returning -- clearly marked as never audited. It must
+    NOT be emitted to disk: an unaudited page must not enter a wiki/corpus.
+    """
+    from alexandria.llm import BudgetExhausted
+
+    engine = FakeEngine({"topic": [Result("sources/a#1", "sources/a", "Supported evidence.")]})
+    result = run_pipeline(
+        engine, "topic",
+        gather_llm=ScriptedClient([json.dumps({"queries": []})]),
+        writer_llm=ScriptedClient([_page("Unaudited draft.", [{
+            "text": "Draft claim.",
+            "citations": [{"doc_id": "sources/a", "chunk_id": "sources/a#1"}],
+        }])]),
+        repair_llm=ScriptedClient([]),
+        audit_llm=_OutOfTimeClient(),           # request budget dies mid-judge
+        coverage_llm_a=ScriptedClient([]),
+        coverage_llm_b=ScriptedClient([]),
+        corpus_root=tmp_path,
+        writer_model="writer-model",
+        prompt_version="v2",
+    )
+
+    assert result.budget_exhausted is True
+    assert result.salvaged_page is not None
+    assert "Unaudited draft." in result.salvaged_page.text
+    assert result.emitted is False, "a salvaged draft is not a published page"
+    assert result.page_path is None
+    assert not (tmp_path / "wiki").exists(), "salvage must not emit an unaudited page to disk"
+
+
+def test_pipeline_propagates_when_the_budget_dies_before_any_draft_exists(tmp_path):
+    """Nothing to salvage if the writer never ran -- propagating is correct."""
+    from alexandria.llm import BudgetExhausted
+
+    class OutOfTimeGather:
+        def complete(self, system, user, temperature=0.0):
+            raise BudgetExhausted("request budget exhausted (900s)", scope="request")
+
+    with pytest.raises(BudgetExhausted):
+        run_pipeline(
+            FakeEngine({"topic": [Result("sources/a#1", "sources/a", "E")]}),
+            "topic",
+            gather_llm=OutOfTimeGather(),
+            writer_llm=ScriptedClient([]),
+            repair_llm=ScriptedClient([]),
+            audit_llm=ScriptedClient([]),
+            coverage_llm_a=ScriptedClient([]),
+            coverage_llm_b=ScriptedClient([]),
+            corpus_root=tmp_path,
+        )

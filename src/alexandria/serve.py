@@ -239,7 +239,7 @@ def start_drain(ctx: ServeContext, *,
     return stop
 
 
-def _json_error(status: int, message: str) -> tuple[int, bytes, str]:
+def _json_error(status: int, message: object) -> tuple[int, bytes, str]:
     return status, json.dumps({"error": message}).encode(), "application/json"
 
 
@@ -384,6 +384,15 @@ def _handle_answer(ctx: ServeContext, identity: str, payload: dict) -> tuple[int
         # a "caller"/"user" field in the request is not honored here.
         caller=identity, user=identity,
     )
+    if getattr(outcome, "salvaged", False):
+        # #48 distinct branch: the draft exists but verification was incomplete.
+        # A dedicated 503 (not 200) keeps the status signal honest for callers
+        # that check only the HTTP code; the draft rides along because it may
+        # contain useful work, but salvaged:true says do not treat as verified.
+        return _json_error(503, {"emitted": False, "salvaged": True,
+                                 "text": outcome.text, "n_claims": outcome.n_claims,
+                                 "error": outcome.error,
+                                 "answer_id": outcome.answer_id})
     if not outcome.emitted:
         return _json_ok(422, {"emitted": False, "error": outcome.error,
                               "failed_claims": outcome.failed_claims or [],
