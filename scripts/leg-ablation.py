@@ -22,9 +22,12 @@ significant: a leg whose removal moves MRR without moving recall cannot be
 distinguished from noise at n=49, so that case is reported, not gated.
 
 READ-ONLY. Builds nothing, appends nothing to eval history, and disables the
-query logger so the corpus's demand-report query log is not polluted. It skips
-(exit 0) when the private corpus/golden/index is absent, exactly like
-eval-gate.py, so a clean clone or CI box is never blocked.
+query logger and result cache so the corpus's demand-report query log is not
+polluted. It opens the embedding cache read-only: cached query vectors may be
+used, but a missing vector is computed without creating or changing the cache
+or its SQLite sidecars. It skips (exit 0) when the private corpus/golden/index
+is absent, exactly like eval-gate.py, so a clean clone or CI box is never
+blocked.
 
 WEEKLY, NOT PRE-COMMIT. Each amputated pass is a full golden-set scoring
 (~60-90s), so this belongs in the weekly loop, not .git/hooks/pre-commit.
@@ -131,7 +134,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     config = load_config(corpus_override=str(corpus))
-    engine = _build_search_engine(config, corpus, query_cache=False, client="leg-ablation")
+    engine = _build_search_engine(
+        config, corpus, query_cache=False, embedding_cache_read_only=True, client="leg-ablation")
 
     baseline = _score(engine, entries)
 

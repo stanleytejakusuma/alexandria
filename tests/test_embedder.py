@@ -1,8 +1,9 @@
 """Embedders are deterministic offline in tests and cache model work by content."""
 
+import sqlite3
 from pathlib import Path
 
-from alexandria.index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder
+from alexandria.index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, QUERY_PREFIX
 
 
 class CountingEmbedder:
@@ -147,3 +148,131 @@ def test_query_and_document_cache_entries_never_collide(tmp_path: Path):
     embedder.embed(["same text"])
     embedder.embed_queries(["same text"])
     assert len(provider.calls) == 2          # both computed, no false cache hit
+
+
+def test_read_only_embedding_cache_miss_does_not_create_a_missing_cache(tmp_path: Path):
+    """A read-only evaluation may calculate a query miss but must leave no cache.
+
+    This is the ablation query path (``embed_queries``), not merely a document
+    embedding unit test: the intentionally absent parent directory proves that
+    opening the cache did not create its directory, database, or SQLite sidecars.
+    """
+    provider = CountingEmbedder()
+    cache_path = tmp_path / "corpus" / ".alexandria" / "cache" / "embeddings.sqlite"
+
+    embedder = CachedEmbedder(provider, cache_path, read_only=True)
+    vectors = embedder.embed_queries(["uncached ablation query"])
+
+    assert vectors == [[float(len(f"{QUERY_PREFIX}uncached ablation query")), 0.0, 1.0]]
+    assert provider.calls == [[f"{QUERY_PREFIX}uncached ablation query"]]
+    assert embedder.last_cache_stats == {"hits": 0, "misses": 1}
+    assert not cache_path.exists()
+    assert not cache_path.parent.exists()
+    assert list(cache_path.parent.parent.glob("embeddings.sqlite-*")) == []
+
+
+def test_read_only_embedding_cache_without_a_table_computes_without_repairing_it(tmp_path: Path):
+    """A malformed/old cache database is a miss, not an invitation to create its table."""
+    cache_path = tmp_path / "cache" / "embeddings.sqlite"
+    cache_path.parent.mkdir()
+    with sqlite3.connect(cache_path) as connection:
+        connection.execute("CREATE TABLE unrelated (value TEXT)")
+        connection.execute("INSERT INTO unrelated VALUES ('keep')")
+    before_bytes = cache_path.read_bytes()
+    before_mtime_ns = cache_path.stat().st_mtime_ns
+
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, cache_path, read_only=True)
+    assert embedder.embed_queries(["missing schema query"])
+
+    assert provider.calls == [[f"{QUERY_PREFIX}missing schema query"]]
+    assert cache_path.read_bytes() == before_bytes
+    assert cache_path.stat().st_mtime_ns == before_mtime_ns
+    with sqlite3.connect(f"{cache_path.resolve().as_uri()}?mode=ro&immutable=1", uri=True) as connection:
+        assert connection.execute("SELECT value FROM unrelated").fetchall() == [("keep",)]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embeddings'"
+        ).fetchone()[0] == 0
+
+
+def test_read_only_embedding_cache_uses_hits_without_mutating_existing_cache(tmp_path: Path):
+    """A hit and a miss leave the existing cache byte-for-byte unchanged.
+
+    The immutable SQLite URI is important here: a plain ``mode=ro`` connection
+    can create ``-wal``/``-shm`` sidecars merely by reading a WAL database.
+    """
+    cache_path = tmp_path / "corpus" / ".alexandria" / "cache" / "embeddings.sqlite"
+    seed = CachedEmbedder(CountingEmbedder(), cache_path)
+    seeded_vector = seed.embed_queries(["cached ablation query"])[0]
+    seed._connection.close()
+    assert list(cache_path.parent.glob("embeddings.sqlite-*")) == []
+
+    before_bytes = cache_path.read_bytes()
+    before_mtime_ns = cache_path.stat().st_mtime_ns
+    cache_uri = f"{cache_path.resolve().as_uri()}?mode=ro&immutable=1"
+    with sqlite3.connect(cache_uri, uri=True) as connection:
+        before_rows = connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, cache_path, read_only=True)
+    vectors = embedder.embed_queries(["cached ablation query", "uncached ablation query"])
+
+    assert vectors[0] == seeded_vector
+    assert provider.calls == [[f"{QUERY_PREFIX}uncached ablation query"]]
+    assert embedder.last_cache_stats == {"hits": 1, "misses": 1}
+    assert cache_path.read_bytes() == before_bytes
+    assert cache_path.stat().st_mtime_ns == before_mtime_ns
+    with sqlite3.connect(cache_uri, uri=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == before_rows
+    assert list(cache_path.parent.glob("embeddings.sqlite-*")) == []
+
+
+
+def test_read_only_cache_survives_an_ablation_like_search_query_flow(tmp_path: Path):
+    """Hybrid query flow computes an uncached query without touching cache bytes.
+
+    The synthetic vector and lexical indexes are prepared before the snapshot;
+    the only cache this query path receives is a read-only ``CachedEmbedder``.
+    """
+    from alexandria.index.bm25 import BM25Index
+    from alexandria.index.store import VectorStore
+    from alexandria.retrieval.rerank import IdentityReranker
+    from alexandria.retrieval.search import SearchConfig, SearchEngine
+
+    corpus = tmp_path / "corpus"
+    cache_path = corpus / ".alexandria" / "cache" / "embeddings.sqlite"
+    writer = CachedEmbedder(CountingEmbedder(), cache_path)
+    writer.embed_queries(["cached evaluation query"])
+    writer._connection.close()
+    before_bytes = cache_path.read_bytes()
+    before_mtime_ns = cache_path.stat().st_mtime_ns
+    with sqlite3.connect(f"{cache_path.resolve().as_uri()}?mode=ro&immutable=1", uri=True) as connection:
+        before_rows = connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+
+    document_embedder = HashEmbedder(dim=3)
+    rows = [{
+        "chunk_id": "sources/a", "doc_id": "sources/a", "text": "evaluation query evidence",
+        "heading_path": "Evidence", "vector": document_embedder.embed(["evidence"])[0],
+        "type": "observation", "project": None, "status": "active", "source": "test",
+        "tags": [], "entities": [], "layer": "sources", "generated_at": None,
+        "enrichment": None, "kind": None, "parent_doc": None, "target_chunk": None,
+    }]
+    store = VectorStore(corpus / ".alexandria" / "index")
+    store.upsert(rows)
+    bm25 = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+    bm25.index(rows)
+
+    provider = CountingEmbedder()
+    engine = SearchEngine(
+        CachedEmbedder(provider, cache_path, read_only=True), store, bm25,
+        IdentityReranker(), SearchConfig(prefetch=1, top_k=1), logger=None, query_cache=None,
+    )
+    engine.search("cached evaluation query")
+    engine.search("uncached evaluation query")
+
+    assert provider.calls == [[f"{QUERY_PREFIX}uncached evaluation query"]]
+    assert cache_path.read_bytes() == before_bytes
+    assert cache_path.stat().st_mtime_ns == before_mtime_ns
+    with sqlite3.connect(f"{cache_path.resolve().as_uri()}?mode=ro&immutable=1", uri=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == before_rows
+    assert list(cache_path.parent.glob("embeddings.sqlite-*")) == []

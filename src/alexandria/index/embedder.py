@@ -216,24 +216,49 @@ class MLXEmbedder:
 class CachedEmbedder:
     """Cache embeddings by ``sha256(model_name + '\\n' + text)``.
 
-    Cache entries are durable across interrupted index runs. Corrupt values are
-    ignored and overwritten by a fresh provider call instead of breaking search.
+    Normal mode keeps entries durable across interrupted index runs; corrupt
+    values are ignored and overwritten by a fresh provider call. ``read_only``
+    mode uses an existing cache for hits, computes misses without persisting
+    them, and never creates a cache file, parent directory, or SQLite sidecar.
     """
 
     def __init__(self, provider: Embedder, cache_path: str | Path, *, progress_every: int = 250,
-                 progress_stream=None, on_progress: Callable[[dict], None] | None = None) -> None:
+                 progress_stream=None, on_progress: Callable[[dict], None] | None = None,
+                 read_only: bool = False) -> None:
         self.provider = provider
         self.cache_path = Path(cache_path)
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.cache_path, check_same_thread=False)
-        # See index/bm25.py §3.1: wait for a concurrent writer instead of raising
-        # "database is locked" immediately.
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute(
-            "CREATE TABLE IF NOT EXISTS embeddings (cache_key TEXT PRIMARY KEY, vector TEXT NOT NULL)"
-        )
-        self._connection.commit()
+        self.read_only = read_only
+        self._connection: sqlite3.Connection | None
+        if read_only:
+            # ``mode=ro`` alone can create ``-wal``/``-shm`` sidecars while reading
+            # a WAL database. ``immutable=1`` prevents those writes as well as DDL
+            # and INSERTs. It is safe for this short-lived evaluation reader: it may
+            # use an older cache snapshot if a normal indexing writer races it, which
+            # only turns a would-be hit into a computed (never persisted) miss.
+            if self.cache_path.is_file():
+                uri = f"{self.cache_path.resolve().as_uri()}?mode=ro&immutable=1"
+                try:
+                    self._connection = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                    self._connection.execute("PRAGMA busy_timeout=5000")
+                except sqlite3.Error:
+                    # A cache can disappear between is_file() and connect while an
+                    # indexer rotates it. Fall back to uncached computation rather
+                    # than creating or repairing anything in this read-only path.
+                    self._connection = None
+            else:
+                # Do not create cache directories or a SQLite database just to read.
+                self._connection = None
+        else:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(self.cache_path, check_same_thread=False)
+            # See index/bm25.py §3.1: wait for a concurrent writer instead of raising
+            # "database is locked" immediately.
+            self._connection.execute("PRAGMA busy_timeout=5000")
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS embeddings (cache_key TEXT PRIMARY KEY, vector TEXT NOT NULL)"
+            )
+            self._connection.commit()
         self._lock = Lock()
         self.progress_every = max(1, progress_every)
         self.progress_stream = progress_stream or sys.stderr
@@ -285,14 +310,16 @@ class CachedEmbedder:
             with self._lock:
                 for (key, (_, indexes)), vector in zip(missing, produced, strict=True):
                     clean = [float(value) for value in vector]
-                    self._connection.execute(
-                        "INSERT INTO embeddings(cache_key, vector) VALUES(?, ?) "
-                        "ON CONFLICT(cache_key) DO UPDATE SET vector=excluded.vector",
-                        (key, json.dumps(clean, separators=(",", ":"))),
-                    )
+                    if self._connection is not None and not self.read_only:
+                        self._connection.execute(
+                            "INSERT INTO embeddings(cache_key, vector) VALUES(?, ?) "
+                            "ON CONFLICT(cache_key) DO UPDATE SET vector=excluded.vector",
+                            (key, json.dumps(clean, separators=(",", ":"))),
+                        )
                     for index in indexes:
                         vectors[index] = clean
-                self._connection.commit()
+                if self._connection is not None and not self.read_only:
+                    self._connection.commit()
         self.last_cache_stats = {"hits": hits, "misses": len(texts) - hits}
         self._report_progress(len(texts), started)
         return [vector for vector in vectors if vector is not None]
@@ -309,9 +336,16 @@ class CachedEmbedder:
         ).hexdigest()
 
     def _read(self, key: str) -> list[float] | None:
-        row = self._connection.execute(
-            "SELECT vector FROM embeddings WHERE cache_key = ?", (key,)
-        ).fetchone()
+        if self._connection is None:
+            return None
+        try:
+            row = self._connection.execute(
+                "SELECT vector FROM embeddings WHERE cache_key = ?", (key,)
+            ).fetchone()
+        except sqlite3.Error:
+            # A read-only evaluator must not repair a missing/corrupt schema. Treat
+            # it like any other cache miss and calculate the vector without writing.
+            return None
         if row is None:
             return None
         try:

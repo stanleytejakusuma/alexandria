@@ -1243,14 +1243,15 @@ def _require_index(corpus: Path) -> None:
 
 
 def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True,
-                         corpus_root: Path | None = None, client: str = "cli") -> SearchEngine:
+                         corpus_root: Path | None = None, client: str = "cli",
+                         embedding_cache_read_only: bool = False) -> SearchEngine:
     _require_index(corpus)
     # §7: every invocation performs the liveness check and prints one line to
     # stderr if stale -- never raises, never blocks results (gate W7).
     live = liveness.check(corpus)
     if live.stale:
         print(f"alexandria: stale -- {live.reason}", file=sys.stderr)
-    embedder = _cached_embedder(config, corpus)
+    embedder = _cached_embedder(config, corpus, read_only=embedding_cache_read_only)
     try:
         verify_manifest(corpus, embedder, config.embed_provider)
     except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
@@ -1269,7 +1270,8 @@ def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = Tr
     )
 
 
-def _cached_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
+def _cached_embedder(config: AppConfig, corpus: Path, *, read_only: bool = False) -> CachedEmbedder:
+    """Build the shared embedding cache; read-only callers never create or mutate it."""
     if config.embed_provider == "hash":
         provider = HashEmbedder()
     elif config.embed_provider == "mlx":
@@ -1280,7 +1282,7 @@ def _cached_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
     else:
         provider = LocalEmbedder(config.embed_model, config.embed_batch_size)
     return CachedEmbedder(provider, corpus / ".alexandria" / "cache" / "embeddings.sqlite",
-                          progress_every=config.index_progress_every)
+                          progress_every=config.index_progress_every, read_only=read_only)
 
 
 def _load_chunk_records(corpus: Path, config: AppConfig, limit: int, workers: int) -> tuple[list[dict], list[str]]:
