@@ -148,7 +148,13 @@ class LLMClient:
                     # Retries are exhausted. If the budget is ALSO spent, say so
                     # and make it non-retryable: otherwise a call that burned its
                     # whole budget escapes as retryable and a wrapper retries it.
-                    raise self._budget_error(started, attempt + 1, exc) or exc
+                    # Explicit assign-check-raise rather than `x or exc`: it does
+                    # not depend on LLMError never defining __bool__, and it lets
+                    # the budget error name its direct cause like the loop-top exit.
+                    budget_error = self._budget_error(started, attempt + 1, exc)
+                    if budget_error is not None:
+                        raise budget_error from exc
+                    raise
                 # Exponential backoff with full jitter: synchronized retries from a
                 # worker pool are how one rate limit becomes a thundering herd.
                 delay = self.base_delay * (2 ** attempt)

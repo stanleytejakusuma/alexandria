@@ -1,5 +1,6 @@
 """Retry/backoff: be a good citizen against a shared, rate-limited endpoint."""
 
+import random
 import re
 import time
 import pytest
@@ -322,6 +323,9 @@ def test_backoff_sleep_is_clamped_so_it_cannot_itself_overrun_the_budget(monkeyp
     """The clamp was implemented but nothing pinned it (Red: silently removable)."""
     slept: list[float] = []
     monkeypatch.setattr(time, "sleep", slept.append)
+    # Pin the jitter to its UPPER bound: with random draws, a removed clamp could
+    # still pass by luck. Asserting the max draw is clamped is strictly stronger.
+    monkeypatch.setattr(random, "uniform", lambda a, b: b)
     now = {"t": 0.0}
     monkeypatch.setattr(time, "monotonic", lambda: now["t"])
 
@@ -340,3 +344,29 @@ def test_backoff_sleep_is_clamped_so_it_cannot_itself_overrun_the_budget(monkeyp
     assert slept, "no backoff was attempted, so the clamp was never exercised"
     for i, s in enumerate(slept):
         assert s <= 5.0, f"backoff #{i} slept {s}s against a 5s total budget"
+
+
+def test_total_timeout_zero_means_one_attempt_then_a_budget_error(monkeypatch):
+    """0 is 'one attempt then budget error', NOT 'disabled' -- None disables.
+
+    Implemented via the `if attempt:` guard at the loop top; a future
+    simplification dropping that guard would refuse the FIRST attempt and report
+    "after 0 attempt(s); last error: None". Pin the documented contract.
+    """
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def stalls(self, system, user, temperature=0.0):
+        calls["n"] += 1
+        err = LLMError("stall"); err.retryable = True
+        raise err
+
+    monkeypatch.setattr(LLMClient, "_once", stalls)
+
+    client = LLMClient(max_retries=3, base_delay=0.0, total_timeout=0)
+    with pytest.raises(LLMError) as exc:
+        client.complete("sys", "user", temperature=0.1)
+
+    assert calls["n"] == 1, "a zero budget must still permit exactly one attempt"
+    assert "total budget" in str(exc.value)
+    assert getattr(exc.value, "retryable", False) is False
