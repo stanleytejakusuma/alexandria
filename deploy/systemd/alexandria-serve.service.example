@@ -1,0 +1,71 @@
+# Generic example only — do not install or commit a site-specific copy here.
+#
+# This example contains no remote address, corpus location, gateway setting,
+# executable location, credential ciphertext, or credential value. Create and review
+# a private site-specific unit outside this repository. The unit must be root-owned
+# and not writable by group/other. Do not use a user unit without a separate design.
+#
+# The application is the sole plaintext reader. It reads the fixed credential name
+# from $CREDENTIALS_DIRECTORY itself and never exports it as an environment variable.
+# Do NOT add Environment=ALEXANDRIA_LLM_KEY=..., EnvironmentFile=, PassEnvironment=,
+# SetCredential=, SetCredentialEncrypted=, a shell wrapper, or a credential path/value
+# to ExecStart=. The only permitted credential source is the named system credential
+# directive below.
+
+[Unit]
+Description=Alexandria serve (credential-isolated example)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alexandria-svc
+Group=alexandria-svc
+StateDirectory=alexandria
+
+# The encrypted blob is installed by an authorized human system administrator in the
+# protected system credential store. systemd 252 decrypts/authenticates it at service
+# activation and provides only the plaintext file named below to this unit.
+LoadCredentialEncrypted=alexandria-llm-key
+
+# Replace only in private operator material with an absolute path to the installed
+# Alexandria executable. Do not use /bin/sh, bash -c, a wrapper, substitutions, or
+# an argument that contains a credential. Site-specific non-secret options require
+# separate review against the hardening profile.
+ExecStart=<absolute-path-to-alexandria> serve
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Defense in depth. Confirm the target's systemd 252 accepts these and make only
+# minimal private allow-list adjustments for reviewed corpus/state paths. Do not
+# weaken the profile merely to make an unknown path work.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+
+# DynamicUser is intentionally NOT enabled in this first migration: service-account,
+# corpus/state, tunnel, and socket ownership/ACLs must be reconciled explicitly.
+# StateDirectory is the only writable managed location. Add no ReadWritePaths= here;
+# any additional private path must be separately justified and reviewed.
+
+[Install]
+WantedBy=multi-user.target

@@ -27,6 +27,7 @@ from .auditlog import AuditLogger, audit_summary
 from .cache import (
     QueryCache,
     ResponseCache,
+    answer_pipeline_fingerprint,
     read_index_generation,
     write_index_generation,
 )
@@ -43,7 +44,12 @@ from .eval.history import append_run, compare, load_runs, regressions
 from .eval.metrics import by_overlap_band
 from .eval.runner import EvalReport, run_eval
 from .index.bm25 import BM25Index, searchable_text
-from .index.chunker import chunk_doc_records, chunk_document, is_indexable_source
+from .index.chunker import (
+    chunk_doc_records,
+    chunk_document,
+    is_appledouble_metadata,
+    is_indexable_source,
+)
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
 from .index.manifest import (ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest,
                              verify_manifest_for_write, write_manifest)
@@ -59,7 +65,30 @@ from .reconcile import reconcile_inbox
 from .retrieval.rerank import CrossEncoderReranker
 from .retrieval.search import SearchConfig, SearchEngine
 from .schema import Severity, validate
-from .writelock import DEFAULT_LOCK_TIMEOUT, write_lock
+from .synthesis.gather import MAX_FOLLOW_UP_QUERIES
+from .synthesis.judge import MAX_AUDIT_CONCURRENCY
+from .writelock import (DEFAULT_LOCK_TIMEOUT, IndexReadUnavailable, index_read_lock,
+                        rebuild_marker, write_lock)
+
+
+def _bounded_non_negative_int(value: str, *, maximum: int) -> int:
+    """Argparse converter for a bounded count whose zero is meaningful."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 0 <= parsed <= maximum:
+        raise argparse.ArgumentTypeError(f"must be between 0 and {maximum}")
+    return parsed
+
+
+def _follow_up_query_count(value: str) -> int:
+    return _bounded_non_negative_int(value, maximum=MAX_FOLLOW_UP_QUERIES)
+
+
+def _audit_concurrency_count(value: str) -> int:
+    return _bounded_non_negative_int(value, maximum=MAX_AUDIT_CONCURRENCY)
+
 
 def cmd_migrate(args) -> int:
     report = migrate_kg_sync(args.vault, args.corpus, dry_run=args.dry_run)
@@ -75,7 +104,11 @@ def cmd_lint(args) -> int:
     errors = checked = 0
     for path in sorted(corpus.rglob("*.md")):
         rel = path.relative_to(corpus)
-        if "_unparsed" in rel.parts or ".alexandria" in rel.parts or "inbox" == rel.parts[0]:
+        # This is an independent validation walk, but Finder's ``._`` sidecars
+        # have the same central metadata exclusion as indexing/health: they
+        # are not malformed corpus documents to report.
+        if ("_unparsed" in rel.parts or ".alexandria" in rel.parts
+                or "inbox" == rel.parts[0] or is_appledouble_metadata(rel)):
             continue
         try:
             doc = Doc.read(path, root=corpus)
@@ -342,14 +375,13 @@ def cmd_promote(args) -> int:
     try:
         result = promote_pending(corpus, config, embedder, store, lexical)
     except ManifestMissing as exc:
-        # A corpus indexed before manifests existed has vectors but no manifest,
-        # so the write guard refuses. That is correct, but a bare traceback does
-        # not tell the operator the one-command way out.
+        # A corpus indexed before the declared L2 policy has stored vectors
+        # whose representation cannot be proven. The guard is intentional; do
+        # not offer an assertion-only escape hatch over a non-empty store.
         raise SystemExit(
             f"alexandria: {exc}\n"
-            "  this index predates the manifest, so its embedding provider cannot be\n"
-            "  verified. If you are certain --embed-provider matches what built it:\n"
-            "    alexandria --corpus <path> index --backfill-manifest") from exc
+            "  this index predates declared normalization policy and must be rebuilt:\n"
+            "    alexandria --corpus <path> index --rebuild") from exc
     if result.skipped_locked:
         print("promote: write lock held by another process, skipped this run")
         return 0
@@ -622,23 +654,11 @@ def cmd_index(args) -> int:
     """Chunk, embed, and persist the corpus in deterministic batches."""
     config = _config_for(args)
     corpus = config.corpus_path
-    if getattr(args, "backfill_manifest", False):
-        # SPEC F4 one-time backfill: an index built before manifests existed
-        # has no way to (re)derive which model produced its vectors from the
-        # vectors themselves, so this trusts the operator's assertion that
-        # --embed-provider matches what was actually used, without paying to
-        # re-embed the whole corpus.
-        embedder = _cached_embedder(config, corpus)
-        manifest = write_manifest(corpus, embedder, config.embed_provider)
-        print(f"index: manifest backfilled -> provider={manifest['provider']} "
-              f"model={manifest['model']} dim={manifest['dim']} "
-              f"normalized={manifest['normalized']} dtype={manifest['dtype']}")
-        return 0
 
     # BACKLOG #50: promote_pending is the only other writer of the FTS/vector
     # tables this command drops and rebuilds (--rebuild) or otherwise writes
-    # into. Neither `write_lock()`'s LOCK_NB default nor cmd_index taking no
-    # lock at all excludes the other -- a promote (CLI, or serve's 600s drain)
+    # into. `promote_pending` uses non-blocking acquisition while this command
+    # waits for the same lock -- so a promote (CLI, or serve's 600s drain)
     # can land its FTS insert after this run's chunk-record snapshot is taken
     # but before --rebuild's lexical.drop() wipes the table, which then never
     # gets that promote's row back (the rebuild only re-adds the pre-drop
@@ -666,6 +686,26 @@ def cmd_index(args) -> int:
 
 def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
     """The body of `index`, run while BACKLOG #50's write lock is held."""
+    if getattr(args, "backfill_manifest", False):
+        # A pre-policy manifest cannot establish that every persisted vector
+        # crossed CachedEmbedder's L2 boundary. Never relabel non-empty legacy
+        # storage as l2 by operator assertion: rebuild is the only safe migration.
+        # Empty storage has no vector representation to attest, so it may receive
+        # an initial manifest for a new writer.
+        store = VectorStore(corpus / ".alexandria" / "index")
+        if store.count() != 0:
+            raise SystemExit(
+                "alexandria: refusing to backfill normalization policy over a non-empty "
+                "legacy index; its stored vectors cannot be proven L2-normalized. "
+                "Rebuild explicitly: alexandria --corpus "
+                f"{corpus} index --rebuild")
+        embedder = _cached_embedder(config, corpus)
+        manifest = write_manifest(corpus, embedder, config.embed_provider)
+        print(f"index: manifest backfilled -> provider={manifest['provider']} "
+              f"model={manifest['model']} dim={manifest['dim']} "
+              f"normalized={manifest['normalized']} dtype={manifest['dtype']}")
+        return 0
+
     records, errors = _load_chunk_records(corpus, config, args.limit, args.workers)
     for error in errors:
         print(f"skip: {error}", file=sys.stderr)
@@ -945,10 +985,31 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
     from .llm import LLMClient
     from .synthesis.pipeline import run_pipeline
 
+    if (not isinstance(max_follow_up_queries, int) or isinstance(max_follow_up_queries, bool)
+            or not 0 <= max_follow_up_queries <= MAX_FOLLOW_UP_QUERIES):
+        raise ValueError(
+            f"max_follow_up_queries must be between 0 and {MAX_FOLLOW_UP_QUERIES}")
+    if (not isinstance(audit_concurrency, int) or isinstance(audit_concurrency, bool)
+            or not 0 <= audit_concurrency <= MAX_AUDIT_CONCURRENCY):
+        raise ValueError(
+            f"audit_concurrency must be between 0 and {MAX_AUDIT_CONCURRENCY}")
     answer_id = str(uuid.uuid4())
     response_cache = ResponseCache(corpus)
     generation = read_index_generation(corpus)
-    rkey = response_cache.key(question, llm_model, k, prompt_version, generation)
+    # These settings change either evidence selection (follow-ups) or which
+    # page passes the native judges. They are answer semantics, not diagnostics.
+    answer_pipeline = answer_pipeline_fingerprint(
+        grader_a_model=grader_a_model,
+        grader_b_model=grader_b_model,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        retrieval=_answer_retrieval_fingerprint(engine),
+        prompt_version=prompt_version,
+        max_follow_up_queries=max_follow_up_queries,
+        audit_concurrency=audit_concurrency,
+    )
+    rkey = response_cache.key(question, llm_model, k, prompt_version, generation,
+                              pipeline=answer_pipeline)
 
     # RESPONSE CACHE: a previously-emitted answer for the same question/model
     # config is replayed verbatim (TTL 7d); the pipeline is skipped entirely.
@@ -1043,6 +1104,26 @@ def cmd_answer(args) -> int:
     return 0
 
 
+def _answer_retrieval_fingerprint(engine) -> dict[str, object]:
+    """Stable retrieval policy that determines the evidence an answer sees."""
+    config = getattr(engine, "config", None)
+    reranker = getattr(engine, "reranker", None)
+    return {
+        "embedder": str(getattr(getattr(engine, "embedder", None), "name", "unknown")),
+        "reranker": {
+            "model": str(getattr(reranker, "model_name", type(reranker).__name__)),
+            "half_precision": getattr(reranker, "half_precision", None),
+        },
+        "search": {
+            "depth": getattr(config, "depth", None),
+            "prefetch": getattr(config, "prefetch", None),
+            "top_k": getattr(config, "top_k", None),
+            "rrf_k": getattr(config, "rrf_k", None),
+            "wiki_boost": getattr(config, "wiki_boost", None),
+        },
+    }
+
+
 def _answer_trace(result) -> dict:
     """The route one answer took: retrieval rounds -> augmentation pool ->
     synthesis outcome. Stored in the audit row so the route can be mapped."""
@@ -1088,7 +1169,10 @@ def cmd_wiki_site(args) -> int:
 
 
 def _rebuild_marker(corpus: Path) -> Path:
-    return corpus / ".alexandria" / "index" / ".rebuild-in-progress"
+    # Compatibility shim for internal callers/tests. One shared lock module owns
+    # the durable marker path so retrieval and mutation cannot drift apart.
+    from .writelock import rebuild_marker
+    return rebuild_marker(corpus)
 
 
 def cmd_eval(args) -> int:
@@ -1126,7 +1210,10 @@ def cmd_eval(args) -> int:
                   + ", ".join(target_errors), file=sys.stderr)
         return 2
 
-    engine = _build_search_engine(config, corpus)
+    # Quality evaluation must observe present retrieval, not replay cached
+    # results from before a ranking/config regression. Normal search keeps its
+    # query cache; this is an evaluation-only isolation boundary.
+    engine = _build_search_engine(config, corpus, query_cache=False)
     report = run_eval(engine, entries, k_override=args.k)
 
     # Negative cases (BACKLOG #21): queries the corpus cannot answer. Without
@@ -1243,14 +1330,39 @@ def _require_index(corpus: Path) -> None:
 
 
 def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = True,
-                         corpus_root: Path | None = None, client: str = "cli") -> SearchEngine:
+                         corpus_root: Path | None = None, client: str = "cli",
+                         embedding_cache_read_only: bool = False) -> SearchEngine:
+    # A rebuild writes its durable marker *before* dropping either projection.
+    # Check it before `_require_index`: after drop, the old "never indexed"
+    # error would otherwise hide a live/crashed writer and invite bad recovery.
+    if rebuild_marker(corpus).exists():
+        raise IndexReadUnavailable(
+            "index rebuild is in progress or was interrupted; retry after a successful rebuild")
     _require_index(corpus)
+    # Deliberately NOT holding the shared epoch lock across construction.
+    # Construction binds no epoch: `VectorStore.search_vector` re-opens its
+    # table per query and BM25 reads a live connection, so coherence is a
+    # property of each search's own SH epoch, not of when the engine was built.
+    # Locking here only added an outage -- `serve` (and every CLI read) would
+    # refuse to start while an ordinary promote/drain held the writer lock for
+    # a few seconds, which test_a_lock_skipped_drain_cycle_records_no_liveness_success
+    # pins as required behavior. The durable marker above is the construction-time
+    # guard, because a rebuild that has already dropped a projection leaves an
+    # index no amount of waiting makes readable.
+    return _build_search_engine_unlocked(
+        config, corpus, query_cache=query_cache, corpus_root=corpus_root,
+        client=client, embedding_cache_read_only=embedding_cache_read_only)
+
+
+def _build_search_engine_unlocked(config: AppConfig, corpus: Path, query_cache: bool = True,
+                                  corpus_root: Path | None = None, client: str = "cli",
+                                  embedding_cache_read_only: bool = False) -> SearchEngine:
     # §7: every invocation performs the liveness check and prints one line to
     # stderr if stale -- never raises, never blocks results (gate W7).
     live = liveness.check(corpus)
     if live.stale:
         print(f"alexandria: stale -- {live.reason}", file=sys.stderr)
-    embedder = _cached_embedder(config, corpus)
+    embedder = _cached_embedder(config, corpus, read_only=embedding_cache_read_only)
     try:
         verify_manifest(corpus, embedder, config.embed_provider)
     except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
@@ -1269,7 +1381,8 @@ def _build_search_engine(config: AppConfig, corpus: Path, query_cache: bool = Tr
     )
 
 
-def _cached_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
+def _cached_embedder(config: AppConfig, corpus: Path, *, read_only: bool = False) -> CachedEmbedder:
+    """Build the shared embedding cache; read-only callers never create or mutate it."""
     if config.embed_provider == "hash":
         provider = HashEmbedder()
     elif config.embed_provider == "mlx":
@@ -1280,7 +1393,7 @@ def _cached_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
     else:
         provider = LocalEmbedder(config.embed_model, config.embed_batch_size)
     return CachedEmbedder(provider, corpus / ".alexandria" / "cache" / "embeddings.sqlite",
-                          progress_every=config.index_progress_every)
+                          progress_every=config.index_progress_every, read_only=read_only)
 
 
 def _load_chunk_records(corpus: Path, config: AppConfig, limit: int, workers: int) -> tuple[list[dict], list[str]]:
@@ -1493,10 +1606,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="gather/write/repair model (the measurement-proven config)")
     answer.add_argument("--grader-a-model", default="deepseek-v4-flash")
     answer.add_argument("--grader-b-model", default="deepseek-v4-flash")
-    answer.add_argument("--max-follow-up-queries", type=int, default=2,
-                        help="cap on gap-detector follow-up searches per answer")
-    answer.add_argument("--audit-concurrency", type=int, default=4,
-                        help="parallel per-claim entailment graders (1 = sequential)")
+    answer.add_argument("--max-follow-up-queries", type=_follow_up_query_count, default=2,
+                        help=f"follow-up cap, 0..{MAX_FOLLOW_UP_QUERIES} (0 disables follow-ups)")
+    answer.add_argument("--audit-concurrency", type=_audit_concurrency_count, default=4,
+                        help=f"grader workers, 0..{MAX_AUDIT_CONCURRENCY} (0 or 1 = sequential)")
     answer.add_argument("--prompt-version", default="v1")
     answer.add_argument("--caller", default=os.environ.get("ALEXANDRIA_CALLER", "cli"),
                        help="UNVERIFIED tool label recorded in the audit trail; not an identity")
@@ -1527,9 +1640,24 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Deliberate, actionable exit code for "the index is momentarily unreadable"
+# -- distinct from 1 (the command ran and failed) and 2 (bad input/unusable
+# golden set), so a caller can retry rather than treat it as a hard error.
+EXIT_INDEX_UNAVAILABLE = 3
+
+
 def app(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except IndexReadUnavailable as exc:
+        # Engine CONSTRUCTION reads the index too, so this must be caught for
+        # the whole command, not just around the query call: catching narrowly
+        # left `search`/`answer` raising an uncaught RuntimeError (exit 1 plus a
+        # traceback) whenever a rebuild was already running at startup. One
+        # boundary here also covers every future read verb by default.
+        print(f"alexandria: index unavailable -- {exc}", file=sys.stderr)
+        return EXIT_INDEX_UNAVAILABLE
 
 
 if __name__ == "__main__":

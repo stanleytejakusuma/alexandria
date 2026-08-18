@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+from .index.chunker import is_appledouble_metadata
+
 __all__ = ["render_markdown", "render_site"]
 
 _CSS = """
@@ -180,7 +182,9 @@ def render_site(wiki_dir: Path, out_dir: Path, audit_dir: Path | None = None) ->
     out.mkdir(parents=True, exist_ok=True)
     (out / "pages").mkdir(exist_ok=True)
 
-    pages = sorted(wiki.rglob("*.md"))
+    # AppleDouble sidecars are Finder metadata, not wiki pages. Reuse the
+    # central final-basename rule used by corpus indexing/lint/health.
+    pages = sorted(page for page in wiki.rglob("*.md") if not is_appledouble_metadata(page))
     entries: list[tuple[str, str, str]] = []  # (slug, title, html)
     for page in pages:
         slug = str(page.relative_to(wiki))[:-3].replace("/", "-")

@@ -63,6 +63,12 @@ class LLMClient:
     base_delay: float = 2.0
     min_interval: float = 0.0     # floor between calls from one client; be a good citizen
     _last_call: float = field(default=0.0, repr=False)
+    # Reserve rate-limit start slots and update diagnostic usage under small
+    # critical sections. Network I/O deliberately remains outside these locks.
+    _rate_limit_lock: threading.Lock = field(default_factory=threading.Lock,
+                                              init=False, repr=False)
+    _usage_lock: threading.Lock = field(default_factory=threading.Lock,
+                                        init=False, repr=False)
     # Prompt-cache accounting: the gateway decides actual prompt-cache hits
     # (OpenRouter/Anthropic cache billing is server-side); we record what we
     # see so the audit trail can show prompt-token drift. Populated by _once.
@@ -102,17 +108,12 @@ class LLMClient:
         system = self._with_cache_buster(system)
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
-            if self.min_interval:
-                gap = time.monotonic() - self._last_call
-                if gap < self.min_interval:
-                    time.sleep(self.min_interval - gap)
+            self._reserve_call_slot()
             try:
                 out = self._once(system, user, temperature)
-                self._last_call = time.monotonic()
                 return out
             except LLMError as exc:
                 last = exc
-                self._last_call = time.monotonic()
                 if not getattr(exc, "retryable", False) or attempt == self.max_retries:
                     raise
                 # Exponential backoff with full jitter: synchronized retries from a
@@ -120,6 +121,23 @@ class LLMClient:
                 delay = self.base_delay * (2 ** attempt)
                 time.sleep(random.uniform(0, delay))
         raise last if last else LLMError("unreachable")
+
+    def _reserve_call_slot(self) -> None:
+        """Reserve one outbound-call start time without holding a network lock.
+
+        Advancing the reservation before sleeping closes the race where parallel
+        callers all read the same ``_last_call`` and start together. A retry gets
+        its own slot; the actual HTTP call stays outside the critical section.
+        """
+        if not self.min_interval:
+            return
+        with self._rate_limit_lock:
+            now = time.monotonic()
+            start_at = max(now, self._last_call + self.min_interval)
+            self._last_call = start_at
+        delay = start_at - now
+        if delay > 0:
+            time.sleep(delay)
 
     # Found live 2026-08-05: the gateway's own semantic (similarity-based) response
     # cache serves an unrelated earlier request's answer when two prompts are similar
@@ -164,16 +182,19 @@ class LLMClient:
         try:
             usage = body.get("usage") or {}
             details = usage.get("prompt_tokens_details")
-            self.last_usage = {
+            observed_usage = {
                 "prompt_tokens": usage.get("prompt_tokens", 0),
                 "completion_tokens": usage.get("completion_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
                 "cache_read": details.get("cached_tokens", 0)
                               if isinstance(details, dict) else 0,
             }
-            self.last_usage_error = ""
+            with self._usage_lock:
+                self.last_usage = observed_usage
+                self.last_usage_error = ""
         except Exception as exc:  # usage is advisory; never fail a call on it
-            self.last_usage_error = f"{type(exc).__name__}: {exc}"
+            with self._usage_lock:
+                self.last_usage_error = f"{type(exc).__name__}: {exc}"
         try:
             choice = body["choices"][0]
         except (KeyError, IndexError, TypeError) as exc:
@@ -185,10 +206,11 @@ class LLMClient:
         # session bursts failed exactly this way. NOT retryable -- an identical
         # request truncates at an identical place, so retrying only burns calls.
         if choice.get("finish_reason") == "length":
+            with self._usage_lock:
+                completion_tokens = self.last_usage.get("completion_tokens", 0)
             err = LLMError(
                 "response truncated at the output limit (finish_reason=length, "
-                f"{self.last_usage.get('completion_tokens', 0)} completion tokens) -- "
-                "send less input or raise the limit")
+                f"{completion_tokens} completion tokens) -- send less input or raise the limit")
             err.retryable = False
             raise err
         try:

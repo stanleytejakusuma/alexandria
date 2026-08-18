@@ -54,6 +54,19 @@ def test_render_site_builds_index_and_pages(tmp_path):
     assert "<h1>Beta</h1>" in beta
 
 
+def test_render_site_skips_appledouble_metadata(tmp_path):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "visible.md").write_text("# Visible\n", encoding="utf-8")
+    (wiki / "._visible.md").write_bytes(b"Finder metadata is not markdown\x00")
+    out = tmp_path / "site"
+
+    assert render_site(wiki, out) == ["visible"]
+    index = (out / "index.html").read_text(encoding="utf-8")
+    assert "1 page(s)" in index
+    assert "._visible" not in index
+
+
 def test_render_site_handles_empty_wiki(tmp_path):
     wiki = tmp_path / "wiki"
     wiki.mkdir()

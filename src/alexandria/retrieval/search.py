@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import time
@@ -16,6 +17,7 @@ from ..index.embedder import Embedder
 from ..index.filtering import normalize_filters
 from ..index.store import VectorStore
 from ..monitor import QueryLogger
+from ..writelock import index_read_lock
 from .fusion import apply_layer_boost, rrf
 from .rerank import RerankCandidate, Reranker
 
@@ -97,6 +99,33 @@ class SearchEngine:
 
     def search(self, query: str, *, k: int | None = None, filters: Mapping[str, Any] | None = None,
                tier: str = "map") -> list[SearchResult]:
+        # The only safe result during an in-place writer epoch is no result.
+        # The shared epoch is entered here and released by `_retrieved` the
+        # moment hydration finishes -- it spans cache lookup and BOTH retrieval
+        # legs (so no writer can drop one projection between them) but NOT
+        # reranking. flock grants no writer priority, so a queued `index` keeps
+        # losing to newly arriving readers; holding SH across a ~100ms/candidate
+        # cross-encoder would make ordinary query traffic starve indexing.
+        # Synthetic engines without a corpus root retain isolated in-memory
+        # behavior; that is the only unfenced construction and it is deliberate.
+        return self._search_unlocked(query, k=k, filters=filters, tier=tier)
+
+    def _read_epoch(self):
+        """Shared index epoch for one retrieval, or a no-op for synthetic engines.
+
+        The unfenced case is narrow and deliberate: an engine built with no
+        ``corpus_root`` has no corpus lock file to share (the synthetic-gate and
+        in-memory unit harnesses). Every production construction routes through
+        ``cli._build_search_engine``, which always passes ``corpus_root``, so the
+        fence cannot be skipped by omission on a real corpus.
+        """
+        if self._corpus_root is None:
+            return contextlib.nullcontext()
+        return index_read_lock(self._corpus_root)
+
+    def _search_unlocked(self, query: str, *, k: int | None = None,
+                         filters: Mapping[str, Any] | None = None,
+                         tier: str = "map") -> list[SearchResult]:
         started = time.perf_counter()
         # Execute the SAME normalized query that keys the cache (Red: the
         # first spelling must not control later results).
@@ -123,177 +152,181 @@ class SearchEngine:
         # generation file is corrupt, caching is disabled for THIS call only
         # (retrieval still runs) rather than crashing search() or silently
         # resuming from a resurrected generation 0 (see GenerationFileCorrupt).
-        query_cache = self.query_cache
-        generation = None
-        if query_cache is not None:
+        # SHARED INDEX EPOCH: cache lookup + both retrieval legs + hydration.
+        # Closed before reranking on purpose -- see search() for why holding it
+        # across the cross-encoder would let read traffic starve `index`.
+        with self._read_epoch():
+            query_cache = self.query_cache
+            generation = None
+            if query_cache is not None:
+                try:
+                    generation = self._generation
+                except GenerationFileCorrupt as exc:
+                    print(f"alexandria: index generation file is corrupt, caching "
+                          f"disabled for this query ({exc})", file=sys.stderr)
+                    query_cache = None
+
+            cached: list[SearchResult] | None = None
+            if query_cache is not None:
+                ckey = query_cache.key(
+                    query, limit, self.config, metadata_filter,
+                    generation=generation)
+                payload = query_cache.get(ckey)
+                if payload is not None:
+                    cached = [
+                        SearchResult(
+                            c["chunk_id"], c["doc_id"], c["text"], c.get("heading_path", ""),
+                            c.get("layer", ""), c.get("score", 0.0), rank, {
+                                "cache_hit": True, "latency_ms": _elapsed_ms(started),
+                            })
+                        for rank, c in enumerate(payload, start=1)
+                    ]
+            if cached is not None:
+                self.last_cache_hit = 1  # query-cache hit (embedding never consulted)
+                trace["cache_hit"] = True
+                trace["cache_source"] = "query"
+                trace["latency_ms"] = _elapsed_ms(started)
+                self.last_trace = trace
+                if self.logger is not None:
+                    self.logger.log(
+                        query=query, filters=metadata_filter, tier=tier,
+                        retrieved_ids=[r.chunk_id for r in cached],
+                        scores=[r.score for r in cached], latency_ms=trace["latency_ms"],
+                        cache_hit=1, client=self.client)
+                return cached
+            self.last_cache_hit = 0
+
+            embed_started = time.perf_counter()
+            query_vector = None
             try:
-                generation = self._generation
-            except GenerationFileCorrupt as exc:
-                print(f"alexandria: index generation file is corrupt, caching "
-                      f"disabled for this query ({exc})", file=sys.stderr)
-                query_cache = None
+                # embed_queries applies the model's instruct prefix (queries only;
+                # documents are embedded raw). Fall back for bare providers.
+                if hasattr(self.embedder, "embed_queries"):
+                    query_vector = self.embedder.embed_queries([query])[0]
+                else:
+                    query_vector = self.embedder.embed([query])[0]
+                cache_stats = getattr(self.embedder, "last_cache_stats", {"hits": 0, "misses": 1})
+                trace["stages"]["embed"] = {
+                    "out": 1,
+                    "timing_ms": _elapsed_ms(embed_started),
+                    "cache": dict(cache_stats),
+                    "error": None,
+                }
+            except Exception as exc:
+                cache_stats = {"hits": 0, "misses": 0}
+                trace["stages"]["embed"] = {
+                    "out": 0,
+                    "timing_ms": _elapsed_ms(embed_started),
+                    "cache": cache_stats,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
 
-        cached: list[SearchResult] | None = None
-        if query_cache is not None:
-            ckey = query_cache.key(
-                query, limit, self.config, metadata_filter,
-                generation=generation)
-            payload = query_cache.get(ckey)
-            if payload is not None:
-                cached = [
-                    SearchResult(
-                        c["chunk_id"], c["doc_id"], c["text"], c.get("heading_path", ""),
-                        c.get("layer", ""), c.get("score", 0.0), rank, {
-                            "cache_hit": True, "latency_ms": _elapsed_ms(started),
-                        })
-                    for rank, c in enumerate(payload, start=1)
-                ]
-        if cached is not None:
-            self.last_cache_hit = 1  # query-cache hit (embedding never consulted)
-            trace["cache_hit"] = True
-            trace["cache_source"] = "query"
-            trace["latency_ms"] = _elapsed_ms(started)
-            self.last_trace = trace
-            if self.logger is not None:
-                self.logger.log(
-                    query=query, filters=metadata_filter, tier=tier,
-                    retrieved_ids=[r.chunk_id for r in cached],
-                    scores=[r.score for r in cached], latency_ms=trace["latency_ms"],
-                    cache_hit=1, client=self.client)
-            return cached
-        self.last_cache_hit = 0
-
-        embed_started = time.perf_counter()
-        query_vector = None
-        try:
-            # embed_queries applies the model's instruct prefix (queries only;
-            # documents are embedded raw). Fall back for bare providers.
-            if hasattr(self.embedder, "embed_queries"):
-                query_vector = self.embedder.embed_queries([query])[0]
-            else:
-                query_vector = self.embedder.embed([query])[0]
-            cache_stats = getattr(self.embedder, "last_cache_stats", {"hits": 0, "misses": 1})
-            trace["stages"]["embed"] = {
-                "out": 1,
-                "timing_ms": _elapsed_ms(embed_started),
-                "cache": dict(cache_stats),
-                "error": None,
+            lexical_started = time.perf_counter()
+            dense_started = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                lexical_future = pool.submit(self.bm25.search, query, self.config.depth, metadata_filter)
+                dense_future = (pool.submit(self.store.search_vector, query_vector, self.config.depth,
+                                            metadata_filter) if query_vector is not None else None)
+                lexical, lexical_error = _future_value(lexical_future, [])
+                dense, dense_error = _future_value(dense_future, []) if dense_future is not None else ([], None)
+            trace["stages"]["bm25"] = {
+                "in": self.config.depth,
+                "out": len(lexical),
+                "scores": dict(lexical),
+                "timing_ms": _elapsed_ms(lexical_started),
+                "error": lexical_error,
             }
-        except Exception as exc:
-            cache_stats = {"hits": 0, "misses": 0}
-            trace["stages"]["embed"] = {
-                "out": 0,
-                "timing_ms": _elapsed_ms(embed_started),
-                "cache": cache_stats,
-                "error": f"{type(exc).__name__}: {exc}",
+            trace["stages"]["dense"] = {
+                "in": self.config.depth,
+                "out": len(dense),
+                "scores": {row["chunk_id"]: -float(row.get("_distance", 0.0)) for row in dense},
+                "timing_ms": _elapsed_ms(dense_started),
+                "error": dense_error,
             }
 
-        lexical_started = time.perf_counter()
-        dense_started = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            lexical_future = pool.submit(self.bm25.search, query, self.config.depth, metadata_filter)
-            dense_future = (pool.submit(self.store.search_vector, query_vector, self.config.depth,
-                                        metadata_filter) if query_vector is not None else None)
-            lexical, lexical_error = _future_value(lexical_future, [])
-            dense, dense_error = _future_value(dense_future, []) if dense_future is not None else ([], None)
-        trace["stages"]["bm25"] = {
-            "in": self.config.depth,
-            "out": len(lexical),
-            "scores": dict(lexical),
-            "timing_ms": _elapsed_ms(lexical_started),
-            "error": lexical_error,
-        }
-        trace["stages"]["dense"] = {
-            "in": self.config.depth,
-            "out": len(dense),
-            "scores": {row["chunk_id"]: -float(row.get("_distance", 0.0)) for row in dense},
-            "timing_ms": _elapsed_ms(dense_started),
-            "error": dense_error,
-        }
-
-        fusion_started = time.perf_counter()
-        base_scores = rrf([[chunk_id for chunk_id, _ in lexical],
-                           [row["chunk_id"] for row in dense]], self.config.rrf_k)
-        # ONE batched lookup, not one per candidate: the per-candidate version cost
-        # ~494ms of pure overhead per query (up to 40 full table scans).
-        records: dict[str, dict] = {}
-        lookup_errors: dict[str, str] = {}
-        try:
-            records = self.store.get_many(list(base_scores))
-        except Exception as exc:
-            lookup_errors["*"] = f"{type(exc).__name__}: {exc}"
-        # Defense in depth (SOL-01/SOL-03): the leg queries filter `deleted`,
-        # but a candidate that slips through a stale or divergent leg must still
-        # be dropped here. get_many() is deliberately unfiltered (an
-        # administrative read), so the deleted check belongs at hydration, not
-        # in the store.
-        #
-        # Exclude ONLY an explicit tombstone ("true"). A record whose `deleted`
-        # field is absent predates the tombstone column entirely (the live Lance
-        # table is an old schema without it) and is NOT deleted, so it must stay
-        # visible. Fail-closed behaviour for corrupt/NULL values lives in the leg
-        # predicate (not_deleted_clause), not here.
-        base_scores = {
-            chunk_id: score for chunk_id, score in base_scores.items()
-            if chunk_id in records and records[chunk_id].get("deleted") != "true"
-        }
-        layers = {chunk_id: record["layer"] for chunk_id, record in records.items()}
-        before = _ordered(base_scores)
-        boosted_scores = apply_layer_boost(base_scores, layers, wiki_boost=self.config.wiki_boost)
-        # Enrichment routing (Red 2026-08-09): synthetic records (kind
-        # "synthetic") are never surfaced -- their score boosts their
-        # explicit target_chunk (a real chunk), so a hypothetical-question
-        # match retrieves the document. Targets missing from the RRF set
-        # are fetched in ONE bounded lookup.
-        enriched_hits = 0
-        collapsed: dict[str, float] = {}
-        # target -> best synthetic score seen for it. The score MUST travel
-        # with the id: a target absent from the RRF set is precisely the
-        # zero-overlap case enrichment exists to rescue, and recovering it
-        # at 0.0 would rank it last -- enrichment paying off only in the
-        # cases where it was not needed.
-        missing_targets: dict[str, float] = {}
-        for chunk_id, score in boosted_scores.items():
-            record = records.get(chunk_id)
-            if record is not None and record.get("kind") == "synthetic":
-                enriched_hits += 1
-                target = record.get("target_chunk")
-                if target and target in records:
-                    collapsed[target] = max(collapsed.get(target, 0.0), score)
-                elif target:
-                    missing_targets[target] = max(
-                        missing_targets.get(target, 0.0), score)
-            else:
-                collapsed[chunk_id] = max(collapsed.get(chunk_id, 0.0), score)
-        if missing_targets:
+            fusion_started = time.perf_counter()
+            base_scores = rrf([[chunk_id for chunk_id, _ in lexical],
+                               [row["chunk_id"] for row in dense]], self.config.rrf_k)
+            # ONE batched lookup, not one per candidate: the per-candidate version cost
+            # ~494ms of pure overhead per query (up to 40 full table scans).
+            records: dict[str, dict] = {}
+            lookup_errors: dict[str, str] = {}
             try:
-                for chunk_id, record in self.store.get_many(
-                        list(missing_targets)).items():
-                    # SOL-01: a synthetic row routes to its real target via
-                    # get_many(); if the target is an explicit tombstone
-                    # (deleted == "true") the synthetic row must not resurrect
-                    # it. Drop, never boost. A missing field means the target
-                    # predates the tombstone column and stays routable.
-                    if record.get("deleted") == "true":
-                        continue
-                    records[chunk_id] = record
-                    collapsed[chunk_id] = max(
-                        collapsed.get(chunk_id, 0.0),
-                        boosted_scores.get(chunk_id, 0.0),
-                        missing_targets[chunk_id])
-            except Exception:
-                pass  # routing enhancement is best-effort; never breaks search
-        after = _ordered(collapsed)
-        trace["stages"]["fusion"] = {
-            "in": {"bm25": len(lexical), "dense": len(dense)},
-            "out": len(after),
-            "scores_before_boost": base_scores,
-            "scores": collapsed,
-            "boost_changed_order": before != after,
-            "lookup_errors": lookup_errors,
-            "enriched_hits": enriched_hits,
-            "timing_ms": _elapsed_ms(fusion_started),
-        }
+                records = self.store.get_many(list(base_scores))
+            except Exception as exc:
+                lookup_errors["*"] = f"{type(exc).__name__}: {exc}"
+            # Defense in depth (SOL-01/SOL-03): the leg queries filter `deleted`,
+            # but a candidate that slips through a stale or divergent leg must still
+            # be dropped here. get_many() is deliberately unfiltered (an
+            # administrative read), so the deleted check belongs at hydration, not
+            # in the store.
+            #
+            # Exclude ONLY an explicit tombstone ("true"). A record whose `deleted`
+            # field is absent predates the tombstone column entirely (the live Lance
+            # table is an old schema without it) and is NOT deleted, so it must stay
+            # visible. Fail-closed behaviour for corrupt/NULL values lives in the leg
+            # predicate (not_deleted_clause), not here.
+            base_scores = {
+                chunk_id: score for chunk_id, score in base_scores.items()
+                if chunk_id in records and records[chunk_id].get("deleted") != "true"
+            }
+            layers = {chunk_id: record["layer"] for chunk_id, record in records.items()}
+            before = _ordered(base_scores)
+            boosted_scores = apply_layer_boost(base_scores, layers, wiki_boost=self.config.wiki_boost)
+            # Enrichment routing (Red 2026-08-09): synthetic records (kind
+            # "synthetic") are never surfaced -- their score boosts their
+            # explicit target_chunk (a real chunk), so a hypothetical-question
+            # match retrieves the document. Targets missing from the RRF set
+            # are fetched in ONE bounded lookup.
+            enriched_hits = 0
+            collapsed: dict[str, float] = {}
+            # target -> best synthetic score seen for it. The score MUST travel
+            # with the id: a target absent from the RRF set is precisely the
+            # zero-overlap case enrichment exists to rescue, and recovering it
+            # at 0.0 would rank it last -- enrichment paying off only in the
+            # cases where it was not needed.
+            missing_targets: dict[str, float] = {}
+            for chunk_id, score in boosted_scores.items():
+                record = records.get(chunk_id)
+                if record is not None and record.get("kind") == "synthetic":
+                    enriched_hits += 1
+                    target = record.get("target_chunk")
+                    if target and target in records:
+                        collapsed[target] = max(collapsed.get(target, 0.0), score)
+                    elif target:
+                        missing_targets[target] = max(
+                            missing_targets.get(target, 0.0), score)
+                else:
+                    collapsed[chunk_id] = max(collapsed.get(chunk_id, 0.0), score)
+            if missing_targets:
+                try:
+                    for chunk_id, record in self.store.get_many(
+                            list(missing_targets)).items():
+                        # SOL-01: a synthetic row routes to its real target via
+                        # get_many(); if the target is an explicit tombstone
+                        # (deleted == "true") the synthetic row must not resurrect
+                        # it. Drop, never boost. A missing field means the target
+                        # predates the tombstone column and stays routable.
+                        if record.get("deleted") == "true":
+                            continue
+                        records[chunk_id] = record
+                        collapsed[chunk_id] = max(
+                            collapsed.get(chunk_id, 0.0),
+                            boosted_scores.get(chunk_id, 0.0),
+                            missing_targets[chunk_id])
+                except Exception:
+                    pass  # routing enhancement is best-effort; never breaks search
+            after = _ordered(collapsed)
+            trace["stages"]["fusion"] = {
+                "in": {"bm25": len(lexical), "dense": len(dense)},
+                "out": len(after),
+                "scores_before_boost": base_scores,
+                "scores": collapsed,
+                "boost_changed_order": before != after,
+                "lookup_errors": lookup_errors,
+                "enriched_hits": enriched_hits,
+                "timing_ms": _elapsed_ms(fusion_started),
+            }
         candidates = [
             # Heading included: the reranker judges "does this passage answer the
             # query?", and judging that on text stripped of its own title is how a

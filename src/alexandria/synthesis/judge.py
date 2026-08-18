@@ -14,6 +14,10 @@ from .write import Claim, SynthesisPage
 
 __all__ = ["ChunkAccountingError", "JudgeVerdict", "complete_skip_log", "judge_page"]
 
+# A claim page is small; more workers adds endpoint pressure without reducing
+# meaningful latency. Zero is the documented sequential mode.
+MAX_AUDIT_CONCURRENCY = 32
+
 
 class ChunkAccountingError(ValueError):
     """A gathered chunk was neither cited nor given a deterministic skip predicate."""
@@ -47,6 +51,10 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
                coverage_llm_b, coverage_sample_per_stratum: int = 1,
                audit_concurrency: int = 4) -> JudgeVerdict:
     """Run no new grading logic: deterministic accounting plus the three existing judges."""
+    if (not isinstance(audit_concurrency, int) or isinstance(audit_concurrency, bool)
+            or not 0 <= audit_concurrency <= MAX_AUDIT_CONCURRENCY):
+        raise ValueError(
+            f"audit_concurrency must be an integer between 0 and {MAX_AUDIT_CONCURRENCY}")
     normalized_page = _validate_chunk_accounting(gathered, page)
     errors: list[str] = []
     audit = AuditResult()
@@ -84,7 +92,9 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
         except LLMError as exc:
             return exc
 
-    workers = max(1, int(audit_concurrency))
+    # Zero is an explicit public "do not parallelize" value, retained for
+    # callers that used the prior sequential fallback. Negative values reject.
+    workers = max(1, audit_concurrency)
     if len(grade_jobs) > 1 and workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(pool.map(lambda job: _grade_one(*job), grade_jobs))

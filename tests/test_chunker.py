@@ -2,7 +2,15 @@
 
 import pytest
 
-from alexandria.index.chunker import Chunk, chunk_document, count_tokens, split_headings
+from pathlib import Path
+
+from alexandria.index.chunker import (
+    Chunk,
+    chunk_document,
+    count_tokens,
+    is_indexable_source,
+    split_headings,
+)
 
 DOC = """# Payments service
 
@@ -97,6 +105,19 @@ def test_a_single_oversized_paragraph_is_split_not_dropped():
 def test_empty_document_yields_no_chunks():
     assert chunk_document("d", "") == []
     assert chunk_document("d", "   \n\n  ") == []
+
+
+def test_appledouble_metadata_is_not_an_indexable_source_in_either_tree():
+    """Finder's ``._`` sidecars are metadata, never malformed corpus documents.
+
+    Check both indexed top-level trees and a non-final component: the exclusion is
+    deliberately about the final basename, so a real document under an ordinary
+    directory is not discarded merely because an ancestor happens to resemble a
+    metadata name.
+    """
+    assert not is_indexable_source(Path("sources/pi/._note.md"))
+    assert not is_indexable_source(Path("wiki/topics/._overview.md"))
+    assert is_indexable_source(Path("sources/._archive/real-note.md"))
 
 
 def test_chunk_ids_are_stable_and_unique():

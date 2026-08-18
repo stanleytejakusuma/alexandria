@@ -208,7 +208,9 @@ table. Still open there: #5 enrichment injection framing, #6 deletion path,
   invalidates every cached vector. An MLX-built index **cannot** be copied to a
   Linux host — it is a different vector space, requiring a full re-embed.
 - Any retrieval-relevant commit needs the real corpus `manifest.json` to exist.
-  It does now (`index --backfill-manifest`).
+  It did temporarily (`index --backfill-manifest`), but that assertion-only path was superseded:
+  non-empty legacy indexes must now use `index --rebuild` because a manifest cannot prove
+  their persisted vectors had the declared L2 policy.
 
 **Hard constraints**
 - **Never run a corpus index build on the second host.** It carries live capital

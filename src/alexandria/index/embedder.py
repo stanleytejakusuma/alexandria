@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -13,7 +14,43 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol, runtime_checkable
 
-__all__ = ["CachedEmbedder", "Embedder", "HashEmbedder", "LocalEmbedder", "MLXEmbedder"]
+__all__ = ["CachedEmbedder", "Embedder", "EmbeddingCacheBusy", "HashEmbedder",
+           "LocalEmbedder", "MLXEmbedder"]
+
+
+# CachedEmbedder is the sole vector boundary used by CLI indexing, promotion,
+# and retrieval. It makes L2 normalization a code-enforced storage/query
+# contract rather than a hardware-sensitive observation about a provider probe.
+NORMALIZATION_POLICY = "l2"
+
+# How long a normal (writing) cache waits for the cooperative cache lock before
+# failing loudly. A read-only evaluator legitimately holds its shared snapshot
+# for the whole of a leg-ablation run, so an unbounded LOCK_EX would let one
+# evaluation wedge every later index run with no diagnostic -- the identical
+# silent-stall failure writelock.py already refuses for the corpus lock. Same
+# order of magnitude as that bounded wait, since a cache batch is sub-second.
+DEFAULT_CACHE_LOCK_TIMEOUT = 30.0
+_CACHE_LOCK_POLL = 0.05
+
+
+class EmbeddingCacheBusy(RuntimeError):
+    """A cache writer could not take the cooperative lock within its deadline."""
+
+
+def _lock_exclusive(handle, timeout: float, what: str) -> None:
+    """Bounded LOCK_EX: wait, then name the blocker instead of hanging."""
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise EmbeddingCacheBusy(
+                    f"embedding cache lock held by an active read-only reader "
+                    f"(evaluation/ablation) for more than {timeout:.0f}s while {what}; "
+                    f"retry once that run finishes") from exc
+            time.sleep(_CACHE_LOCK_POLL)
 
 
 @runtime_checkable
@@ -213,27 +250,107 @@ class MLXEmbedder:
         self._generate = generate
 
 
-class CachedEmbedder:
-    """Cache embeddings by ``sha256(model_name + '\\n' + text)``.
+def _l2_normalize(vector, *, expected_dim: int | None = None) -> list[float]:
+    """Return a finite, nonzero vector at exactly the wrapper's L2 scale.
 
-    Cache entries are durable across interrupted index runs. Corrupt values are
-    ignored and overwritten by a fresh provider call instead of breaking search.
+    ``math.hypot`` deliberately replaces ``sqrt(sum(x*x))`` here: the latter
+    overflows for finite large values and underflows for finite tiny ones, both
+    of which could turn a legitimate provider vector into an all-zero cached
+    vector. The optional width check is part of the storage boundary too: a
+    numeric legacy cache row is not compatible merely because it parses.
+    """
+    try:
+        clean = [float(value) for value in vector]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("embedder returned a non-numeric vector") from exc
+    if not clean or not all(math.isfinite(value) for value in clean):
+        raise ValueError("embedder returned an empty or non-finite vector")
+    if expected_dim is not None and len(clean) != expected_dim:
+        raise ValueError(
+            f"embedder returned dimension {len(clean)}, expected {expected_dim}")
+    norm = math.hypot(*clean)
+    if not math.isfinite(norm) or norm == 0.0:
+        raise ValueError("embedder returned a zero or unnormalizable vector")
+    normalized = [value / norm for value in clean]
+    normalized_norm = math.hypot(*normalized)
+    if (not all(math.isfinite(value) for value in normalized)
+            or normalized_norm == 0.0
+            or not math.isclose(normalized_norm, 1.0, rel_tol=1e-12, abs_tol=1e-12)):
+        raise ValueError("embedder produced an invalid L2-normalized vector")
+    return normalized
+
+
+class CachedEmbedder:
+    """Cache embeddings by ``sha256(model_name + '\n' + text)`` and enforce L2.
+
+    This common production boundary normalizes every returned vector before it
+    can reach indexing or retrieval. Normal mode keeps cache entries durable;
+    read-only mode uses existing hits but computes misses without persisting or
+    creating cache files/SQLite sidecars (for evaluation-only callers).
     """
 
     def __init__(self, provider: Embedder, cache_path: str | Path, *, progress_every: int = 250,
-                 progress_stream=None, on_progress: Callable[[dict], None] | None = None) -> None:
+                 progress_stream=None, on_progress: Callable[[dict], None] | None = None,
+                 read_only: bool = False,
+                 lock_timeout: float = DEFAULT_CACHE_LOCK_TIMEOUT) -> None:
         self.provider = provider
         self.cache_path = Path(cache_path)
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.cache_path, check_same_thread=False)
-        # See index/bm25.py §3.1: wait for a concurrent writer instead of raising
-        # "database is locked" immediately.
-        self._connection.execute("PRAGMA busy_timeout=5000")
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute(
-            "CREATE TABLE IF NOT EXISTS embeddings (cache_key TEXT PRIMARY KEY, vector TEXT NOT NULL)"
-        )
-        self._connection.commit()
+        self._cache_lock_path = self.cache_path.with_name(f"{self.cache_path.name}.lock")
+        self.read_only = read_only
+        self.lock_timeout = lock_timeout
+        # The read-only setup path can fail before sqlite3.connect() returns.
+        # Keep a concrete sentinel so cleanup of that partial setup is safe.
+        self._connection: sqlite3.Connection | None = None
+        self._read_lock = None
+        self._write_lock = None
+        if read_only:
+            # ``mode=ro`` alone can create ``-wal``/``-shm`` sidecars while reading
+            # a WAL database. ``immutable=1`` prevents those writes as well as DDL
+            # and INSERTs, but it assumes the database does not change underneath
+            # it. Normal cache writes take this lock exclusively; the evaluator
+            # holds it shared for its short lifetime. If a legacy cache lacks the
+            # cooperative lock, compute uncached instead of trusting its live file.
+            if self.cache_path.is_file() and self._cache_lock_path.is_file():
+                try:
+                    lock = open(self._cache_lock_path, "r")
+                    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    self._read_lock = lock
+                    uri = f"{self.cache_path.resolve().as_uri()}?mode=ro&immutable=1"
+                    self._connection = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                    self._connection.execute("PRAGMA busy_timeout=5000")
+                except (OSError, sqlite3.Error):
+                    # A cache/lock can rotate between check and open. Close the
+                    # immutable connection *before* releasing its shared lock:
+                    # SQLite close can touch WAL/checkpoint state, which must not
+                    # overlap an exclusive normal writer. Then compute uncached;
+                    # a read-only evaluator never repairs a cache.
+                    if self._connection is not None:
+                        self._connection.close()
+                        self._connection = None
+                    if self._read_lock is not None:
+                        fcntl.flock(self._read_lock, fcntl.LOCK_UN)
+                        self._read_lock.close()
+                        self._read_lock = None
+            else:
+                # Do not create cache or lock directories just to evaluate.
+                self._connection = None
+        else:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cache_lock_path.touch(exist_ok=True)
+            self._write_lock = open(self._cache_lock_path, "a+")
+            _lock_exclusive(self._write_lock, lock_timeout, "opening the cache")
+            try:
+                self._connection = sqlite3.connect(self.cache_path, check_same_thread=False)
+                # See index/bm25.py §3.1: wait for a concurrent writer instead of raising
+                # "database is locked" immediately.
+                self._connection.execute("PRAGMA busy_timeout=5000")
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute(
+                    "CREATE TABLE IF NOT EXISTS embeddings (cache_key TEXT PRIMARY KEY, vector TEXT NOT NULL)"
+                )
+                self._connection.commit()
+            finally:
+                fcntl.flock(self._write_lock, fcntl.LOCK_UN)
         self._lock = Lock()
         self.progress_every = max(1, progress_every)
         self.progress_stream = progress_stream or sys.stderr
@@ -247,6 +364,17 @@ class CachedEmbedder:
     @property
     def dim(self) -> int:
         return self.provider.dim
+
+    @property
+    def normalization_policy(self) -> str:
+        """The normalization semantics this wrapper actually enforces.
+
+        Provider output is allowed to vary by backend/device, but every vector
+        this wrapper returns or persists is L2-normalized. The manifest records
+        this declared, code-enforced policy as compatibility identity; a probe's
+        observed norm remains useful diagnostics only.
+        """
+        return NORMALIZATION_POLICY
 
     def embed_queries(self, texts: list[str]) -> list[list[float]]:
         """Embed QUERIES: instruct-prefixed per the model's own template.
@@ -271,8 +399,20 @@ class CachedEmbedder:
             for index, (text, key) in enumerate(zip(texts, keys, strict=True)):
                 cached = self._read(key)
                 if cached is not None:
-                    vectors[index] = cached
-                    hits += 1
+                    try:
+                        # Legacy rows can predate the wrapper policy. Normalize on
+                        # every read, but only accept a vector with this provider's
+                        # declared width; an invalid row is an ordinary cache miss.
+                        vectors[index] = _l2_normalize(cached, expected_dim=self.dim)
+                    except ValueError:
+                        # A repeated bad cache key remains one provider request
+                        # with every caller position restored from that result.
+                        if key in pending:
+                            pending[key][1].append(index)
+                        else:
+                            pending[key] = (text, [index])
+                    else:
+                        hits += 1
                 elif key in pending:
                     pending[key][1].append(index)
                 else:
@@ -282,17 +422,45 @@ class CachedEmbedder:
             produced = self.provider.embed([text for _, (text, _) in missing])
             if len(produced) != len(missing):
                 raise RuntimeError("embedder returned a different number of vectors")
+            # Validate the entire provider response before taking the SQL mutation
+            # lock. No malformed vector may leave an earlier row of this batch in
+            # the durable cache, and read-only callers get the same boundary.
+            clean_produced = [
+                _l2_normalize(vector, expected_dim=self.dim) for vector in produced
+            ]
             with self._lock:
-                for (key, (_, indexes)), vector in zip(missing, produced, strict=True):
-                    clean = [float(value) for value in vector]
-                    self._connection.execute(
-                        "INSERT INTO embeddings(cache_key, vector) VALUES(?, ?) "
-                        "ON CONFLICT(cache_key) DO UPDATE SET vector=excluded.vector",
-                        (key, json.dumps(clean, separators=(",", ":"))),
-                    )
-                    for index in indexes:
-                        vectors[index] = clean
-                self._connection.commit()
+                if self._connection is not None and not self.read_only:
+                    # An immutable evaluator owns a shared lock for its short
+                    # lifetime. Wait before changing this SQLite file rather than
+                    # violating immutable=1's no-concurrent-change precondition --
+                    # but bounded, so a long-lived reader cannot wedge indexing.
+                    _lock_exclusive(self._write_lock, self.lock_timeout,
+                                    "persisting a cache batch")
+                try:
+                    if self._connection is not None and not self.read_only:
+                        # A provider batch is one cache transaction. Prevalidation
+                        # above prevents vector failures; this rollback additionally
+                        # prevents disk/SQLite failures after the first SQL statement
+                        # from becoming durable during a later successful call.
+                        self._connection.execute("BEGIN")
+                    for (key, (_, indexes)), clean in zip(missing, clean_produced, strict=True):
+                        if self._connection is not None and not self.read_only:
+                            self._connection.execute(
+                                "INSERT INTO embeddings(cache_key, vector) VALUES(?, ?) "
+                                "ON CONFLICT(cache_key) DO UPDATE SET vector=excluded.vector",
+                                (key, json.dumps(clean, separators=(",", ":"))),
+                            )
+                        for index in indexes:
+                            vectors[index] = clean
+                    if self._connection is not None and not self.read_only:
+                        self._connection.commit()
+                except Exception:
+                    if self._connection is not None and not self.read_only:
+                        self._connection.rollback()
+                    raise
+                finally:
+                    if self._connection is not None and not self.read_only:
+                        fcntl.flock(self._write_lock, fcntl.LOCK_UN)
         self.last_cache_stats = {"hits": hits, "misses": len(texts) - hits}
         self._report_progress(len(texts), started)
         return [vector for vector in vectors if vector is not None]
@@ -305,13 +473,47 @@ class CachedEmbedder:
 
     def _key(self, text: str, mode: str = "d") -> str:
         return hashlib.sha256(
-            f"{self.name}\\n{self.revision}\\n{mode}\\n{text}".encode("utf-8")
+            f"{self.name}\\n{self.revision}\\n{self.dim}\\n{self.normalization_policy}\\n"
+            f"{mode}\\n{text}".encode("utf-8")
         ).hexdigest()
 
+    def close(self) -> None:
+        """Release the SQLite connection and any cooperative cache lock.
+
+        SQLite may checkpoint/clean up WAL state while closing. A normal cache
+        therefore holds its exclusive lock through close, just as it does for
+        initialization and mutations; immutable readers release their snapshot
+        only after closing the read-only connection.
+        """
+        with self._lock:
+            if self._connection is not None and not self.read_only:
+                _lock_exclusive(self._write_lock, self.lock_timeout, "closing the cache")
+                try:
+                    self._connection.close()
+                    self._connection = None
+                finally:
+                    fcntl.flock(self._write_lock, fcntl.LOCK_UN)
+            elif self._connection is not None:
+                self._connection.close()
+                self._connection = None
+            if self._read_lock is not None:
+                fcntl.flock(self._read_lock, fcntl.LOCK_UN)
+                self._read_lock.close()
+                self._read_lock = None
+            if self._write_lock is not None:
+                self._write_lock.close()
+                self._write_lock = None
+
     def _read(self, key: str) -> list[float] | None:
-        row = self._connection.execute(
-            "SELECT vector FROM embeddings WHERE cache_key = ?", (key,)
-        ).fetchone()
+        if self._connection is None:
+            return None
+        try:
+            row = self._connection.execute(
+                "SELECT vector FROM embeddings WHERE cache_key = ?", (key,)
+            ).fetchone()
+        except sqlite3.Error:
+            # A read-only evaluator must not repair a missing/corrupt schema.
+            return None
         if row is None:
             return None
         try:
@@ -319,7 +521,7 @@ class CachedEmbedder:
             if not isinstance(parsed, list) or not all(isinstance(value, (int, float)) for value in parsed):
                 raise ValueError("not a numeric vector")
             return [float(value) for value in parsed]
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
             return None
 
     def _report_progress(self, total: int, started: float) -> None:
