@@ -464,3 +464,40 @@ def test_all_three_answer_clients_share_the_SAME_deadline_object(monkeypatch, tm
     assert all(d is not None for d in deadlines), "a client was built with no budget"
     assert deadlines[0] is deadlines[1] is deadlines[2], (
         "clients got separate budgets -- N stages would cost N budgets again")
+
+
+def test_a_budget_exhausted_answer_never_reaches_the_response_cache(monkeypatch, tmp_path):
+    """Red round 2 #3: the no-poisoning invariant was traced, never pinned.
+
+    If a budget-exhausted run ever wrote to the response cache, a truncated or
+    unjudged answer would replay verbatim for the whole TTL after the gateway
+    recovered. It holds today only because BudgetExhausted propagates out of
+    run_answer before `put` -- and the scope fix edits exactly that path, so it
+    needs a regression test rather than an argument.
+    """
+    from alexandria import cli
+    from alexandria.llm import BudgetExhausted
+    from alexandria.synthesis import pipeline as pipeline_mod
+
+    puts = []
+    monkeypatch.setattr(cli.ResponseCache, "put",
+                        lambda self, key, value: puts.append(key), raising=False)
+    monkeypatch.setattr(pipeline_mod, "run_pipeline",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            BudgetExhausted("request budget exhausted (900s)", scope="request")))
+
+    class FakeEngine:
+        embedder = type("E", (), {"name": "hash-24"})()
+        reranker = type("R", (), {"model_name": "fake", "half_precision": True})()
+        config = type("C", (), {"prefetch": 8, "top_k": 5, "rrf_k": 60, "wiki_boost": 1.25})()
+        logger = type("L", (), {"log_usage": lambda self, **kw: None})()
+
+    with pytest.raises(BudgetExhausted):
+        cli.run_answer(
+            cli.AppConfig(corpus_path=tmp_path), tmp_path, "q",
+            engine=FakeEngine(), k=5, llm_model="m",
+            grader_a_model="a", grader_b_model="b",
+            base_url=None, api_key_env=None, prompt_version="v1",
+        )
+
+    assert puts == [], "a budget-exhausted answer was written to the response cache"

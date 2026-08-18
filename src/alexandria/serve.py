@@ -95,6 +95,23 @@ class ServeContext:
     llm_defaults: dict[str, str]
 
 
+def _validated_answer_timeout() -> str:
+    """Read ALEXANDRIA_ANSWER_TIMEOUT, failing at startup on a bad value."""
+    raw = os.environ.get("ALEXANDRIA_ANSWER_TIMEOUT", "").strip()
+    if not raw:
+        return ""
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"ALEXANDRIA_ANSWER_TIMEOUT must be a number of seconds "
+            f"(0 disables the budget), got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(
+            f"ALEXANDRIA_ANSWER_TIMEOUT must be non-negative, got {value}")
+    return raw
+
+
 def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
     """Build once at startup, reused by every request. Delegates the
     index-exists and manifest checks to `_build_search_engine` (S9: refuses
@@ -120,7 +137,10 @@ def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
             "grader_b_model": os.environ.get("ALEXANDRIA_GRADER_B_MODEL", "deepseek-v4-flash"),
             "prompt_version": os.environ.get("ALEXANDRIA_PROMPT_VERSION", "v1"),
             # Operator surface for the #47 request budget. 0 disables it.
-            "answer_timeout": os.environ.get("ALEXANDRIA_ANSWER_TIMEOUT", ""),
+            # Validated HERE, at startup, not per request: a malformed value
+            # should refuse to boot with a clear message rather than turn every
+            # /answer into an opaque 500.
+            "answer_timeout": _validated_answer_timeout(),
         },
     )
 

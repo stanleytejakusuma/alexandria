@@ -1042,7 +1042,10 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
     # sequential stages, so a dead gateway still cost ~1.8h even with every call
     # bounded. All three clients draw down the same deadline, and once it is
     # spent the remaining stages fail fast instead of each paying an attempt.
-    deadline = RequestDeadline(answer_timeout)
+    # Single normalization point for the "<=0 disables" convention, so CLI,
+    # serve and direct callers cannot drift into three different meanings of 0.
+    deadline = RequestDeadline(
+        None if answer_timeout is not None and answer_timeout <= 0 else answer_timeout)
     writer = LLMClient(model=llm_model, base_url=base_url, api_key_env=api_key_env,
                        deadline=deadline)
     grader_a = LLMClient(model=grader_a_model, base_url=base_url, api_key_env=api_key_env,
@@ -1108,7 +1111,7 @@ def cmd_answer(args) -> int:
         max_follow_up_queries=getattr(args, "max_follow_up_queries", 2),
         audit_concurrency=getattr(args, "audit_concurrency", 4),
         api_key_env=args.api_key_env, prompt_version=args.prompt_version,
-        answer_timeout=(getattr(args, "answer_timeout", DEFAULT_ANSWER_TIMEOUT) or None),
+        answer_timeout=getattr(args, "answer_timeout", DEFAULT_ANSWER_TIMEOUT),
         save_dir=args.save_dir, caller=args.caller, user=cli_identity())
     if outcome.cached:
         print("[cached] " + outcome.text)

@@ -450,7 +450,9 @@ def test_a_budget_expiry_mid_audit_is_not_recorded_as_a_failed_CLAIM():
     actually judged, and a repair loop could burn its remaining iterations
     trying to fix claims whose only problem was that the clock ran out.
     BudgetExhausted is a distinct type precisely so this path can tell them
-    apart -- it must abort the judgement, not be absorbed into the verdict.
+    apart -- a REQUEST-scope expiry must abort the judgement, not be absorbed
+    into the verdict. (A call-scope expiry is the opposite case; see the
+    slow-CALL test below.)
     """
     from alexandria.llm import BudgetExhausted
 
@@ -458,7 +460,8 @@ def test_a_budget_expiry_mid_audit_is_not_recorded_as_a_failed_CLAIM():
 
     class OutOfTime:
         def complete(self, system, user, temperature=0.0):
-            raise BudgetExhausted("request budget exhausted (900s) after 1 attempt(s)")
+            raise BudgetExhausted(
+                "request budget exhausted (900s) after 1 attempt(s)", scope="request")
 
     with pytest.raises(BudgetExhausted):
         judge_page(
@@ -469,3 +472,34 @@ def test_a_budget_expiry_mid_audit_is_not_recorded_as_a_failed_CLAIM():
             coverage_llm_b=ScriptedClient([]),
             audit_concurrency=2,
         )
+
+
+def test_a_single_slow_CALL_does_not_abort_an_answer_that_still_has_request_budget():
+    """Red round 2: scope matters -- the first fix over-corrected.
+
+    Re-raising EVERY BudgetExhausted meant one grader call stalling past its own
+    300s cap killed the whole answer even with 500s+ of request budget left --
+    killing precisely the slow-but-alive case the generous request budget exists
+    to tolerate. A call-scope expiry stays a per-claim failure that repair can
+    re-judge with a fresh call budget (itself bounded by the request deadline);
+    only a request-scope expiry aborts.
+    """
+    from alexandria.llm import BudgetExhausted
+
+    gathered, page = _three_claim_page()
+
+    class SlowOneCall:
+        def complete(self, system, user, temperature=0.0):
+            raise BudgetExhausted("call exceeded its 300s total budget", scope="call")
+
+    verdict = judge_page(
+        gathered,
+        page,
+        audit_llm=SlowOneCall(),
+        coverage_llm_a=ScriptedClient([_coverage_response("out_of_scope", "out_of_scope:not_cited")]),
+        coverage_llm_b=ScriptedClient([_coverage_response("out_of_scope", "out_of_scope:not_cited")]),
+        audit_concurrency=2,
+    )
+
+    assert not verdict.passes, "unjudged claims must not silently pass"
+    assert verdict.failed_claim_ids, "a call-scope expiry stays a per-claim failure"

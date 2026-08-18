@@ -96,6 +96,16 @@ class LLMError(RuntimeError):
 class BudgetExhausted(LLMError):
     """A call stopped because a time budget ran out, not because of its content.
 
+    ``scope`` distinguishes WHICH budget ran out, and callers must branch on it:
+      "request" -- the shared per-answer deadline. Nothing later can succeed, so
+                   judging aborts.
+      "call"    -- only this one call's cap. The request may still have minutes
+                   left, so this stays a per-claim failure that repair can
+                   legitimately re-judge with a fresh call budget (itself now
+                   bounded by the request deadline). Aborting the whole answer
+                   here would kill exactly the slow-but-alive case the generous
+                   request budget exists to tolerate.
+
     A distinct TYPE, not a message prefix: the per-claim audit path treats an
     LLMError as "this claim failed its check", so a budget expiry that arrives
     as a plain LLMError would be recorded as a CONTENT-quality failure -- the
@@ -103,6 +113,10 @@ class BudgetExhausted(LLMError):
     a repair loop could burn iterations against a budget that is already spent.
     Callers must be able to tell "we ran out of time" from "this claim is bad".
     """
+
+    def __init__(self, message: str, *, scope: str = "call") -> None:
+        super().__init__(message)
+        self.scope = scope
 
 
 @dataclass
@@ -186,7 +200,8 @@ class LLMClient:
         if self.deadline is not None and self.deadline.expired():
             err = BudgetExhausted(
                 f"request budget exhausted ({self.deadline.budget_seconds:.0f}s) before "
-                f"this call started (spent by earlier stages in this request)")
+                f"this call started (spent by earlier stages in this request)",
+                scope="request")
             err.retryable = False
             raise err
         last: Exception | None = None
@@ -245,7 +260,7 @@ class LLMClient:
             # this call under a spent request budget is pointless.
             err = BudgetExhausted(
                 f"request budget exhausted ({self.deadline.budget_seconds:.0f}s) after "
-                f"{attempts} attempt(s); last error: {last}")
+                f"{attempts} attempt(s); last error: {last}", scope="request")
             err.retryable = False
             return err
         if self.total_timeout is None:
@@ -255,7 +270,8 @@ class LLMClient:
             return None
         err = BudgetExhausted(
             f"call exceeded its {self.total_timeout:.0f}s total budget after "
-            f"{attempts} attempt(s) ({elapsed:.0f}s elapsed); last error: {last}")
+            f"{attempts} attempt(s) ({elapsed:.0f}s elapsed); last error: {last}",
+            scope="call")
         err.retryable = False
         return err
 

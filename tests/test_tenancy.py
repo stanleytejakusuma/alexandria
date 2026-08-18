@@ -38,6 +38,14 @@ _ANSWER_ARGS_TODAY = frozenset({
     # and cannot enable the cross-tenant leak this gate exists to catch. (It is
     # deliberately absent from answer_pipeline_fingerprint for the same reason:
     # a budget changes how long we wait, never which evidence is used.)
+    #
+    # THIS EXEMPTION IS CONDITIONAL. It holds only because a budget expiry can
+    # never produce an emittable, cacheable result today (BudgetExhausted
+    # propagates out of run_answer before response_cache.put, pinned by
+    # test_a_budget_exhausted_answer_never_reaches_the_response_cache). If
+    # partial-result salvage ever lands, a low-budget "unaudited" draft cached
+    # under a key that omits the budget would replay as a full answer to a
+    # default-budget request -- and this line must be revisited, not inherited.
     "answer_timeout",
 })
 

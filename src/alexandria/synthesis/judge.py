@@ -89,13 +89,20 @@ def judge_page(gathered: GatherResult, page: SynthesisPage, *, audit_llm, covera
                 claim.id,
                 clauses=True,
             )
-        except BudgetExhausted:
-            # NOT a content verdict. Absorbing this would record a claim as
-            # failing its entailment check when it was never actually judged --
-            # the answer would then name failed_claims that no grader ever saw,
-            # and repair would spend its remaining iterations "fixing" them.
-            # Propagate so the caller aborts on the real cause: time.
-            raise
+        except BudgetExhausted as exc:
+            # Branch on SCOPE. A request-scope expiry means nothing later can
+            # succeed, so abort rather than record claims no grader ever saw --
+            # otherwise the answer names failed_claims that were never judged
+            # and repair burns its iterations "fixing" them.
+            #
+            # A call-scope expiry is different: only this one call's cap ran
+            # out and the request may still have minutes left, so it stays a
+            # per-claim failure that repair can legitimately re-judge with a
+            # fresh call budget (bounded by the request deadline). Aborting
+            # here would kill the slow-but-alive case the budget tolerates.
+            if getattr(exc, "scope", "call") == "request":
+                raise
+            return exc
         except LLMError as exc:
             return exc
 
