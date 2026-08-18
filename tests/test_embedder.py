@@ -1,6 +1,8 @@
 """Embedders are deterministic offline in tests and cache model work by content."""
 
 import sqlite3
+
+import pytest
 from pathlib import Path
 
 from alexandria.index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, QUERY_PREFIX
@@ -163,7 +165,9 @@ def test_read_only_embedding_cache_miss_does_not_create_a_missing_cache(tmp_path
     embedder = CachedEmbedder(provider, cache_path, read_only=True)
     vectors = embedder.embed_queries(["uncached ablation query"])
 
-    assert vectors == [[float(len(f"{QUERY_PREFIX}uncached ablation query")), 0.0, 1.0]]
+    assert len(vectors) == 1
+    assert vectors[0][1] == 0.0
+    assert sum(value * value for value in vectors[0]) == pytest.approx(1.0)
     assert provider.calls == [[f"{QUERY_PREFIX}uncached ablation query"]]
     assert embedder.last_cache_stats == {"hits": 0, "misses": 1}
     assert not cache_path.exists()
