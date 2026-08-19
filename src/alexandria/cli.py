@@ -99,6 +99,82 @@ def cmd_migrate(args) -> int:
     return 0
 
 
+def cmd_ingest(args) -> int:
+    """#51: preserve artifacts (PDF/image) and write their indexed companions.
+
+    Accepts a file, a directory, or a glob, because nothing calls this for you:
+    the weekly loop drives connectors, so ingest is a deliberate human/bridge
+    action. A batch keeps going past a bad artifact but still exits non-zero --
+    silently dropping one file out of twenty is how a memory disappears.
+    """
+    from .ingest import ExtractionFailed, UnsupportedArtifact, ingest_path
+
+    config = _config_for(args)
+    corpus = config.corpus_path
+
+    from .ingest import IMAGE_SUFFIXES, PDF_SUFFIXES
+
+    supported = PDF_SUFFIXES | IMAGE_SUFFIXES
+    # An explicitly named file is an instruction and must fail loudly if it
+    # cannot be honored. A file merely SWEPT UP by a directory/glob walk is
+    # not: a folder always holds .DS_Store and notes.txt, and if every stray
+    # forced a non-zero exit the operator would learn to ignore the code --
+    # destroying the signal for the failure that actually matters.
+    targets: list[tuple[Path, bool]] = []   # (path, explicitly_named)
+    for raw in args.paths:
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            targets.extend((p, False) for p in sorted(path.rglob("*"))
+                           if p.is_file() and p.suffix.lower() in supported)
+        elif path.exists():
+            targets.append((path, True))
+        else:
+            # Unexpanded glob or a typo. Path().glob() raises on absolute
+            # patterns, so split the pattern from its anchor explicitly.
+            pattern = Path(raw).expanduser()
+            root = Path(pattern.anchor) if pattern.anchor else Path()
+            rel = str(pattern.relative_to(pattern.anchor)) if pattern.anchor else str(pattern)
+            try:
+                matches = sorted(root.glob(rel))
+            except (NotImplementedError, ValueError, OSError):
+                matches = []
+            if not matches:
+                print(f"ingest: no such path: {raw}", file=sys.stderr)
+                return 2
+            targets.extend((p, False) for p in matches
+                           if p.is_file() and p.suffix.lower() in supported)
+
+    if not targets:
+        print("ingest: nothing to ingest", file=sys.stderr)
+        return 2
+
+    ingested = failed = 0
+    for path, explicit in targets:
+        try:
+            result = ingest_path(path, corpus)
+        except (UnsupportedArtifact, ExtractionFailed) as exc:
+            print(f"ingest: skipped {path.name}: {exc}", file=sys.stderr)
+            failed += explicit or isinstance(exc, ExtractionFailed)
+            continue
+        except OSError as exc:
+            # Unreadable file, disk full, permission denied: a per-file skip,
+            # never an abandoned batch. Counted as a real failure.
+            print(f"ingest: skipped {path.name}: {exc}", file=sys.stderr)
+            failed += 1
+            continue
+        ingested += 1
+        print(f"ingest: {path.name} -> {result.doc_path} "
+              f"(asset {result.asset_path}, via {result.extraction})")
+
+    print(f"ingest: {ingested} artifact(s) stored, {failed} failed")
+    if ingested:
+        print("ingest: run `alexandria index` to make them searchable")
+    # Non-zero only for REAL failures (explicitly named, or extraction broke on
+    # a supported artifact) -- a partial batch reporting success is the
+    # "reported success while doing nothing" class this project keeps finding.
+    return 1 if failed else 0
+
+
 def cmd_lint(args) -> int:
     corpus = _config_for(args).corpus_path
     errors = checked = 0
@@ -1588,6 +1664,12 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("archive", help="path to a backup_state() .tar.gz archive")
     restore.add_argument("--dry-run", action="store_true", help="list what would be restored, write nothing")
     restore.set_defaults(func=cmd_restore)
+
+    ingest = sub.add_parser("ingest",
+                            help="store a PDF/image artifact and index its extracted text")
+    ingest.add_argument("paths", nargs="+",
+                        help="file(s), directory, or glob to ingest")
+    ingest.set_defaults(func=cmd_ingest)
 
     lint = sub.add_parser("lint", help="validate every document against the schema")
     lint.set_defaults(func=cmd_lint)
