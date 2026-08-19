@@ -64,6 +64,28 @@ class ExtractionFailed(Exception):
     """
 
 
+def _store_asset(source: Path, asset_abs: Path) -> None:
+    """Copy the artifact into place atomically.
+
+    A torn copy straight to the content-addressed name would be PERMANENT:
+    later ingests see the file exists and skip the repair, while the companion
+    asserts a sha256 those bytes do not have. Write to a sibling temp and
+    rename, so an interrupt leaves either nothing or the whole artifact.
+
+    NOTE (single-writer invariant): the temp name is deterministic, so two
+    concurrent ingests of the SAME bytes could interleave. Alexandria's ingest
+    is a deliberate single-operator action; a corpus-lock or random suffix is
+    filed as Phase-2 correctness work.
+    """
+    asset_abs.parent.mkdir(parents=True, exist_ok=True)
+    tmp_asset = asset_abs.with_name(f".{asset_abs.name}.partial")
+    try:
+        shutil.copy2(source, tmp_asset)
+        tmp_asset.replace(asset_abs)
+    finally:
+        tmp_asset.unlink(missing_ok=True)
+
+
 def _find_companion(corpus: Path, digest: str) -> Path | None:
     """The companion for these exact bytes, or None.
 
@@ -76,7 +98,13 @@ def _find_companion(corpus: Path, digest: str) -> Path | None:
     companion_dir = corpus / COMPANION_ROOT
     if not companion_dir.is_dir():
         return None
-    for candidate in sorted(companion_dir.glob(f"*-{digest[:8]}.md")):
+    # Match every width the allocator can emit (8/12/16/64). They all share the
+    # 8-char prefix, so a prefix-anywhere pattern finds them; the full-sha
+    # confirmation below makes stray glob hits harmless. Globbing only the
+    # 8-wide name made widened companions invisible, so every re-ingest
+    # re-extracted and allocated ANOTHER name -- duplicates asserting one
+    # identity, then a hard failure once the widths ran out.
+    for candidate in sorted(companion_dir.glob(f"*-{digest[:8]}*.md")):
         try:
             fm, _ = split_frontmatter(candidate.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -88,15 +116,24 @@ def _find_companion(corpus: Path, digest: str) -> Path | None:
 
 def _free_companion_path(corpus: Path, stem: str, digest: str) -> str:
     """A companion path that cannot collide with an unrelated artifact's."""
-    base = f"{COMPANION_ROOT}/{stem}-{digest[:8]}"
-    if not (corpus / f"{base}.md").exists():
-        return f"{base}.md"
-    # Prefix collision with a DIFFERENT artifact: disambiguate rather than
-    # overwrite. Widening the digest is deterministic and self-describing.
-    for width in (12, 16, 64):
-        wider = f"{COMPANION_ROOT}/{stem}-{digest[:width]}.md"
-        if not (corpus / wider).exists():
-            return wider
+    # Widening is only for a collision with a DIFFERENT artifact. If the
+    # occupant is OURS, reuse it -- widening past our own memory would fork it.
+    for width in (8, 12, 16, 64):
+        candidate = f"{COMPANION_ROOT}/{stem}-{digest[:width]}.md"
+        occupant = corpus / candidate
+        if not occupant.exists():
+            return candidate
+        try:
+            fm, _ = split_frontmatter(occupant.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # Unreadable frontmatter at our exact target name: refuse rather
+            # than silently widen, which would fork identity invisibly (the
+            # duplicate-digest lint is Phase 2 and cannot back-stop us yet).
+            raise ExtractionFailed(
+                f"{candidate}: companion exists but its frontmatter is unreadable; "
+                f"repair or remove it before re-ingesting")
+        if isinstance(fm, dict) and (fm.get("ingest") or {}).get("sha256") == digest:
+            return candidate
     raise ExtractionFailed(f"cannot allocate a companion path for {digest[:8]}")
 
 
@@ -203,7 +240,14 @@ def ingest_path(
     asset_abs = corpus / asset_rel
 
     known = _find_companion(corpus, digest)
-    if known is not None and asset_abs.exists() and _sha256(asset_abs) == digest:
+    if known is not None:
+        # These bytes are already a memory. Restore the artifact if it went
+        # missing or got damaged -- that is a byte copy, never an extractor
+        # call -- and NEVER touch the companion: re-extracting would mutate a
+        # stored memory (and clobber operator edits) through a side door that
+        # the pre-extraction short-circuit alone does not cover.
+        if not asset_abs.exists() or _sha256(asset_abs) != digest:
+            _store_asset(source, asset_abs)
         return IngestResult(asset_path=asset_rel,
                             doc_path=known.relative_to(corpus).as_posix(),
                             extraction=extraction, sha256=digest)
@@ -237,12 +281,7 @@ def ingest_path(
     # component's whole job, so it writes to a sibling temp and renames, and
     # re-copies anything already there whose digest does not match.
     if not asset_abs.exists() or _sha256(asset_abs) != digest:
-        tmp_asset = asset_abs.with_name(f".{asset_abs.name}.partial")
-        try:
-            shutil.copy2(source, tmp_asset)
-            tmp_asset.replace(asset_abs)
-        finally:
-            tmp_asset.unlink(missing_ok=True)
+        _store_asset(source, asset_abs)
 
     known = _find_companion(corpus, digest)
     if known is not None:

@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from alexandria.ingest import (
+    COMPANION_ROOT,
     ExtractionFailed,
     UnsupportedArtifact,
     ingest_path,
@@ -445,35 +446,83 @@ def test_a_missing_absolute_path_reports_cleanly_instead_of_crashing(tmp_path, c
 def test_a_digest8_collision_can_never_overwrite_another_artifacts_memory(tmp_path):
     """The companion glob matches on 32 bits; a false hit would DESTROY a memory.
 
-    Artifact B reusing A's companion rewrites it to assert B's sha and B's
-    asset -- A's memory is silently gone, with no error anywhere. That is
-    exactly the permanent-and-silent shape the atomic-write fix closed, one
-    layer up, and 2^32 is grindable by anyone who can hand us a file.
+    A forged companion is actually WRITTEN here at the attacker's own digest8
+    (so the attacker's lookup really does glob it up) but carrying a DIFFERENT
+    full sha256. Pre-fix, reuse-by-prefix rewrote that file and the victim's
+    memory silently became the attacker's. Post-fix, the full-sha confirmation
+    rejects it and the attacker is diverted to its own path.
     """
     from alexandria.corpus import Doc
 
     corpus = _corpus(tmp_path)
-    victim = tmp_path / "victim.pdf"
-    victim.write_bytes(_PDF)
-    first = ingest_path(victim, corpus)
-    victim_sha = Doc.read(corpus / first.doc_path, corpus).frontmatter["ingest"]["sha256"]
+    attacker = tmp_path / "attacker.pdf"
+    attacker.write_bytes(_PDF.replace(b"smoke test", b"other doc"))
+    attacker_sha = hashlib.sha256(attacker.read_bytes()).hexdigest()
 
-    # Forge a DIFFERENT artifact whose companion name collides on digest[:8].
-    other = tmp_path / "attacker.pdf"
-    other.write_bytes(_PDF.replace(b"smoke test", b"other doc"))
-    other_sha = hashlib.sha256(other.read_bytes()).hexdigest()
-    assert other_sha != victim_sha
-    colliding = corpus / "sources/assets" / f"attacker-{victim_sha[:8]}.md"
-    colliding.parent.mkdir(parents=True, exist_ok=True)
+    # A pre-existing memory whose companion name collides on digest[:8] with
+    # the attacker's, but whose recorded identity is a different artifact.
+    victim_sha = "f" * 64
+    forged = corpus / COMPANION_ROOT / f"victim-{attacker_sha[:8]}.md"
+    forged.parent.mkdir(parents=True, exist_ok=True)
+    forged.write_text(
+        "---\n"
+        "type: doc\ntitle: victim\nsource: ingest\nsource_id: victimid\n"
+        "generated:\n  by: connector/ingest\n  at: '2026-01-01T00:00:00+0000'\n"
+        f"ingest:\n  sha256: {victim_sha}\n  asset: assets/ff/{victim_sha}.pdf\n"
+        "---\nthe victim's irreplaceable memory\n",
+        encoding="utf-8")
+    before = forged.read_bytes()
 
-    result = ingest_path(other, corpus)
+    result = ingest_path(attacker, corpus)
 
-    # The victim's memory must be intact and still describe the victim.
-    survivor = Doc.read(corpus / first.doc_path, corpus)
-    assert survivor.frontmatter["ingest"]["sha256"] == victim_sha, (
+    assert forged.read_bytes() == before, (
         "a digest8 collision overwrote another artifact's memory")
-    assert result.doc_path != first.doc_path
-    assert Doc.read(corpus / result.doc_path, corpus).frontmatter["ingest"]["sha256"] == other_sha
+    assert result.doc_path != forged.relative_to(corpus).as_posix()
+    assert Doc.read(corpus / result.doc_path, corpus).frontmatter["ingest"]["sha256"] == attacker_sha
+
+
+def test_a_collision_widened_companion_is_still_found_on_re_ingest(tmp_path):
+    """The seam between discovery and allocation must not disagree.
+
+    Allocation widens a colliding name to digest[:12]; if discovery only globs
+    digest[:8], that artifact is invisible forever -- so every re-ingest
+    re-extracts (Gate 2 void for exactly the artifacts Gate 1 protects) and
+    allocates ANOTHER companion, accumulating duplicates that assert one
+    identity, until the widths run out and it hard-fails.
+    """
+    corpus = _corpus(tmp_path)
+    art = tmp_path / "paper.pdf"
+    art.write_bytes(_PDF)
+    digest = hashlib.sha256(_PDF).hexdigest()
+
+    # Occupy the exact digest[:8] name with a DIFFERENT artifact's memory,
+    # forcing the allocator to widen.
+    squatter = corpus / COMPANION_ROOT / f"paper-{digest[:8]}.md"
+    squatter.parent.mkdir(parents=True, exist_ok=True)
+    squatter.write_text(
+        "---\ntype: doc\ntitle: squatter\nsource: ingest\nsource_id: sq\n"
+        "generated:\n  by: connector/ingest\n  at: '2026-01-01T00:00:00+0000'\n"
+        f"ingest:\n  sha256: {'a' * 64}\n  asset: assets/aa/x.pdf\n"
+        "---\nsquatter body\n", encoding="utf-8")
+
+    first = ingest_path(art, corpus)
+    assert first.doc_path != squatter.relative_to(corpus).as_posix()
+
+    calls = []
+    real = _count_extractions(calls)
+    second = ingest_path(art, corpus, describe_image=real)
+
+    assert second.doc_path == first.doc_path, (
+        "a widened companion was invisible on re-ingest -- duplicates would accumulate")
+    assert len(list((corpus / COMPANION_ROOT).glob("paper-*.md"))) == 2, (
+        "exactly the squatter plus one companion for this artifact")
+
+
+def _count_extractions(calls):
+    def describe(path):
+        calls.append(path)
+        return "should never be called for known bytes"
+    return describe
 
 
 def test_reingesting_known_bytes_does_not_re_extract_or_mutate_the_memory(tmp_path):
@@ -522,3 +571,36 @@ def test_a_directory_with_only_unsupported_files_is_not_a_silent_success(tmp_pat
 
     assert app(["--corpus", str(corpus), "ingest", str(drop)]) == 2
     assert "nothing to ingest" in capsys.readouterr().err
+
+
+def test_restoring_a_lost_asset_never_rewrites_the_surviving_memory(tmp_path):
+    """The side door: companion known, asset missing.
+
+    The pre-extraction shortcut is skipped (the asset must be restored), so
+    extraction re-runs and the post-write path would rewrite the Doc -- mutating
+    a stored memory through a path Gate 2 does not cover. Restoring bytes needs
+    a byte copy, not an extractor call whose output overwrites the survivor.
+    """
+    from alexandria.corpus import Doc
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "screenshot.png"
+    src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"fake-pixels")
+
+    calls = []
+
+    def vision(path):
+        calls.append(path)
+        return f"description number {len(calls)}"
+
+    first = ingest_path(src, corpus, describe_image=vision)
+    body_before = Doc.read(corpus / first.doc_path, corpus).body
+    (corpus / first.asset_path).unlink()          # the artifact is lost
+
+    again = ingest_path(src, corpus, describe_image=vision)
+
+    assert (corpus / again.asset_path).read_bytes() == src.read_bytes(), "asset not restored"
+    assert again.doc_path == first.doc_path
+    assert Doc.read(corpus / again.doc_path, corpus).body == body_before, (
+        "restoring a lost asset rewrote the surviving memory")
+    assert calls == [src], "restoring bytes should not re-run extraction"
