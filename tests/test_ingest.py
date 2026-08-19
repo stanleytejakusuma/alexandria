@@ -10,6 +10,7 @@ Embedder protocol, store search, fusion and reranker stay untouched.
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 from pathlib import Path
 
@@ -43,6 +44,22 @@ _PDF = (
 # on the CI runner, so tests that exercise the REAL extraction path must skip
 # rather than fail -- the engine's own behaviour when it is missing is covered
 # by test_a_missing_pdftotext_is_a_clean_refusal_not_a_crash below.
+class _FakeResponse:
+    """Minimal stand-in for urlopen's context-manager response."""
+
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode()
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 requires_pdftotext = pytest.mark.skipif(
     shutil.which("pdftotext") is None, reason="pdftotext (poppler) not installed")
 
@@ -743,20 +760,15 @@ def test_the_default_vision_route_calls_the_gateway_with_a_proper_image_payload(
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
     sent = {}
 
-    def fake_post(url, headers=None, json=None, timeout=None):
-        sent["url"] = url
-        sent["auth"] = (headers or {}).get("Authorization", "")
-        sent["body"] = json
-
-        class Resp:
-            status_code = 200
-            def raise_for_status(self): pass
-            def json(self):
-                return {"choices": [{"message": {"content": "A login screen with an error banner."}}]}
-        return Resp()
+    def fake_urlopen(req, timeout=None):
+        sent["url"] = req.full_url
+        sent["auth"] = req.get_header("Authorization", "")
+        sent["body"] = json.loads(req.data)
+        return _FakeResponse({"choices": [
+            {"message": {"content": "A login screen with an error banner."}}]})
 
     monkeypatch.setattr(ing, "_vision_api_key", lambda: "test-key")
-    monkeypatch.setattr(ing.requests, "post", fake_post)
+    monkeypatch.setattr(ing.urllib.request, "urlopen", fake_urlopen)
 
     text = ing._describe_image_via_gateway(png)
 
@@ -777,18 +789,14 @@ def test_a_jpeg_is_sent_with_its_own_mime_type_not_a_hardcoded_png(tmp_path, mon
     jpg.write_bytes(b"\xff\xd8\xff\xe0" + b"jpegdata")
     seen = {}
 
-    def fake_post(url, headers=None, json=None, timeout=None):
-        seen["url"] = next(p for p in json["messages"][0]["content"]
+    def fake_urlopen(req, timeout=None):
+        body = json.loads(req.data)
+        seen["url"] = next(p for p in body["messages"][0]["content"]
                            if p["type"] == "image_url")["image_url"]["url"]
-
-        class Resp:
-            status_code = 200
-            def raise_for_status(self): pass
-            def json(self): return {"choices": [{"message": {"content": "a photo"}}]}
-        return Resp()
+        return _FakeResponse({"choices": [{"message": {"content": "a photo"}}]})
 
     monkeypatch.setattr(ing, "_vision_api_key", lambda: "k")
-    monkeypatch.setattr(ing.requests, "post", fake_post)
+    monkeypatch.setattr(ing.urllib.request, "urlopen", fake_urlopen)
     ing._describe_image_via_gateway(jpg)
 
     assert seen["url"].startswith("data:image/jpeg;base64,")
@@ -803,10 +811,10 @@ def test_an_unreachable_vision_gateway_becomes_a_named_refusal(tmp_path, monkeyp
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
 
     def boom(*a, **k):
-        raise ing.requests.exceptions.ConnectionError("connection refused")
+        raise ing.urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(ing, "_vision_api_key", lambda: "k")
-    monkeypatch.setattr(ing.requests, "post", boom)
+    monkeypatch.setattr(ing.urllib.request, "urlopen", boom)
 
     with pytest.raises(ExtractionFailed, match="vision"):
         ingest_path(png, corpus)
@@ -821,7 +829,7 @@ def test_a_missing_vision_key_refuses_instead_of_calling_the_gateway(tmp_path, m
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
 
     monkeypatch.setattr(ing, "_vision_api_key", lambda: "")
-    monkeypatch.setattr(ing.requests, "post",
+    monkeypatch.setattr(ing.urllib.request, "urlopen",
                         lambda *a, **k: pytest.fail("must not call the gateway with no key"))
 
     with pytest.raises(ExtractionFailed, match="no vision credential"):

@@ -27,15 +27,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-
-import requests
 
 from .corpus import Doc, slugify, split_frontmatter
 
@@ -288,24 +289,26 @@ def _describe_image_via_gateway(path: Path) -> str:
 
     mime = MIME_TYPES.get(path.suffix.lower(), "application/octet-stream")
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    payload = json.dumps({
+        "model": VISION_MODEL,
+        "stream": False,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": VISION_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+        ]}],
+    }).encode()
+    # stdlib urllib, matching llm.py: this project keeps its runtime dependency
+    # list to three packages on purpose ("your data outlives the engine"), so a
+    # new HTTP client for one code path is not a trade worth making.
+    request = urllib.request.Request(
+        f"{VISION_BASE_URL.rstrip('/')}/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"},
+    )
     try:
-        resp = requests.post(
-            f"{VISION_BASE_URL.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {key}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": VISION_MODEL,
-                "stream": False,
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": VISION_PROMPT},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-                ]}],
-            },
-            timeout=300,
-        )
-        resp.raise_for_status()
-        body = resp.json()
+        with urllib.request.urlopen(request, timeout=300) as resp:
+            body = json.loads(resp.read())
     except Exception as exc:   # transport, HTTP status, or malformed JSON
         raise ExtractionFailed(
             f"vision extraction failed on {path.name}: {exc}") from exc
