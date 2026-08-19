@@ -10,6 +10,7 @@ Embedder protocol, store search, fusion and reranker stay untouched.
 from __future__ import annotations
 
 import hashlib
+import shutil
 from pathlib import Path
 
 import pytest
@@ -38,11 +39,19 @@ _PDF = (
 )
 
 
+# pdftotext is a system binary (poppler). It is present on the dev Mac but NOT
+# on the CI runner, so tests that exercise the REAL extraction path must skip
+# rather than fail -- the engine's own behaviour when it is missing is covered
+# by test_a_missing_pdftotext_is_a_clean_refusal_not_a_crash below.
+requires_pdftotext = pytest.mark.skipif(
+    shutil.which("pdftotext") is None, reason="pdftotext (poppler) not installed")
+
 def _corpus(tmp_path: Path) -> Path:
     (tmp_path / "sources").mkdir(parents=True, exist_ok=True)
     return tmp_path
 
 
+@requires_pdftotext
 def test_a_pdf_is_preserved_verbatim_and_gets_a_searchable_companion(tmp_path):
     """The artifact IS the memory: the original bytes must survive ingest.
 
@@ -65,6 +74,7 @@ def test_a_pdf_is_preserved_verbatim_and_gets_a_searchable_companion(tmp_path):
     assert companion.suffix == ".md"
 
 
+@requires_pdftotext
 def test_the_preserved_binary_is_invisible_to_the_indexer_by_construction(tmp_path):
     """No is_indexable_source change is needed -- and none may be required.
 
@@ -85,6 +95,7 @@ def test_the_preserved_binary_is_invisible_to_the_indexer_by_construction(tmp_pa
     assert not (corpus / result.asset_path).name.endswith(".md")
 
 
+@requires_pdftotext
 def test_the_companion_carries_provenance_that_survives_in_frontmatter(tmp_path):
     """Provenance is what makes an ingested memory auditable later."""
     from alexandria.corpus import Doc
@@ -106,6 +117,7 @@ def test_the_companion_carries_provenance_that_survives_in_frontmatter(tmp_path)
         "the companion must point back at the artifact so a hit can open it")
 
 
+@requires_pdftotext
 def test_the_extracted_text_is_actually_in_the_body_so_search_can_find_it(tmp_path):
     """A companion with no text is a memory that cannot be recalled."""
     from alexandria.corpus import Doc
@@ -120,6 +132,7 @@ def test_the_extracted_text_is_actually_in_the_body_so_search_can_find_it(tmp_pa
     assert "Pensieve ingest smoke test" in body
 
 
+@requires_pdftotext
 def test_content_addressed_storage_deduplicates_the_same_artifact(tmp_path):
     """Re-ingesting the same bytes must not fork the memory."""
     corpus = _corpus(tmp_path)
@@ -222,6 +235,7 @@ def test_an_unreachable_vision_gateway_fails_closed_rather_than_guessing(tmp_pat
 # The weekly loop never calls ingest (it drives connectors), so manual and
 # bridge-skill invocation must be pleasant: a file, a directory, or a glob.
 
+@requires_pdftotext
 def test_cli_ingests_a_single_file_and_reports_what_it_stored(tmp_path, capsys):
     from alexandria.cli import app
 
@@ -235,6 +249,7 @@ def test_cli_ingests_a_single_file_and_reports_what_it_stored(tmp_path, capsys):
     assert "sources/assets/" in out, "the operator must see where the memory landed"
 
 
+@requires_pdftotext
 def test_cli_ingests_a_whole_directory_in_one_invocation(tmp_path, capsys):
     from alexandria.cli import app
 
@@ -248,6 +263,7 @@ def test_cli_ingests_a_whole_directory_in_one_invocation(tmp_path, capsys):
     assert len(list((corpus / "sources/assets").glob("*.md"))) == 2
 
 
+@requires_pdftotext
 def test_cli_keeps_going_after_a_BROKEN_supported_file_and_exits_nonzero(tmp_path, capsys):
     """A batch must not lose every good artifact to one bad one -- and a
     supported artifact that failed extraction must still show up in the code.
@@ -272,6 +288,7 @@ def test_cli_keeps_going_after_a_BROKEN_supported_file_and_exits_nonzero(tmp_pat
 
 # --- durability + batch semantics (Red review round 1) ---------------------
 
+@requires_pdftotext
 def test_a_torn_asset_write_is_never_left_behind_or_treated_as_valid(tmp_path, monkeypatch):
     """The dedup check makes corruption PERMANENT, so the write must be atomic.
 
@@ -306,6 +323,7 @@ def test_a_torn_asset_write_is_never_left_behind_or_treated_as_valid(tmp_path, m
     assert (corpus / result.asset_path).read_bytes() == _PDF
 
 
+@requires_pdftotext
 def test_a_preexisting_corrupt_asset_is_repaired_not_trusted(tmp_path):
     """Dedup must verify what is stored, not just that something is stored."""
     corpus = _corpus(tmp_path)
@@ -321,6 +339,7 @@ def test_a_preexisting_corrupt_asset_is_repaired_not_trusted(tmp_path):
         "a damaged asset was trusted on the dedup path instead of repaired")
 
 
+@requires_pdftotext
 def test_an_unreadable_file_is_skipped_without_killing_the_batch(tmp_path, capsys):
     """OSError must be a per-file skip: one bad file must not abandon the rest."""
     from alexandria.cli import app
@@ -342,6 +361,7 @@ def test_an_unreadable_file_is_skipped_without_killing_the_batch(tmp_path, capsy
         bad.chmod(0o644)
 
 
+@requires_pdftotext
 def test_a_directory_of_unsupported_files_is_not_a_failure(tmp_path, capsys):
     """Exit codes must stay meaningful.
 
@@ -377,6 +397,7 @@ def test_an_explicitly_named_unsupported_file_still_fails(tmp_path, capsys):
     assert "mystery.bin" in capsys.readouterr().err
 
 
+@requires_pdftotext
 def test_the_same_bytes_under_a_new_name_stay_ONE_memory(tmp_path):
     """Content-addressed means one artifact AND one companion.
 
@@ -398,6 +419,7 @@ def test_the_same_bytes_under_a_new_name_stay_ONE_memory(tmp_path):
     assert len(list((corpus / "sources/assets").glob("*.md"))) == 1
 
 
+@requires_pdftotext
 def test_a_hostile_filename_cannot_break_out_of_frontmatter(tmp_path):
     """original_name is attacker-influenced text landing in YAML."""
     from alexandria.corpus import Doc
@@ -443,6 +465,7 @@ def test_a_missing_absolute_path_reports_cleanly_instead_of_crashing(tmp_path, c
 
 # --- companion identity + memory stability (Red review round 2) ------------
 
+@requires_pdftotext
 def test_a_digest8_collision_can_never_overwrite_another_artifacts_memory(tmp_path):
     """The companion glob matches on 32 bits; a false hit would DESTROY a memory.
 
@@ -481,6 +504,7 @@ def test_a_digest8_collision_can_never_overwrite_another_artifacts_memory(tmp_pa
     assert Doc.read(corpus / result.doc_path, corpus).frontmatter["ingest"]["sha256"] == attacker_sha
 
 
+@requires_pdftotext
 def test_a_collision_widened_companion_is_still_found_on_re_ingest(tmp_path):
     """The seam between discovery and allocation must not disagree.
 
@@ -606,6 +630,7 @@ def test_restoring_a_lost_asset_never_rewrites_the_surviving_memory(tmp_path):
     assert calls == [src], "restoring bytes should not re-run extraction"
 
 
+@requires_pdftotext
 def test_nothing_lands_at_a_content_addressed_name_unless_the_bytes_hash_to_it(tmp_path, monkeypatch):
     """The last permanent-and-silent write: publish-then-trust.
 
@@ -635,6 +660,7 @@ def test_nothing_lands_at_a_content_addressed_name_unless_the_bytes_hash_to_it(t
         "bytes that do not hash to the name were published anyway")
 
 
+@requires_pdftotext
 def test_an_unreadable_companion_matching_our_digest_is_loud_not_skipped(tmp_path):
     """Symmetry with the allocation guard: an unconfirmable digest8 match is
     ambiguous about OUR identity, so discovery must refuse rather than silently
@@ -650,3 +676,52 @@ def test_an_unreadable_companion_matching_our_digest_is_loud_not_skipped(tmp_pat
 
     with pytest.raises(ExtractionFailed, match="frontmatter is unreadable"):
         ingest_path(src, corpus)
+
+
+def test_a_missing_pdftotext_is_a_clean_refusal_not_a_crash(tmp_path, monkeypatch):
+    """The engine must degrade honestly where poppler is absent.
+
+    CI runners (and any Linux/NAS deployment) may not have pdftotext. Alexandria
+    is harness- and host-agnostic by design, so a missing system binary has to
+    become a named refusal that names the fix -- never a bare FileNotFoundError
+    traceback, and never a silently empty memory.
+    """
+    import alexandria.ingest as ing
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "paper.pdf"
+    src.write_bytes(_PDF)
+
+    def no_binary(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "pdftotext")
+
+    monkeypatch.setattr(ing.subprocess, "run", no_binary)
+
+    with pytest.raises(ExtractionFailed, match="pdftotext is not installed"):
+        ingest_path(src, corpus)
+
+    assert list(corpus.rglob("*.md")) == []
+    assert [p for p in (corpus / "assets").rglob("*") if p.is_file()] == []
+
+
+def test_the_cli_surfaces_a_missing_extractor_without_killing_the_batch(tmp_path, monkeypatch, capsys):
+    """A host without poppler must still ingest its images, and say why the
+    PDFs were skipped."""
+    import alexandria.ingest as ing
+    from alexandria.cli import app
+
+    corpus = _corpus(tmp_path)
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    (drop / "doc.pdf").write_bytes(_PDF)
+
+    def no_binary(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "pdftotext")
+
+    monkeypatch.setattr(ing.subprocess, "run", no_binary)
+
+    code = app(["--corpus", str(corpus), "ingest", str(drop)])
+
+    assert code != 0, "a supported artifact that could not be read is a real failure"
+    err = capsys.readouterr().err
+    assert "doc.pdf" in err and "pdftotext is not installed" in err
