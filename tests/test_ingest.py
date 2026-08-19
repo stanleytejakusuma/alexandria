@@ -509,13 +509,13 @@ def test_a_collision_widened_companion_is_still_found_on_re_ingest(tmp_path):
     assert first.doc_path != squatter.relative_to(corpus).as_posix()
 
     calls = []
-    real = _count_extractions(calls)
-    second = ingest_path(art, corpus, describe_image=real)
+    second = ingest_path(art, corpus, describe_image=_count_extractions(calls))
 
     assert second.doc_path == first.doc_path, (
         "a widened companion was invisible on re-ingest -- duplicates would accumulate")
     assert len(list((corpus / COMPANION_ROOT).glob("paper-*.md"))) == 2, (
         "exactly the squatter plus one companion for this artifact")
+    assert calls == [], "known bytes must not re-extract, whatever the name width"
 
 
 def _count_extractions(calls):
@@ -604,3 +604,49 @@ def test_restoring_a_lost_asset_never_rewrites_the_surviving_memory(tmp_path):
     assert Doc.read(corpus / again.doc_path, corpus).body == body_before, (
         "restoring a lost asset rewrote the surviving memory")
     assert calls == [src], "restoring bytes should not re-run extraction"
+
+
+def test_nothing_lands_at_a_content_addressed_name_unless_the_bytes_hash_to_it(tmp_path, monkeypatch):
+    """The last permanent-and-silent write: publish-then-trust.
+
+    The digest is taken from the source BEFORE the copy, so a source mutated or
+    torn-read in between would publish wrong bytes under a name asserting
+    otherwise -- the exact poisoning the temp-and-rename dance exists to
+    prevent, one layer down. Nothing may land at a content-addressed name
+    unless the temp's own hash equals that name.
+    """
+    import alexandria.ingest as ing
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "paper.pdf"
+    src.write_bytes(_PDF)
+
+    real_copy = ing.shutil.copy2
+
+    def swapped_copy(a, b, *args, **kwargs):
+        Path(b).write_bytes(b"%PDF-1.4 different bytes entirely\n")
+
+    monkeypatch.setattr(ing.shutil, "copy2", swapped_copy)
+    with pytest.raises(ExtractionFailed, match="do not match the expected digest"):
+        ingest_path(src, corpus)
+
+    monkeypatch.setattr(ing.shutil, "copy2", real_copy)
+    assert [p for p in (corpus / "assets").rglob("*") if p.is_file()] == [], (
+        "bytes that do not hash to the name were published anyway")
+
+
+def test_an_unreadable_companion_matching_our_digest_is_loud_not_skipped(tmp_path):
+    """Symmetry with the allocation guard: an unconfirmable digest8 match is
+    ambiguous about OUR identity, so discovery must refuse rather than silently
+    fork a second memory for the same bytes."""
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "paper.pdf"
+    src.write_bytes(_PDF)
+    digest = hashlib.sha256(_PDF).hexdigest()
+
+    broken = corpus / COMPANION_ROOT / f"paper-{digest[:12]}.md"
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text("---\nthis: [is not: valid yaml\n---\nbody\n", encoding="utf-8")
+
+    with pytest.raises(ExtractionFailed, match="frontmatter is unreadable"):
+        ingest_path(src, corpus)

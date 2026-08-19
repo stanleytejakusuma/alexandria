@@ -64,7 +64,7 @@ class ExtractionFailed(Exception):
     """
 
 
-def _store_asset(source: Path, asset_abs: Path) -> None:
+def _store_asset(source: Path, asset_abs: Path, digest: str) -> None:
     """Copy the artifact into place atomically.
 
     A torn copy straight to the content-addressed name would be PERMANENT:
@@ -81,9 +81,42 @@ def _store_asset(source: Path, asset_abs: Path) -> None:
     tmp_asset = asset_abs.with_name(f".{asset_abs.name}.partial")
     try:
         shutil.copy2(source, tmp_asset)
+        # NOTHING lands at a content-addressed name unless the bytes hash to it.
+        # The digest was taken from the source before this copy, so a source
+        # mutated or torn-read in between would otherwise publish wrong bytes
+        # under a name asserting otherwise -- the same poisoning the rename
+        # prevents, one layer down. This closes that whole TOCTOU family.
+        if _sha256(tmp_asset) != digest:
+            raise ExtractionFailed(
+                f"{source.name}: copied bytes do not match the expected digest "
+                f"{digest[:12]} (the file changed while it was being read)")
         tmp_asset.replace(asset_abs)
     finally:
         tmp_asset.unlink(missing_ok=True)
+
+
+def _companion_claims(candidate: Path, digest: str) -> bool:
+    """Whether this companion records exactly these bytes.
+
+    ONE home for the predicate: discovery and allocation both need it, and
+    parallel copies at a seam are precisely how this feature kept re-creating
+    the same defect. Unreadable frontmatter on a digest8 match is LOUD, not
+    skipped -- a candidate we cannot confirm is ambiguous about our identity,
+    and silently skipping it forks a second memory for the same artifact.
+    """
+    try:
+        fm, _ = split_frontmatter(candidate.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ExtractionFailed(
+            f"{candidate.name}: companion frontmatter is unreadable, so its "
+            f"identity cannot be confirmed; repair or remove it ({exc})") from exc
+    if not isinstance(fm, dict):
+        # split_frontmatter returns None for malformed/absent frontmatter
+        # rather than raising, so the None case IS the unreadable case.
+        raise ExtractionFailed(
+            f"{candidate.name}: companion frontmatter is unreadable, so its "
+            f"identity cannot be confirmed; repair or remove it")
+    return (fm.get("ingest") or {}).get("sha256") == digest
 
 
 def _find_companion(corpus: Path, digest: str) -> Path | None:
@@ -105,11 +138,7 @@ def _find_companion(corpus: Path, digest: str) -> Path | None:
     # re-extracted and allocated ANOTHER name -- duplicates asserting one
     # identity, then a hard failure once the widths ran out.
     for candidate in sorted(companion_dir.glob(f"*-{digest[:8]}*.md")):
-        try:
-            fm, _ = split_frontmatter(candidate.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(fm, dict) and (fm.get("ingest") or {}).get("sha256") == digest:
+        if _companion_claims(candidate, digest):
             return candidate
     return None
 
@@ -123,16 +152,7 @@ def _free_companion_path(corpus: Path, stem: str, digest: str) -> str:
         occupant = corpus / candidate
         if not occupant.exists():
             return candidate
-        try:
-            fm, _ = split_frontmatter(occupant.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # Unreadable frontmatter at our exact target name: refuse rather
-            # than silently widen, which would fork identity invisibly (the
-            # duplicate-digest lint is Phase 2 and cannot back-stop us yet).
-            raise ExtractionFailed(
-                f"{candidate}: companion exists but its frontmatter is unreadable; "
-                f"repair or remove it before re-ingesting")
-        if isinstance(fm, dict) and (fm.get("ingest") or {}).get("sha256") == digest:
+        if _companion_claims(occupant, digest):
             return candidate
     raise ExtractionFailed(f"cannot allocate a companion path for {digest[:8]}")
 
@@ -247,7 +267,7 @@ def ingest_path(
         # stored memory (and clobber operator edits) through a side door that
         # the pre-extraction short-circuit alone does not cover.
         if not asset_abs.exists() or _sha256(asset_abs) != digest:
-            _store_asset(source, asset_abs)
+            _store_asset(source, asset_abs, digest)
         return IngestResult(asset_path=asset_rel,
                             doc_path=known.relative_to(corpus).as_posix(),
                             extraction=extraction, sha256=digest)
@@ -281,7 +301,7 @@ def ingest_path(
     # component's whole job, so it writes to a sibling temp and renames, and
     # re-copies anything already there whose digest does not match.
     if not asset_abs.exists() or _sha256(asset_abs) != digest:
-        _store_asset(source, asset_abs)
+        _store_asset(source, asset_abs, digest)
 
     known = _find_companion(corpus, digest)
     if known is not None:
