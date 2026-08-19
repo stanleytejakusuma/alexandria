@@ -110,10 +110,26 @@ def cmd_ingest(args) -> int:
     action. A batch keeps going past a bad artifact but still exits non-zero --
     silently dropping one file out of twenty is how a memory disappears.
     """
-    from .ingest import ExtractionFailed, UnsupportedArtifact, ingest_path
+    from .ingest import ExtractionFailed, UnsupportedArtifact, ingest_path, refresh_ingest
 
     config = _config_for(args)
     corpus = config.corpus_path
+
+    if getattr(args, "refresh", False):
+        refreshed = failed = 0
+        for raw in args.paths:
+            try:
+                result = refresh_ingest(corpus, raw)
+            except (UnsupportedArtifact, ExtractionFailed) as exc:
+                print(f"ingest: refresh failed for {raw}: {exc}", file=sys.stderr)
+                failed += 1
+                continue
+            print(f"ingest: refreshed {result.doc_path} (via {result.extraction})")
+            refreshed += 1
+        print(f"ingest: {refreshed} refreshed, {failed} failed")
+        if refreshed:
+            print("ingest: run `alexandria index` to re-embed the updated text")
+        return 1 if failed and not refreshed else (2 if not refreshed and not failed else 0)
 
     from .ingest import IMAGE_SUFFIXES, PDF_SUFFIXES
 
@@ -200,6 +216,12 @@ def cmd_lint(args) -> int:
             if issue.severity is Severity.ERROR:
                 errors += 1
                 print(f"ERROR {doc.path}: {issue.code} {issue.field} -- {issue.message}")
+    from .ingest import lint_assets
+    asset_findings = lint_assets(corpus)
+    for finding in asset_findings:
+        print(f"ERROR (assets): {finding}")
+        errors += 1
+
     print(f"\nlint: {checked} documents, {errors} error(s)")
     return 1 if errors else 0
 
@@ -1807,7 +1829,13 @@ def build_parser() -> argparse.ArgumentParser:
     ingest = sub.add_parser("ingest",
                             help="store a PDF/image artifact and index its extracted text")
     ingest.add_argument("paths", nargs="+",
-                        help="file(s), directory, or glob to ingest")
+                        help="file(s), directory, or glob to ingest (or, with "
+                             "--refresh, asset path(s) to re-extract)")
+    ingest.add_argument("--refresh", action="store_true",
+                        help="re-extract and OVERWRITE the companion for an "
+                             "ALREADY-ingested asset (#54); paths name assets, "
+                             "not source files. Opt-in only -- the default "
+                             "ingest path never rewrites a known memory.")
     ingest.set_defaults(func=cmd_ingest)
 
     lint = sub.add_parser("lint", help="validate every document against the schema")

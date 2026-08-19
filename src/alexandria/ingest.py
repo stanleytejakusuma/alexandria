@@ -34,6 +34,7 @@ import subprocess
 import urllib.error
 import urllib.request
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -45,6 +46,8 @@ __all__ = [
     "IngestResult",
     "UnsupportedArtifact",
     "ingest_path",
+    "refresh_ingest",
+    "lint_assets",
 ]
 
 # Artifacts whose text lives in a PDF text layer.
@@ -101,13 +104,14 @@ def _store_asset(source: Path, asset_abs: Path, digest: str) -> None:
     asserts a sha256 those bytes do not have. Write to a sibling temp and
     rename, so an interrupt leaves either nothing or the whole artifact.
 
-    NOTE (single-writer invariant): the temp name is deterministic, so two
-    concurrent ingests of the SAME bytes could interleave. Alexandria's ingest
-    is a deliberate single-operator action; a corpus-lock or random suffix is
-    filed as Phase-2 correctness work.
+    The temp name is unique per writer (pid + a random token), so two
+    concurrent ingests of the SAME bytes never share a temp file -- each
+    writes and hashes its own, and the LAST rename simply wins (both would
+    write identical content-addressed bytes, since the name IS the hash).
     """
     asset_abs.parent.mkdir(parents=True, exist_ok=True)
-    tmp_asset = asset_abs.with_name(f".{asset_abs.name}.partial")
+    tmp_asset = asset_abs.with_name(
+        f".{asset_abs.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.partial")
     try:
         shutil.copy2(source, tmp_asset)
         # NOTHING lands at a content-addressed name unless the bytes hash to it.
@@ -437,3 +441,186 @@ def ingest_path(
 
     return IngestResult(asset_path=asset_rel, doc_path=doc_rel,
                         extraction=extraction, sha256=digest)
+
+
+def refresh_ingest(corpus: str | Path, asset: str | Path, *, describe_image=None) -> IngestResult:
+    """Re-extract and rewrite an ALREADY-ingested artifact's companion.
+
+    The default ingest path is a stable, content-addressed no-op BY DESIGN
+    (see ingest_path's docstring): re-encountering known bytes never
+    re-extracts, so an operator edit to the companion survives and a
+    nondeterministic vision model never silently rewrites a memory. That
+    means a provenance field added AFTER an artifact was ingested (`pages`,
+    #51's second commit) can never reach it through the normal path -- this
+    is the explicit escape hatch, opt-in only, never called by ingest_path or
+    a directory/glob sweep.
+
+    Refuses if the asset's bytes no longer match the sha256 the companion
+    asserts: re-extracting corrupted bytes into a companion that still claims
+    the OLD sha256 would silently launder the corruption into the record
+    that's supposed to catch it.
+    """
+    corpus = Path(corpus).expanduser()
+    asset_abs = Path(asset)
+    if not asset_abs.is_absolute():
+        asset_abs = corpus / asset
+
+    if not asset_abs.is_file():
+        raise ExtractionFailed(f"{asset_abs}: no such asset on disk")
+
+    # The asset's NAME asserts its identity (assets/<sha[:2]>/<sha><suffix>),
+    # independent of whatever bytes are on disk right now -- exactly the
+    # distinction that lets this refuse a corrupted asset instead of treating
+    # it as an unrelated, never-ingested file. Find the companion by the
+    # asserted digest, then verify the CURRENT bytes still match it.
+    asserted_digest = asset_abs.stem
+    companion = _find_companion(corpus, asserted_digest)
+    if companion is None:
+        raise ExtractionFailed(
+            f"{asset_abs.name}: no companion claims these bytes -- refresh "
+            f"only rewrites an EXISTING memory, it does not create one "
+            f"(use `alexandria ingest` for that)")
+
+    actual_digest = _sha256(asset_abs)
+    if actual_digest != asserted_digest:
+        raise ExtractionFailed(
+            f"{asset_abs.name}: on-disk bytes hash to {actual_digest[:12]}, but "
+            f"the asset name and its companion both assert sha256 "
+            f"{asserted_digest[:12]} -- the asset is corrupted; refusing to "
+            f"extract from it and launder the corruption into the companion "
+            f"that is supposed to catch it")
+    digest = actual_digest
+
+    doc = Doc.read(companion, corpus)
+    ingest_fm = dict(doc.frontmatter.get("ingest") or {})
+
+    suffix = asset_abs.suffix.lower()
+    if suffix in PDF_SUFFIXES:
+        extraction = "pdftotext"
+        text = _extract_pdf_text(asset_abs)
+    elif suffix in IMAGE_SUFFIXES:
+        extraction = "vision"
+        describe = describe_image or _describe_image_via_gateway
+        text = (describe(asset_abs) or "").strip()
+    else:
+        raise UnsupportedArtifact(
+            f"{asset_abs.name}: no extraction route for {suffix or 'files without a suffix'}")
+    if not text:
+        raise ExtractionFailed(
+            f"{asset_abs.name}: refresh produced no text; refusing to "
+            f"overwrite a memory with an empty one")
+
+    print(f"ingest: refresh is OVERWRITING the stored memory at {companion.name} "
+          f"({companion.relative_to(corpus)})")
+
+    provenance = dict(ingest_fm)
+    provenance["extraction"] = extraction
+    provenance["sha256"] = digest
+    if extraction == "pdftotext":
+        pages = _pdf_page_count(asset_abs)
+        if pages is not None:
+            provenance["pages"] = pages
+        else:
+            provenance.pop("pages", None)
+
+    new_fm = dict(doc.frontmatter)
+    new_fm["ingest"] = provenance
+    generated = dict(new_fm.get("generated") or {})
+    generated["at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    new_fm["generated"] = generated
+
+    Doc(path=doc.path, frontmatter=new_fm,
+        body=text if text.endswith("\n") else text + "\n").write(corpus)
+
+    asset_rel = provenance.get("asset") or asset_abs.relative_to(corpus).as_posix()
+    return IngestResult(asset_path=asset_rel, doc_path=doc.path,
+                        extraction=extraction, sha256=digest)
+
+
+def lint_assets(corpus: str | Path) -> list[str]:
+    """At-rest checks over the ingest layer: asset-digest audit, stray
+    ``.partial`` sweep, orphan assets, duplicate-digest companions, and
+    companions pointing at a missing asset.
+
+    Deferred out of #52's Red review (the phase built the write path; this is
+    the read-only health check over what it wrote). READ-ONLY by design: an
+    orphan asset or a duplicate companion is a judgment call for a human, not
+    something this engine repairs silently. A bad companion's fix is
+    ``alexandria ingest --refresh``, run deliberately.
+    """
+    corpus = Path(corpus).expanduser()
+    findings: list[str] = []
+    assets_dir = corpus / ASSET_ROOT
+    companion_dir = corpus / COMPANION_ROOT
+
+    # 1. Stray .partial files: _store_asset's temp name is a sibling of the
+    # final asset and is unlinked in a `finally`, so a survivor means the
+    # PROCESS itself died (not just the copy) -- worth a human's attention,
+    # never auto-deleted (it might be evidence, not just litter).
+    if assets_dir.is_dir():
+        for partial in sorted(assets_dir.rglob(".*.partial")):
+            findings.append(
+                f"stray .partial file (an interrupted ingest never cleaned up): "
+                f"{partial.relative_to(corpus)}")
+
+    # 2. Every companion under sources/assets/: confirm its recorded sha256
+    # against the asset ON DISK, confirm the asset exists at all, and track
+    # digest -> companions for the duplicate check.
+    by_digest: dict[str, list[str]] = {}
+    if companion_dir.is_dir():
+        for companion in sorted(companion_dir.glob("*.md")):
+            rel = companion.relative_to(corpus).as_posix()
+            try:
+                fm, _ = split_frontmatter(companion.read_text(encoding="utf-8"))
+            except OSError as exc:
+                findings.append(f"unreadable companion {rel}: {exc}")
+                continue
+            if fm is None:
+                findings.append(f"unreadable companion (malformed frontmatter): {rel}")
+                continue
+            ingest_fm = fm.get("ingest") or {}
+            recorded_sha = ingest_fm.get("sha256")
+            asset_rel = ingest_fm.get("asset")
+            if not recorded_sha or not asset_rel:
+                continue  # not an ingest companion (no ingest: block)
+            by_digest.setdefault(recorded_sha, []).append(rel)
+            asset_abs = corpus / asset_rel
+            if not asset_abs.is_file():
+                findings.append(
+                    f"companion {rel} points at a missing asset: {asset_rel}")
+                continue
+            actual = _sha256(asset_abs)
+            if actual != recorded_sha:
+                findings.append(
+                    f"asset digest mismatch for {rel}: companion records "
+                    f"sha256 {recorded_sha[:12]}, asset {asset_rel} actually "
+                    f"hashes to {actual[:12]}")
+
+    for digest, companions in sorted(by_digest.items()):
+        if len(companions) > 1:
+            findings.append(
+                f"duplicate companions claiming sha256 {digest[:12]}: "
+                f"{', '.join(companions)}")
+
+    # 3. Orphan assets: binaries with no companion pointing at them. Derived
+    # from by_digest (built above) rather than a second walk, so "claimed"
+    # means the SAME predicate the duplicate check uses.
+    claimed_assets: set[str] = set()
+    if companion_dir.is_dir():
+        for companion in sorted(companion_dir.glob("*.md")):
+            try:
+                fm, _ = split_frontmatter(companion.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            asset_rel = (fm or {}).get("ingest", {}).get("asset")
+            if asset_rel:
+                claimed_assets.add(asset_rel)
+    if assets_dir.is_dir():
+        for asset in sorted(assets_dir.rglob("*")):
+            if not asset.is_file() or asset.name.startswith("."):
+                continue
+            rel = asset.relative_to(corpus).as_posix()
+            if rel not in claimed_assets:
+                findings.append(f"orphan asset (no companion claims it): {rel}")
+
+    return findings
