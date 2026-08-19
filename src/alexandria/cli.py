@@ -99,6 +99,57 @@ def cmd_migrate(args) -> int:
     return 0
 
 
+def cmd_ingest(args) -> int:
+    """#51: preserve artifacts (PDF/image) and write their indexed companions.
+
+    Accepts a file, a directory, or a glob, because nothing calls this for you:
+    the weekly loop drives connectors, so ingest is a deliberate human/bridge
+    action. A batch keeps going past a bad artifact but still exits non-zero --
+    silently dropping one file out of twenty is how a memory disappears.
+    """
+    from .ingest import ExtractionFailed, UnsupportedArtifact, ingest_path
+
+    config = _config_for(args)
+    corpus = config.corpus_path
+
+    targets: list[Path] = []
+    for raw in args.paths:
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            targets.extend(sorted(p for p in path.rglob("*") if p.is_file()))
+        elif path.exists():
+            targets.append(path)
+        else:  # unexpanded glob, or a typo -- expand it here rather than trust the shell
+            matches = sorted(Path().glob(raw))
+            if not matches:
+                print(f"ingest: no such path: {raw}", file=sys.stderr)
+                return 2
+            targets.extend(p for p in matches if p.is_file())
+
+    if not targets:
+        print("ingest: nothing to ingest", file=sys.stderr)
+        return 2
+
+    ingested = skipped = 0
+    for path in targets:
+        try:
+            result = ingest_path(path, corpus)
+        except (UnsupportedArtifact, ExtractionFailed) as exc:
+            print(f"ingest: skipped {path.name}: {exc}", file=sys.stderr)
+            skipped += 1
+            continue
+        ingested += 1
+        print(f"ingest: {path.name} -> {result.doc_path} "
+              f"(asset {result.asset_path}, via {result.extraction})")
+
+    print(f"ingest: {ingested} artifact(s) stored, {skipped} skipped")
+    if ingested:
+        print("ingest: run `alexandria index` to make them searchable")
+    # Non-zero on ANY skip: a partial batch reporting success is the
+    # "reported success while doing nothing" failure this project keeps finding.
+    return 1 if skipped else 0
+
+
 def cmd_lint(args) -> int:
     corpus = _config_for(args).corpus_path
     errors = checked = 0
@@ -1588,6 +1639,12 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("archive", help="path to a backup_state() .tar.gz archive")
     restore.add_argument("--dry-run", action="store_true", help="list what would be restored, write nothing")
     restore.set_defaults(func=cmd_restore)
+
+    ingest = sub.add_parser("ingest",
+                            help="store a PDF/image artifact and index its extracted text")
+    ingest.add_argument("paths", nargs="+",
+                        help="file(s), directory, or glob to ingest")
+    ingest.set_defaults(func=cmd_ingest)
 
     lint = sub.add_parser("lint", help="validate every document against the schema")
     lint.set_defaults(func=cmd_lint)
