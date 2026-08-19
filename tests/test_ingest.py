@@ -725,3 +725,156 @@ def test_the_cli_surfaces_a_missing_extractor_without_killing_the_batch(tmp_path
     assert code != 0, "a supported artifact that could not be read is a real failure"
     err = capsys.readouterr().err
     assert "doc.pdf" in err and "pdftotext is not installed" in err
+
+
+# --- the REAL vision route (goal DONE criterion: an ingested image) ---------
+
+def test_the_default_vision_route_calls_the_gateway_with_a_proper_image_payload(tmp_path, monkeypatch):
+    """The default extractor must actually work on a host with no extra tooling.
+
+    A harness "skill" is a markdown prompt, not an executable: shelling out to
+    one fails on every host, so the engine speaks the documented
+    OpenAI-compatible gateway contract itself -- a chat/completions call
+    carrying an image_url data URI with the file's REAL mime type.
+    """
+    import alexandria.ingest as ing
+
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
+    sent = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        sent["url"] = url
+        sent["auth"] = (headers or {}).get("Authorization", "")
+        sent["body"] = json
+
+        class Resp:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": "A login screen with an error banner."}}]}
+        return Resp()
+
+    monkeypatch.setattr(ing, "_vision_api_key", lambda: "test-key")
+    monkeypatch.setattr(ing.requests, "post", fake_post)
+
+    text = ing._describe_image_via_gateway(png)
+
+    assert text == "A login screen with an error banner."
+    assert sent["url"].endswith("/v1/chat/completions")
+    assert sent["auth"].startswith("Bearer ")
+    parts = sent["body"]["messages"][0]["content"]
+    image_part = next(p for p in parts if p["type"] == "image_url")
+    assert image_part["image_url"]["url"].startswith("data:image/png;base64,"), (
+        "the payload must carry the file's real mime type, not a hardcoded one")
+    assert sent["body"]["stream"] is False
+
+
+def test_a_jpeg_is_sent_with_its_own_mime_type_not_a_hardcoded_png(tmp_path, monkeypatch):
+    import alexandria.ingest as ing
+
+    jpg = tmp_path / "photo.jpg"
+    jpg.write_bytes(b"\xff\xd8\xff\xe0" + b"jpegdata")
+    seen = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen["url"] = next(p for p in json["messages"][0]["content"]
+                           if p["type"] == "image_url")["image_url"]["url"]
+
+        class Resp:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self): return {"choices": [{"message": {"content": "a photo"}}]}
+        return Resp()
+
+    monkeypatch.setattr(ing, "_vision_api_key", lambda: "k")
+    monkeypatch.setattr(ing.requests, "post", fake_post)
+    ing._describe_image_via_gateway(jpg)
+
+    assert seen["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_an_unreachable_vision_gateway_becomes_a_named_refusal(tmp_path, monkeypatch):
+    """Offline-degradable, per the objective: refuse, never fabricate."""
+    import alexandria.ingest as ing
+
+    corpus = _corpus(tmp_path)
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
+
+    def boom(*a, **k):
+        raise ing.requests.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(ing, "_vision_api_key", lambda: "k")
+    monkeypatch.setattr(ing.requests, "post", boom)
+
+    with pytest.raises(ExtractionFailed, match="vision"):
+        ingest_path(png, corpus)
+    assert list(corpus.rglob("*.md")) == []
+
+
+def test_a_missing_vision_key_refuses_instead_of_calling_the_gateway(tmp_path, monkeypatch):
+    import alexandria.ingest as ing
+
+    corpus = _corpus(tmp_path)
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
+
+    monkeypatch.setattr(ing, "_vision_api_key", lambda: "")
+    monkeypatch.setattr(ing.requests, "post",
+                        lambda *a, **k: pytest.fail("must not call the gateway with no key"))
+
+    with pytest.raises(ExtractionFailed, match="no vision credential"):
+        ingest_path(png, corpus)
+
+
+# --- page count (objective: provenance carries it) -------------------------
+
+@requires_pdftotext
+def test_a_pdf_records_its_page_count_in_provenance(tmp_path, monkeypatch):
+    """The objective names page count as provenance, and Phase 2 needs it for
+    page-anchored citations ("resume.pdf p.2")."""
+    import alexandria.ingest as ing
+    from alexandria.corpus import Doc
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "paper.pdf"
+    src.write_bytes(_PDF)
+
+    monkeypatch.setattr(ing, "_pdf_page_count", lambda p: 10)
+    result = ingest_path(src, corpus)
+
+    assert Doc.read(corpus / result.doc_path, corpus).frontmatter["ingest"]["pages"] == 10
+
+
+@requires_pdftotext
+def test_a_missing_pdfinfo_omits_pages_rather_than_failing_the_ingest(tmp_path, monkeypatch):
+    """pdfinfo is another optional system binary. Its absence must cost the
+    page count, never the memory -- degrade, do not refuse."""
+    import alexandria.ingest as ing
+    from alexandria.corpus import Doc
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "paper.pdf"
+    src.write_bytes(_PDF)
+
+    monkeypatch.setattr(ing, "_pdf_page_count", lambda p: None)
+    result = ingest_path(src, corpus)
+
+    fm = Doc.read(corpus / result.doc_path, corpus).frontmatter["ingest"]
+    assert "pages" not in fm, "an unknown page count must be absent, not a wrong number"
+    assert fm["sha256"]
+
+
+def test_an_image_has_no_page_count(tmp_path):
+    """pages is meaningful for paged documents only; asserting 1 for an image
+    would be inventing provenance."""
+    from alexandria.corpus import Doc
+
+    corpus = _corpus(tmp_path)
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
+
+    result = ingest_path(png, corpus, describe_image=lambda p: "a screenshot")
+
+    assert "pages" not in Doc.read(corpus / result.doc_path, corpus).frontmatter["ingest"]

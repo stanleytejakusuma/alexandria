@@ -25,13 +25,17 @@ would index cleanly and then answer nothing forever -- the exact
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import os
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+import requests
 
 from .corpus import Doc, slugify, split_frontmatter
 
@@ -62,6 +66,30 @@ class ExtractionFailed(Exception):
     is a memory that can never be recalled, and it would pass every downstream
     health check while doing so.
     """
+
+
+def _pdf_page_count(path: Path) -> int | None:
+    """Page count via pdfinfo, or None when it cannot be determined.
+
+    pdfinfo is another optional poppler binary, so its absence must cost the
+    page count and nothing else: degrading here is right where refusing on a
+    missing pdftotext is right, because one loses a provenance detail while the
+    other loses the entire memory.
+    """
+    try:
+        out = subprocess.run(["pdfinfo", str(path)],
+                             capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        if line.lower().startswith("pages:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
 
 
 def _store_asset(source: Path, asset_abs: Path, digest: str) -> None:
@@ -200,28 +228,92 @@ def _extract_pdf_text(path: Path) -> str:
     return out.stdout.strip()
 
 
-def _describe_image_via_skill(path: Path) -> str:  # pragma: no cover - needs a gateway
-    """Default vision route: the installed image-digest skill.
+# The gateway that serves vision models. Overridable so any harness or host can
+# point at its own instance without patching code.
+VISION_BASE_URL = os.environ.get("ALEXANDRIA_LLM_BASE_URL", "http://127.0.0.1:20128/v1")
+VISION_MODEL = os.environ.get("ALEXANDRIA_VISION_MODEL", "gemini/gemini-2.5-flash")
+VISION_KEY_ENV = "ALEXANDRIA_VISION_KEY"
+# Deployment-specific: the engine ships no site keychain name. Operators set
+# this (and the base URL) for their own gateway; see docs/HTTP-API.md.
+VISION_KEYCHAIN_SERVICE = os.environ.get("ALEXANDRIA_VISION_KEYCHAIN_SERVICE", "")
 
-    Imported lazily and called through a subprocess boundary so the engine
-    keeps no hard dependency on a harness skill -- Alexandria stays usable from
-    any harness (see docs/HTTP-API.md), and a missing skill degrades to a clean
-    ExtractionFailed instead of an import error at module load.
+MIME_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif", ".svg": "image/svg+xml",
+}
+
+VISION_PROMPT = ("Describe this image in detail and transcribe any visible text "
+                 "verbatim. The description becomes the only searchable record "
+                 "of this image, so include anything a person might later "
+                 "search for.")
+
+
+def _vision_api_key() -> str:
+    """The vision credential: env var first, then the macOS keychain.
+
+    Env first so Linux/CI/other harnesses have a portable route that needs no
+    keychain at all; the keychain lookup is a macOS convenience, and its
+    absence is a clean empty string rather than an exception.
     """
+    key = os.environ.get(VISION_KEY_ENV, "").strip()
+    if key:
+        return key
+    if not VISION_KEYCHAIN_SERVICE:
+        return ""
     try:
         out = subprocess.run(
-            ["image-digest", str(path)],
-            capture_output=True, text=True, timeout=300,
+            ["security", "find-generic-password", "-s", VISION_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=15,
         )
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _describe_image_via_gateway(path: Path) -> str:
+    """Default vision route: one OpenAI-compatible chat call carrying the image.
+
+    image-digest is a MARKDOWN skill (a prompt for a harness), not a binary, so
+    the engine speaks the documented gateway contract itself: that keeps
+    Alexandria harness-agnostic -- any harness or host can point
+    ALEXANDRIA_LLM_BASE_URL / ALEXANDRIA_VISION_KEY at its own instance -- and
+    avoids depending on a skill that only exists inside one agent framework.
+    """
+    key = _vision_api_key()
+    if not key:
         raise ExtractionFailed(
-            f"no vision extractor available for {path.name}") from exc
-    except subprocess.SubprocessError as exc:
-        raise ExtractionFailed(f"vision extraction failed on {path.name}: {exc}") from exc
-    if out.returncode != 0:
+            f"{path.name}: no vision credential available (set {VISION_KEY_ENV}, or "
+            f"ALEXANDRIA_VISION_KEYCHAIN_SERVICE for a keychain lookup); refusing "
+            f"to index an image with no description")
+
+    mime = MIME_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    try:
+        resp = requests.post(
+            f"{VISION_BASE_URL.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": VISION_MODEL,
+                "stream": False,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": VISION_PROMPT},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+                ]}],
+            },
+            timeout=300,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as exc:   # transport, HTTP status, or malformed JSON
         raise ExtractionFailed(
-            f"vision extraction failed on {path.name}: {out.stderr.strip()[:200]}")
-    return out.stdout.strip()
+            f"vision extraction failed on {path.name}: {exc}") from exc
+    try:
+        return (body["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ExtractionFailed(
+            f"vision extraction returned an unexpected shape for {path.name}") from exc
 
 
 def ingest_path(
@@ -277,7 +369,7 @@ def ingest_path(
     if extraction == "pdftotext":
         text = _extract_pdf_text(source)
     else:
-        describe = describe_image or _describe_image_via_skill
+        describe = describe_image or _describe_image_via_gateway
         try:
             text = (describe(source) or "").strip()
         except ExtractionFailed:
@@ -303,6 +395,21 @@ def ingest_path(
     if not asset_abs.exists() or _sha256(asset_abs) != digest:
         _store_asset(source, asset_abs, digest)
 
+    provenance = {
+        "original_name": source.name,
+        "original_path": str(source),
+        "sha256": digest,
+        "extraction": extraction,
+        "asset": asset_rel,
+        "bytes": source.stat().st_size,
+    }
+    # Paged documents only: claiming pages=1 for an image would be inventing
+    # provenance, and an unknown count must be ABSENT rather than guessed.
+    if extraction == "pdftotext":
+        pages = _pdf_page_count(source)
+        if pages is not None:
+            provenance["pages"] = pages
+
     known = _find_companion(corpus, digest)
     if known is not None:
         doc_rel = known.relative_to(corpus).as_posix()
@@ -320,14 +427,7 @@ def ingest_path(
                           "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
             # Provenance is what makes an ingested memory auditable later, and
             # `asset` is the pointer that lets a search hit open the original.
-            "ingest": {
-                "original_name": source.name,
-                "original_path": str(source),
-                "sha256": digest,
-                "extraction": extraction,
-                "asset": asset_rel,
-                "bytes": source.stat().st_size,
-            },
+            "ingest": provenance,
         },
         body=text if text.endswith("\n") else text + "\n",
     ).write(corpus)

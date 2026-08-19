@@ -120,3 +120,38 @@ cycle (default 600s) -- verify via `/health` `drain_heartbeat_age_seconds`.
 
 All error responses are `{"error": <string-or-object>}` with a 4xx/5xx status.
 Unhandled exceptions never escape the handler (500 "internal error").
+
+
+## Ingesting artifacts (PDF / images)
+
+`alexandria ingest <file|dir|glob>` stores any artifact as a searchable memory:
+the original binary is preserved under `assets/<sha256[:2]>/<sha256><ext>`, a
+companion markdown lands in `sources/assets/` carrying the extracted text plus
+provenance, and **only the markdown is indexed** — so the vector space,
+manifest and retrieval stack are untouched.
+
+Extraction routes by kind:
+
+| artifact | route | requirement |
+|---|---|---|
+| born-digital PDF | `pdftotext` (poppler) | optional system binary; absent → clean refusal |
+| PDF page count | `pdfinfo` (poppler) | optional; absent → `pages` omitted, ingest still succeeds |
+| png/jpg/webp/gif/svg | vision model over the gateway | credential required (below) |
+
+Vision configuration — all optional env vars, so any harness or host can point
+at its own gateway:
+
+```
+ALEXANDRIA_LLM_BASE_URL              gateway base (default http://127.0.0.1:20128/v1)
+ALEXANDRIA_VISION_MODEL              vision model id (default gemini/gemini-2.5-flash)
+ALEXANDRIA_VISION_KEY                credential, checked first (portable: Linux/CI)
+ALEXANDRIA_VISION_KEYCHAIN_SERVICE   macOS keychain service name, used only if the env key is unset
+```
+
+The engine ships **no site-specific keychain name**; set one for your deployment.
+With no credential available, image ingest refuses with a named error rather
+than indexing an image that has no description.
+
+Exit codes: `0` success (including a directory sweep that skipped unsupported
+strays), `1` a real failure (an explicitly named file that could not be
+honored, or extraction breaking on a supported artifact), `2` nothing to ingest.
