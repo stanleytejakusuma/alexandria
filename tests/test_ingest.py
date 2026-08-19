@@ -438,3 +438,87 @@ def test_a_missing_absolute_path_reports_cleanly_instead_of_crashing(tmp_path, c
 
     assert code != 0
     assert "no such path" in capsys.readouterr().err.lower()
+
+
+# --- companion identity + memory stability (Red review round 2) ------------
+
+def test_a_digest8_collision_can_never_overwrite_another_artifacts_memory(tmp_path):
+    """The companion glob matches on 32 bits; a false hit would DESTROY a memory.
+
+    Artifact B reusing A's companion rewrites it to assert B's sha and B's
+    asset -- A's memory is silently gone, with no error anywhere. That is
+    exactly the permanent-and-silent shape the atomic-write fix closed, one
+    layer up, and 2^32 is grindable by anyone who can hand us a file.
+    """
+    from alexandria.corpus import Doc
+
+    corpus = _corpus(tmp_path)
+    victim = tmp_path / "victim.pdf"
+    victim.write_bytes(_PDF)
+    first = ingest_path(victim, corpus)
+    victim_sha = Doc.read(corpus / first.doc_path, corpus).frontmatter["ingest"]["sha256"]
+
+    # Forge a DIFFERENT artifact whose companion name collides on digest[:8].
+    other = tmp_path / "attacker.pdf"
+    other.write_bytes(_PDF.replace(b"smoke test", b"other doc"))
+    other_sha = hashlib.sha256(other.read_bytes()).hexdigest()
+    assert other_sha != victim_sha
+    colliding = corpus / "sources/assets" / f"attacker-{victim_sha[:8]}.md"
+    colliding.parent.mkdir(parents=True, exist_ok=True)
+
+    result = ingest_path(other, corpus)
+
+    # The victim's memory must be intact and still describe the victim.
+    survivor = Doc.read(corpus / first.doc_path, corpus)
+    assert survivor.frontmatter["ingest"]["sha256"] == victim_sha, (
+        "a digest8 collision overwrote another artifact's memory")
+    assert result.doc_path != first.doc_path
+    assert Doc.read(corpus / result.doc_path, corpus).frontmatter["ingest"]["sha256"] == other_sha
+
+
+def test_reingesting_known_bytes_does_not_re_extract_or_mutate_the_memory(tmp_path):
+    """One artifact is one memory, and that memory must be STABLE.
+
+    Re-running extraction on re-encounter is wasted work at best; with a
+    nondeterministic vision extractor it silently rewrites a stored memory, and
+    it clobbers any operator edits to the companion. Known bytes short-circuit
+    BEFORE extraction.
+    """
+    from alexandria.corpus import Doc
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "screenshot.png"
+    src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"fake-pixels")
+
+    calls = []
+
+    def vision(path):
+        calls.append(path)
+        return f"description number {len(calls)}"
+
+    first = ingest_path(src, corpus, describe_image=vision)
+    body_before = Doc.read(corpus / first.doc_path, corpus).body
+
+    renamed = tmp_path / "renamed.png"
+    renamed.write_bytes(src.read_bytes())          # identical bytes, new name
+    again = ingest_path(renamed, corpus, describe_image=vision)
+
+    assert calls == [src], "extraction re-ran on already-known bytes"
+    assert again.doc_path == first.doc_path
+    assert Doc.read(corpus / again.doc_path, corpus).body == body_before, (
+        "re-ingest mutated a stored memory")
+
+
+def test_a_directory_with_only_unsupported_files_is_not_a_silent_success(tmp_path, capsys):
+    """The boundary of the new exit-code taxonomy: doing nothing must not read
+    as success (exit 2), even though swept strays alone are not failures."""
+    from alexandria.cli import app
+
+    corpus = _corpus(tmp_path)
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    (drop / "notes.txt").write_text("nothing ingestable here")
+    (drop / ".DS_Store").write_bytes(b"\x00")
+
+    assert app(["--corpus", str(corpus), "ingest", str(drop)]) == 2
+    assert "nothing to ingest" in capsys.readouterr().err

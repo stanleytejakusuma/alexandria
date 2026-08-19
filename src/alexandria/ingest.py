@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .corpus import Doc, slugify
+from .corpus import Doc, slugify, split_frontmatter
 
 __all__ = [
     "ExtractionFailed",
@@ -62,6 +62,42 @@ class ExtractionFailed(Exception):
     is a memory that can never be recalled, and it would pass every downstream
     health check while doing so.
     """
+
+
+def _find_companion(corpus: Path, digest: str) -> Path | None:
+    """The companion for these exact bytes, or None.
+
+    Candidates are found by the digest[:8] name suffix but CONFIRMED against the
+    full sha256 in frontmatter. A 32-bit prefix match is grindable in ~2**32
+    work, and a false hit would rewrite another artifact's companion to assert
+    this artifact's sha and asset -- destroying that memory silently, which is
+    the permanent-and-silent failure the atomic asset write exists to prevent.
+    """
+    companion_dir = corpus / COMPANION_ROOT
+    if not companion_dir.is_dir():
+        return None
+    for candidate in sorted(companion_dir.glob(f"*-{digest[:8]}.md")):
+        try:
+            fm, _ = split_frontmatter(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(fm, dict) and (fm.get("ingest") or {}).get("sha256") == digest:
+            return candidate
+    return None
+
+
+def _free_companion_path(corpus: Path, stem: str, digest: str) -> str:
+    """A companion path that cannot collide with an unrelated artifact's."""
+    base = f"{COMPANION_ROOT}/{stem}-{digest[:8]}"
+    if not (corpus / f"{base}.md").exists():
+        return f"{base}.md"
+    # Prefix collision with a DIFFERENT artifact: disambiguate rather than
+    # overwrite. Widening the digest is deterministic and self-describing.
+    for width in (12, 16, 64):
+        wider = f"{COMPANION_ROOT}/{stem}-{digest[:width]}.md"
+        if not (corpus / wider).exists():
+            return wider
+    raise ExtractionFailed(f"cannot allocate a companion path for {digest[:8]}")
 
 
 @dataclass(frozen=True)
@@ -156,7 +192,23 @@ def ingest_path(
         raise UnsupportedArtifact(
             f"{source.name}: no extraction route for {suffix or 'files without a suffix'}")
 
-    # EXTRACT FIRST, write nothing until there is something worth recalling.
+    # HASH FIRST. Identity is content, so a known artifact short-circuits BEFORE
+    # the expensive extraction: re-running it is wasted work at best, and with a
+    # nondeterministic vision extractor it would silently rewrite a stored
+    # memory and clobber any operator edits to the companion. "One artifact is
+    # one memory" has to mean the memory is STABLE, not regenerated per
+    # encounter.
+    digest = _sha256(source)
+    asset_rel = f"{ASSET_ROOT}/{digest[:2]}/{digest}{suffix}"
+    asset_abs = corpus / asset_rel
+
+    known = _find_companion(corpus, digest)
+    if known is not None and asset_abs.exists() and _sha256(asset_abs) == digest:
+        return IngestResult(asset_path=asset_rel,
+                            doc_path=known.relative_to(corpus).as_posix(),
+                            extraction=extraction, sha256=digest)
+
+    # EXTRACT, and write nothing until there is something worth recalling.
     # Ordering matters: a failure here must leave no stranded asset behind.
     if extraction == "pdftotext":
         text = _extract_pdf_text(source)
@@ -175,11 +227,8 @@ def ingest_path(
             f"{source.name}: extraction produced no text, so nothing was indexed "
             f"(a companion with no body is a memory that can never be recalled)")
 
-    digest = _sha256(source)
     # Content-addressed: identical bytes are one memory, however many times or
     # under whatever name they are handed to us.
-    asset_rel = f"{ASSET_ROOT}/{digest[:2]}/{digest}{suffix}"
-    asset_abs = corpus / asset_rel
     asset_abs.parent.mkdir(parents=True, exist_ok=True)
     # ATOMIC, and verified on the dedup path. A torn copy straight to the
     # content-addressed name would be PERMANENT: every later ingest of the same
@@ -195,17 +244,12 @@ def ingest_path(
         finally:
             tmp_asset.unlink(missing_ok=True)
 
-    # One artifact is ONE memory: the same bytes handed in under a second name
-    # must reuse the existing companion rather than create a twin carrying an
-    # identical (source, source_id). Two docs claiming one identity is the
-    # duplicate shape that produced a phantom shortfall before.
-    companion_dir = corpus / COMPANION_ROOT
-    existing = sorted(companion_dir.glob(f"*-{digest[:8]}.md")) if companion_dir.is_dir() else []
-    if existing:
-        doc_rel = existing[0].relative_to(corpus).as_posix()
+    known = _find_companion(corpus, digest)
+    if known is not None:
+        doc_rel = known.relative_to(corpus).as_posix()
     else:
         stem = slugify(source.stem) or "artifact"
-        doc_rel = f"{COMPANION_ROOT}/{stem}-{digest[:8]}.md"
+        doc_rel = _free_companion_path(corpus, stem, digest)
     Doc(
         path=doc_rel,
         frontmatter={
