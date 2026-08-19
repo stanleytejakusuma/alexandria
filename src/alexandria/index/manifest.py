@@ -187,6 +187,25 @@ def verify_manifest_for_write(corpus: str | Path, embedder, provider: str, store
     verify_manifest(corpus, embedder, provider)
 
 
+def _current_compatibility_cheap(embedder, provider: str) -> dict[str, Any]:
+    """The identity fields knowable WITHOUT loading the provider (#27).
+
+    provider, model, revision, normalization_policy and dtype are metadata:
+    the embedder exposes them without materialising weights. dim is the
+    exception -- every real provider derives it from the loaded model -- so it
+    is measured separately once the cheap identity agrees. That ordering is
+    what lets a provider/model mismatch refuse instantly (Linux CI runner,
+    wrong --embed-provider) instead of after a multi-minute model load.
+    """
+    return {
+        "provider": provider,
+        "model": embedder.name,
+        "revision": getattr(embedder, "revision", ""),
+        "normalization_policy": getattr(embedder, "normalization_policy", "none"),
+        "dtype": DTYPE,
+    }
+
+
 def _current_compatibility(embedder, provider: str) -> dict[str, Any]:
     """Return only current vector-space identity, not raw probe diagnostics.
 
@@ -195,15 +214,9 @@ def _current_compatibility(embedder, provider: str) -> dict[str, Any]:
     does not compare/re-measure the raw norm: that value is operational
     diagnostics, and can drift across devices without changing wrapper output.
     """
+    cheap = _current_compatibility_cheap(embedder, provider)
     vector = embedder.embed([_PROBE_TEXT])[0]
-    return {
-        "provider": provider,
-        "model": embedder.name,
-        "revision": getattr(embedder, "revision", ""),
-        "dim": len(vector),
-        "normalization_policy": getattr(embedder, "normalization_policy", "none"),
-        "dtype": DTYPE,
-    }
+    return {**cheap, "dim": len(vector)}
 
 
 def verify_manifest(corpus: str | Path, embedder, provider: str) -> None:
@@ -228,10 +241,28 @@ def verify_manifest(corpus: str | Path, embedder, provider: str) -> None:
             f"index predates declared normalization policy, rebuild it under "
             f"the desired configuration: alexandria --corpus {corpus} index --rebuild"
         )
-    fresh = _current_compatibility(embedder, provider)
     on_disk_policy = on_disk.get(
         "normalization_policy", UNVERIFIED_LEGACY_NORMALIZATION_POLICY)
     on_disk_identity = on_disk | {"normalization_policy": on_disk_policy}
+
+    # CHEAP FIELDS FIRST (#27): provider/model/revision/policy/dtype are
+    # metadata, so a mismatch refuses here without loading the provider. dim
+    # is the only field requiring the probe embed, checked only after the
+    # cheap identity agrees.
+    cheap = _current_compatibility_cheap(embedder, provider)
+    cheap_diffs = [f"{field}: index={on_disk_identity.get(field)!r} current={cheap[field]!r}"
+                   for field in ("provider", "model", "revision", "normalization_policy", "dtype")
+                   if on_disk_identity.get(field) != cheap[field]]
+    if cheap_diffs:
+        raise ManifestMismatch(
+            f"embedding config does not match the index manifest at "
+            f"{_manifest_path(corpus)} ({'; '.join(cheap_diffs)}). Mixing vector "
+            f"spaces in one index silently corrupts similarity ranking. "
+            f"Either restore the original embedding config, or rebuild: "
+            f"alexandria --corpus {corpus} index --rebuild"
+        )
+
+    fresh = {**cheap, "dim": len(embedder.embed([_PROBE_TEXT])[0])}
     diffs = [f"{field}: index={on_disk_identity.get(field)!r} current={fresh[field]!r}"
               for field in IDENTITY_FIELDS if on_disk_identity.get(field) != fresh[field]]
     if diffs:

@@ -118,11 +118,40 @@ def test_verify_manifest_refuses_a_missing_manifest_with_a_rebuild_hint(tmp_path
 
 
 def test_verify_manifest_refuses_a_dimension_mismatch(tmp_path):
-    write_manifest(tmp_path, _hash_embedder(tmp_path, dim=384), "hash")
+    """dim is the ONE field that needs the probe embed, so it is checked only
+    after the cheap identity (provider/model/revision/policy/dtype) agrees.
 
+    HashEmbedder's name embeds its dim, so a plain HashEmbedder dim swap would
+    be caught by the cheap model-name check and never reach this path. This
+    fake keeps the name identical and changes only the width -- the case the
+    dim check exists for (same model string, wrong persisted width).
+    """
+    import json
+
+    class SameNameWrongDim:
+        name = "hash-384"
+        revision = ""
+        normalization_policy = "none"
+
+        def __init__(self, dim):
+            self._dim = dim
+
+        @property
+        def dim(self):
+            return self._dim
+
+        def embed(self, texts):
+            return [[0.1] * self._dim for _ in texts]
+
+    # Manifest built by the dim=384 backend.
+    write_manifest(tmp_path, SameNameWrongDim(384), "hash")
+
+    # Probe embedder with a different width, same identity otherwise.
     with pytest.raises(ManifestMismatch) as exc_info:
-        verify_manifest(tmp_path, _hash_embedder(tmp_path, dim=128), "hash")
+        verify_manifest(tmp_path, SameNameWrongDim(128), "hash")
     assert "dim" in str(exc_info.value)
+    assert "model" not in str(exc_info.value), (
+        "the cheap identity matched -- the refusal must name dim, not model")
 
 
 def test_verify_manifest_refuses_a_provider_mismatch(tmp_path):
@@ -235,3 +264,79 @@ def test_manifest_normalized_diagnostic_handles_extreme_finite_probe_values(tmp_
 
     manifest = write_manifest(tmp_path, ExtremeEmbedder(), "test")
     assert manifest["normalized"] is False
+
+
+def test_verify_manifest_refuses_a_model_name_mismatch_WITHOUT_loading_the_provider(tmp_path):
+    """#27: the cheap identity fields must refuse BEFORE any embed runs.
+
+    On a Linux CI runner there is no torch/MLX and no sentence-transformers
+    weights; loading the provider would crash the run. A model-name mismatch is
+    knowable from metadata alone, so embedding must never be attempted. This is
+    the mutation guard: revert the short-circuit and this test fails because
+    embed() is called.
+    """
+    import json
+
+    from alexandria.index.manifest import ManifestMismatch
+
+    # Write the manifest directly, as a DIFFERENT provider would have left it:
+    # write_manifest() probes, which is exactly what this guard exists to avoid.
+    path = tmp_path / ".alexandria" / "index" / "manifest.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "provider": "local", "model": "Qwen/Qwen3-Embedding-0.6B",
+        "revision": "", "dim": 1024, "normalized": False,
+        "normalization_policy": "l2", "dtype": "float32",
+    }))
+
+    class NeverLoads:
+        name = "a-different-model"
+        revision = ""
+        normalization_policy = "l2"
+        embed_called = False
+
+        @property
+        def dim(self):
+            raise AssertionError("dim was touched -- the provider would have loaded")
+
+        def embed(self, texts):
+            self.embed_called = True
+            raise AssertionError("embed ran on a model-name mismatch -- provider loaded")
+
+    with pytest.raises(ManifestMismatch, match="model"):
+        verify_manifest(tmp_path, NeverLoads(), "local")
+    assert NeverLoads.embed_called is False, (
+        "embedding ran before the cheap model-name check could refuse")
+
+
+def test_verify_manifest_refuses_a_provider_mismatch_WITHOUT_loading_the_provider(tmp_path):
+    """Same short-circuit for the provider field, which is also metadata."""
+    import json
+
+    from alexandria.index.manifest import ManifestMismatch
+
+    path = tmp_path / ".alexandria" / "index" / "manifest.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "provider": "local", "model": "Qwen/Qwen3-Embedding-0.6B",
+        "revision": "", "dim": 1024, "normalized": False,
+        "normalization_policy": "l2", "dtype": "float32",
+    }))
+
+    class NeverLoads:
+        name = "Qwen/Qwen3-Embedding-0.6B"
+        revision = ""
+        normalization_policy = "l2"
+        embed_called = False
+
+        @property
+        def dim(self):
+            raise AssertionError("dim was touched -- the provider would have loaded")
+
+        def embed(self, texts):
+            self.embed_called = True
+            raise AssertionError("embed ran on a provider mismatch")
+
+    with pytest.raises(ManifestMismatch, match="provider"):
+        verify_manifest(tmp_path, NeverLoads(), "mlx")
+    assert NeverLoads.embed_called is False
