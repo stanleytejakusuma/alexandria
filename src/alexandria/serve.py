@@ -357,7 +357,11 @@ def _handle_search(ctx: ServeContext, identity: str, payload: dict) -> tuple[int
                                    cache_hit=ctx.engine.last_cache_hit)
     return _json_ok(200, {"results": [
         {"chunk_id": r.chunk_id, "doc_id": r.doc_id, "text": r.text,
-         "heading_path": r.heading_path, "layer": r.layer, "score": r.score, "rank": r.rank}
+         "heading_path": r.heading_path, "layer": r.layer, "score": r.score, "rank": r.rank,
+         # #52: page anchors + openable asset pointer, surfaced as their own
+         # fields (heading_path stays pristine; absent means no annotation).
+         "page": (r.meta or {}).get("page"),
+         "asset": (r.meta or {}).get("asset")}
         for r in results]})
 
 

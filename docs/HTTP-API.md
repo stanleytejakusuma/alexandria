@@ -63,11 +63,24 @@ Body: `{"query": "...", "k": 5, "filters": {"type": "...", "project": "...", "la
 
 ```json
 {"results": [{"chunk_id": "...", "doc_id": "...", "text": "...",
-              "heading_path": "...", "layer": "...", "score": 0.743, "rank": 1}]}
+              "heading_path": "...", "layer": "...", "score": 0.743, "rank": 1,
+              "page": 7, "asset": "assets/25/256f55f1...pdf"}]}
 ```
 
+- `page` = start page of the chunk in an ingested PDF (`pdftotext` form-feed
+  anchors; `null` when the document has no page structure). Citations may say
+  "paper.pdf p.7" rather than just naming the document.
+- `asset` = corpus-relative path to the preserved original binary for ingested
+  artifacts; open it directly (`<corpus>/<asset>`). `null` for ordinary docs.
 - `503` = index momentarily unreadable (writer active / rebuild in progress).
   **Retryable with backoff** -- not an error.
+
+## POST /search page anchors (ingested PDFs)
+
+`alexandria index --backfill-meta` re-annotates an already-indexed corpus with
+`page`/`asset` (re-runs the chunker, updates only the `meta` column, never
+re-embeds; refuses loudly on any chunk_id mismatch). New ingest + index runs
+carry the annotations automatically.
 
 ## POST /answer
 

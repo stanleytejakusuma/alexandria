@@ -8,7 +8,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..cache import GenerationFileCorrupt, QueryCache, normalize_query, read_index_generation
@@ -61,6 +61,7 @@ class SearchResult:
     score: float
     rank: int
     trace: dict[str, Any]
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 class SearchEngine:
@@ -178,7 +179,7 @@ class SearchEngine:
                             c["chunk_id"], c["doc_id"], c["text"], c.get("heading_path", ""),
                             c.get("layer", ""), c.get("score", 0.0), rank, {
                                 "cache_hit": True, "latency_ms": _elapsed_ms(started),
-                            })
+                            }, c.get("meta", {}))
                         for rank, c in enumerate(payload, start=1)
                     ]
             if cached is not None:
@@ -363,7 +364,8 @@ class SearchEngine:
         results = [
             SearchResult(candidate.chunk_id, records[candidate.chunk_id]["doc_id"],
                          records[candidate.chunk_id]["text"], records[candidate.chunk_id]["heading_path"],
-                         records[candidate.chunk_id]["layer"], candidate.score, rank, trace)
+                         records[candidate.chunk_id]["layer"], candidate.score, rank, trace,
+                         records[candidate.chunk_id].get("meta", {}))
             for rank, candidate in enumerate(reranked, start=1)
         ]
         trace["latency_ms"] = _elapsed_ms(started)
@@ -388,6 +390,7 @@ class SearchEngine:
             query_cache.put(ckey, [{
                 "chunk_id": r.chunk_id, "doc_id": r.doc_id, "text": r.text,
                 "heading_path": r.heading_path, "layer": r.layer, "score": r.score,
+                "meta": r.meta,
             } for r in results])
         return results
 

@@ -782,6 +782,18 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
               f"normalized={manifest['normalized']} dtype={manifest['dtype']}")
         return 0
 
+    if getattr(args, "backfill_meta", False):
+        from .index.chunker import backfill_meta
+        from .index.store import VectorStore as _VS
+        store = _VS(corpus / ".alexandria" / "index")
+        stats = backfill_meta(corpus, store, config)
+        gen = write_index_generation(corpus)
+        print(f"index: backfilled meta on {stats.chunks} chunks across {stats.docs} docs "
+              f"({stats.chunks_updated} updated, 0 embedded); "
+              f"generation {gen} (query/response caches invalidated)")
+        liveness.record_success(corpus, promoted_count=0, generation=gen)
+        return 0
+
     records, errors = _load_chunk_records(corpus, config, args.limit, args.workers)
     for error in errors:
         print(f"skip: {error}", file=sys.stderr)
@@ -1688,6 +1700,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="write only the index manifest for the current --embed-provider "
                             "config, without re-indexing (one-time fix for an index built "
                             "before manifests existed; see gate F4)")
+    index.add_argument("--backfill-meta", action="store_true",
+                       help="annotate already-indexed chunks with meta (page anchors, "
+                            "asset pointers) by re-running the chunker and updating only "
+                            "the meta column; never re-embeds (#52)")
     index.add_argument("--limit", type=int, default=0, help="maximum documents to index")
     index.add_argument("--workers", type=int, default=1, help="parallel document chunking workers")
     index.add_argument("--enrich", action="store_true",

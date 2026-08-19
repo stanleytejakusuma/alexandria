@@ -23,7 +23,7 @@ __all__ = ["VectorStore"]
 # `not_deleted_clause` (index/filtering.py) enforceable at all.
 SCALAR_FIELDS = ("chunk_id", "doc_id", "text", "heading_path", "type", "project", "status",
                  "source", "layer", "generated_at", "deleted")
-ALL_FIELDS = (*SCALAR_FIELDS, "vector", "tags", "entities", "enrichment", "kind", "parent_doc", "target_chunk")
+ALL_FIELDS = (*SCALAR_FIELDS, "vector", "tags", "entities", "enrichment", "kind", "parent_doc", "target_chunk", "meta")
 
 
 class VectorStore:
@@ -53,6 +53,7 @@ class VectorStore:
         if table is None:
             self._db.create_table(self.table_name, data=records, schema=_lance_schema(records))
             return
+        self._ensure_meta_column(table)
         # Red 2026-08-09: detect old LanceDB schemas before issuing field
         # projections. A table created before the enrichment columns existed
         # silently drops them on merge; the fix is an explicit rebuild.
@@ -100,6 +101,7 @@ class VectorStore:
         if table is None:
             self._db.create_table(self.table_name, data=records, schema=_lance_schema(records))
             return
+        self._ensure_meta_column(table)
         table.add(records)
 
     def search_vector(self, query_vec: list[float], k: int, where: Mapping[str, Any] | None = None) -> list[dict]:
@@ -212,6 +214,49 @@ class VectorStore:
         table = self._open_table()  # pragma: no cover - requires optional dependency
         return int(table.count_rows()) if table is not None else 0
 
+    def chunk_ids(self) -> set[str]:
+        """Every stored chunk_id, for the backfill's 100%-match gate."""
+        if self._fallback is not None:
+            rows = self._fallback.connection.execute("SELECT chunk_id FROM chunks").fetchall()
+            return {row[0] for row in rows}
+        table = self._open_table()  # pragma: no cover - requires optional dependency
+        if table is None:
+            return set()
+        rows = (table.search().select(["chunk_id"])
+                .limit(2_000_000_000).to_list())
+        return {row["chunk_id"] for row in rows}
+
+    def update_meta(self, meta_by_chunk: Mapping[str, Mapping[str, Any]]) -> int:
+        """Rewrite ONLY the meta column for the given chunk_ids.
+
+        The #52 backfill's write path. Deliberately not upsert(): upsert
+        rewrites text and vector, which would re-embed and could orphan the
+        embedding cache; this touches one column and never the embedder.
+        """
+        if not meta_by_chunk:
+            return 0
+        if self._fallback is not None:
+            with self._fallback.connection:
+                cur = self._fallback.connection.executemany(
+                    "UPDATE chunks SET meta = ? WHERE chunk_id = ?",
+                    [(json.dumps(meta, sort_keys=True, separators=(",", ":")), cid)
+                     for cid, meta in meta_by_chunk.items()])
+            return cur.rowcount
+        table = self._open_table()  # pragma: no cover - requires optional dependency
+        if table is None:
+            return 0
+        self._ensure_meta_column(table)
+        # merge_insert with a SUBSET of columns: matched rows update only the
+        # supplied fields; unmatched rows are ignored (no insert clause), so a
+        # stale chunk_id can never create a row.
+        records = [{"chunk_id": cid,
+                    "meta": json.dumps(meta, sort_keys=True, separators=(",", ":"))}
+                   for cid, meta in meta_by_chunk.items()]
+        result = (table.merge_insert("chunk_id")
+                  .when_matched_update_all()
+                  .execute(records))
+        return int(getattr(result, "rows_updated", len(records)))
+
     def drop(self) -> None:
         if self._fallback is not None:
             self._fallback.drop()
@@ -223,6 +268,29 @@ class VectorStore:
         if self.table_name not in self._db.table_names():
             return None
         return self._db.open_table(self.table_name)
+
+    def _ensure_meta_column(self, table) -> None:
+        """#52 additive migration, WRITE PATHS ONLY.
+
+        A table created before the meta column loses only page/asset
+        annotations, so it gains the column in place. This is deliberately NOT
+        the refuse-loudly guard upsert() uses for enrichment/deleted -- those
+        are load-bearing (a tombstone that silently misses its column hides
+        data); a missing meta column merely means no annotations yet.
+        Reads never call this: _record_from_lance already tolerates an absent
+        column, and a write on the read path would race concurrent readers and
+        break read-only mounts (Red review finding, 2026-08-19).
+        """
+        if "meta" not in {field.name for field in table.schema}:
+            import pyarrow as pa
+            try:
+                table.add_columns(pa.field("meta", pa.string()))
+            except Exception:
+                # A concurrent writer may have added the column between our
+                # schema check and the call. Only a column that is STILL
+                # missing is an error worth propagating.
+                if "meta" not in {field.name for field in table.schema}:
+                    raise
 
 
 class _SQLiteVectorStore:
@@ -248,7 +316,8 @@ class _SQLiteVectorStore:
             "vector TEXT NOT NULL, type TEXT, project TEXT, status TEXT, source TEXT, tags TEXT NOT NULL, "
             "entities TEXT NOT NULL, layer TEXT NOT NULL, generated_at TEXT,"
             " enrichment TEXT, kind TEXT, parent_doc TEXT, target_chunk TEXT,"
-            " deleted TEXT NOT NULL DEFAULT 'false')"
+            " deleted TEXT NOT NULL DEFAULT 'false',"
+            " meta TEXT NOT NULL DEFAULT '{}')"
         )
         # Red release change: enrich the schema in place for pre-existing DBs
         # (sqlite >= 3.35 supports ADD COLUMN IF NOT EXISTS).
@@ -264,7 +333,8 @@ class _SQLiteVectorStore:
         # `not_deleted_clause`'s fail-closed `= 'false'` predicate would then
         # hide the entire pre-migration corpus until the next full reindex.
         for column in ("enrichment TEXT", "kind TEXT", "parent_doc TEXT", "target_chunk TEXT",
-                       "deleted TEXT NOT NULL DEFAULT 'false'"):
+                       "deleted TEXT NOT NULL DEFAULT 'false'",
+                       "meta TEXT NOT NULL DEFAULT '{}'"):
             try:
                 self.connection.execute(f"ALTER TABLE chunks ADD COLUMN {column}")
             except sqlite3.OperationalError:
@@ -276,8 +346,10 @@ class _SQLiteVectorStore:
         placeholders = ", ".join("?" for _ in ALL_FIELDS)
         updates = ", ".join(f"{field}=excluded.{field}" for field in ALL_FIELDS if field != "chunk_id")
         values = [
-            tuple(record[field] if field not in {"vector", "tags", "entities"}
-                  else json.dumps(record[field], separators=(",", ":")) for field in ALL_FIELDS)
+            tuple(json.dumps(record[field], separators=(",", ":"))
+                  if isinstance(record.get(field), (dict, list))
+                  else record[field]
+                  for field in ALL_FIELDS)
             for record in records
         ]
         self.connection.executemany(
@@ -352,6 +424,17 @@ def _normalise_record(chunk: Mapping[str, Any]) -> dict:
     # See index/filtering.py:deleted_flag for the write-time default (missing
     # -> "false") and why it is intentionally more permissive than the
     # read-time fail-closed predicate.
+    # #52: meta is persisted as a compact JSON object string. It is an
+    # annotation (page anchors, asset pointers), never a filter key, so it is
+    # NOT part of the chunk_id digest nor the embedding cache key -- adding it
+    # to rows is a pure additive migration.
+    meta = record.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta) if meta else {}
+        except ValueError:
+            meta = {}
+    record["meta"] = json.dumps(meta, sort_keys=True, separators=(",", ":"))
     record["deleted"] = deleted_flag(record.get("deleted"))
     return {field: record.get(field) for field in ALL_FIELDS}
 
@@ -378,7 +461,7 @@ def _lance_schema(records: list[dict]):
     dim = len(records[0]["vector"]) if records else 0
     text_fields = ("chunk_id", "doc_id", "text", "heading_path", "type", "project",
                    "status", "source", "layer", "generated_at", "enrichment", "kind",
-                   "parent_doc", "target_chunk", "deleted")
+                   "parent_doc", "target_chunk", "deleted", "meta")
     fields = [pa.field(name, pa.string()) for name in text_fields]
     fields.append(pa.field("vector", pa.list_(pa.float32(), dim)))
     fields.append(pa.field("tags", pa.list_(pa.string())))
@@ -403,7 +486,7 @@ def _cosine(left: list[float], right: list[float]) -> float:
 
 def _row_to_record(row) -> dict:
     record = dict(zip(ALL_FIELDS, row, strict=True))
-    for field in ("vector", "tags", "entities"):
+    for field in ("vector", "tags", "entities", "meta"):
         record[field] = json.loads(record[field])
     return record
 
@@ -412,4 +495,14 @@ def _record_from_lance(row: Mapping[str, Any]) -> dict:
     result = dict(row)
     if "_distance" not in result:
         result["_distance"] = 0.0
+    # meta may be absent (a table that predates the #52 column) or a JSON
+    # string; both must read back as an empty annotation.
+    meta = result.get("meta")
+    if isinstance(meta, str):
+        try:
+            result["meta"] = json.loads(meta)
+        except ValueError:
+            result["meta"] = {}
+    else:
+        result["meta"] = meta or {}
     return result
