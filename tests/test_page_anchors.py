@@ -409,7 +409,7 @@ def test_search_results_and_payload_surface_page_and_asset(tmp_path, monkeypatch
     from alexandria.retrieval.search import SearchEngine
     corpus = tmp_path / "corpus"
     (corpus / "sources").mkdir(parents=True)
-    _ingest_style_doc(corpus, body=_pager(80, 3))
+    doc = _ingest_style_doc(corpus, body=_pager(80, 3))
     monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
     assert app(["--corpus", str(corpus), "index"]) == 0
 
@@ -420,16 +420,26 @@ def test_search_results_and_payload_surface_page_and_asset(tmp_path, monkeypatch
     t = threading.Thread(target=tcp_server.serve_forever, daemon=True)
     t.start()
     try:
+        # The expected page is computed by the SAME chunker in THIS process:
+        # CI has no tiktoken (it is not a dependency), so token boundaries --
+        # and therefore chunk start pages -- legitimately differ between
+        # environments. The invariant under test is that the served payload
+        # carries the chunker's own annotation, not a hard-coded page.
+        from alexandria.index.chunker import chunk_document
+        md = doc.read_text()
+        target = next(c for c in chunk_document("sources/assets/paper.md", md)
+                      if "word3-10" in c.text)
+        expected_page = target.meta["page"]
         import http.client
         conn = http.client.HTTPConnection(*addr, timeout=60)
-        conn.request("POST", "/search", json.dumps({"query": "word2-10", "k": 5}),
+        conn.request("POST", "/search", json.dumps({"query": "word3-10", "k": 5}),
                      {"Content-Type": "application/json"})
         resp = conn.getresponse(); body = json.loads(resp.read())
         conn.close()
         assert resp.status == 200, body
-        hits = [r for r in body["results"] if "word2-" in r["text"]]
+        hits = [r for r in body["results"] if "word3-10" in r["text"]]
         assert hits, body
-        assert hits[0]["page"] == 2
+        assert hits[0]["page"] == expected_page, (hits[0]["page"], expected_page)
         assert hits[0]["asset"] == "assets/ab/abc123def4567890.pdf"
     finally:
         tcp_server.shutdown(); tcp_server.server_close()
