@@ -99,6 +99,11 @@ def _extract_pdf_text(path: Path) -> str:
             f"pdftotext is not installed, so {path.name} cannot be read") from exc
     except subprocess.SubprocessError as exc:
         raise ExtractionFailed(f"pdftotext failed on {path.name}: {exc}") from exc
+    if out.returncode != 0:
+        # A damaged PDF can emit partial stdout AND a non-zero code. Storing
+        # that fragment would preserve a truncated memory as if it were whole.
+        raise ExtractionFailed(
+            f"pdftotext failed on {path.name}: {(out.stderr or '').strip()[:200]}")
     return out.stdout.strip()
 
 
@@ -176,11 +181,31 @@ def ingest_path(
     asset_rel = f"{ASSET_ROOT}/{digest[:2]}/{digest}{suffix}"
     asset_abs = corpus / asset_rel
     asset_abs.parent.mkdir(parents=True, exist_ok=True)
-    if not asset_abs.exists():
-        shutil.copy2(source, asset_abs)
+    # ATOMIC, and verified on the dedup path. A torn copy straight to the
+    # content-addressed name would be PERMANENT: every later ingest of the same
+    # bytes sees the file exists and skips the repair forever, while the
+    # companion asserts a sha256 those bytes do not have. Preservation is this
+    # component's whole job, so it writes to a sibling temp and renames, and
+    # re-copies anything already there whose digest does not match.
+    if not asset_abs.exists() or _sha256(asset_abs) != digest:
+        tmp_asset = asset_abs.with_name(f".{asset_abs.name}.partial")
+        try:
+            shutil.copy2(source, tmp_asset)
+            tmp_asset.replace(asset_abs)
+        finally:
+            tmp_asset.unlink(missing_ok=True)
 
-    stem = slugify(source.stem) or "artifact"
-    doc_rel = f"{COMPANION_ROOT}/{stem}-{digest[:8]}.md"
+    # One artifact is ONE memory: the same bytes handed in under a second name
+    # must reuse the existing companion rather than create a twin carrying an
+    # identical (source, source_id). Two docs claiming one identity is the
+    # duplicate shape that produced a phantom shortfall before.
+    companion_dir = corpus / COMPANION_ROOT
+    existing = sorted(companion_dir.glob(f"*-{digest[:8]}.md")) if companion_dir.is_dir() else []
+    if existing:
+        doc_rel = existing[0].relative_to(corpus).as_posix()
+    else:
+        stem = slugify(source.stem) or "artifact"
+        doc_rel = f"{COMPANION_ROOT}/{stem}-{digest[:8]}.md"
     Doc(
         path=doc_rel,
         frontmatter={

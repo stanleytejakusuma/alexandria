@@ -112,42 +112,67 @@ def cmd_ingest(args) -> int:
     config = _config_for(args)
     corpus = config.corpus_path
 
-    targets: list[Path] = []
+    from .ingest import IMAGE_SUFFIXES, PDF_SUFFIXES
+
+    supported = PDF_SUFFIXES | IMAGE_SUFFIXES
+    # An explicitly named file is an instruction and must fail loudly if it
+    # cannot be honored. A file merely SWEPT UP by a directory/glob walk is
+    # not: a folder always holds .DS_Store and notes.txt, and if every stray
+    # forced a non-zero exit the operator would learn to ignore the code --
+    # destroying the signal for the failure that actually matters.
+    targets: list[tuple[Path, bool]] = []   # (path, explicitly_named)
     for raw in args.paths:
         path = Path(raw).expanduser()
         if path.is_dir():
-            targets.extend(sorted(p for p in path.rglob("*") if p.is_file()))
+            targets.extend((p, False) for p in sorted(path.rglob("*"))
+                           if p.is_file() and p.suffix.lower() in supported)
         elif path.exists():
-            targets.append(path)
-        else:  # unexpanded glob, or a typo -- expand it here rather than trust the shell
-            matches = sorted(Path().glob(raw))
+            targets.append((path, True))
+        else:
+            # Unexpanded glob or a typo. Path().glob() raises on absolute
+            # patterns, so split the pattern from its anchor explicitly.
+            pattern = Path(raw).expanduser()
+            root = Path(pattern.anchor) if pattern.anchor else Path()
+            rel = str(pattern.relative_to(pattern.anchor)) if pattern.anchor else str(pattern)
+            try:
+                matches = sorted(root.glob(rel))
+            except (NotImplementedError, ValueError, OSError):
+                matches = []
             if not matches:
                 print(f"ingest: no such path: {raw}", file=sys.stderr)
                 return 2
-            targets.extend(p for p in matches if p.is_file())
+            targets.extend((p, False) for p in matches
+                           if p.is_file() and p.suffix.lower() in supported)
 
     if not targets:
         print("ingest: nothing to ingest", file=sys.stderr)
         return 2
 
-    ingested = skipped = 0
-    for path in targets:
+    ingested = failed = 0
+    for path, explicit in targets:
         try:
             result = ingest_path(path, corpus)
         except (UnsupportedArtifact, ExtractionFailed) as exc:
             print(f"ingest: skipped {path.name}: {exc}", file=sys.stderr)
-            skipped += 1
+            failed += explicit or isinstance(exc, ExtractionFailed)
+            continue
+        except OSError as exc:
+            # Unreadable file, disk full, permission denied: a per-file skip,
+            # never an abandoned batch. Counted as a real failure.
+            print(f"ingest: skipped {path.name}: {exc}", file=sys.stderr)
+            failed += 1
             continue
         ingested += 1
         print(f"ingest: {path.name} -> {result.doc_path} "
               f"(asset {result.asset_path}, via {result.extraction})")
 
-    print(f"ingest: {ingested} artifact(s) stored, {skipped} skipped")
+    print(f"ingest: {ingested} artifact(s) stored, {failed} failed")
     if ingested:
         print("ingest: run `alexandria index` to make them searchable")
-    # Non-zero on ANY skip: a partial batch reporting success is the
-    # "reported success while doing nothing" failure this project keeps finding.
-    return 1 if skipped else 0
+    # Non-zero only for REAL failures (explicitly named, or extraction broke on
+    # a supported artifact) -- a partial batch reporting success is the
+    # "reported success while doing nothing" class this project keeps finding.
+    return 1 if failed else 0
 
 
 def cmd_lint(args) -> int:

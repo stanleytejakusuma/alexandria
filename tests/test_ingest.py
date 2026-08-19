@@ -149,14 +149,31 @@ def test_a_failed_extraction_never_produces_a_silently_empty_memory(tmp_path):
     If extraction yields no text, ingest must refuse rather than write an empty
     companion that indexes cleanly and then answers nothing forever.
     """
-    corpus = _corpus(tmp_path)
-    src = tmp_path / "empty.pdf"
-    src.write_bytes(b"%PDF-1.4\ntrailer<</Root 1 0 R>>\n")  # no text layer
+    import alexandria.ingest as ing
 
-    with pytest.raises(ExtractionFailed, match="no text"):
-        ingest_path(src, corpus)
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "blank.pdf"
+    src.write_bytes(_PDF)
+
+    # A PDF that parses cleanly but carries no text layer (a scanned page with
+    # no OCR is the real-world case): extractor succeeds, yields nothing.
+    class Empty:
+        returncode = 0
+        stdout = "   \n  "
+        stderr = ""
+
+    monkeypatch_run = lambda *a, **k: Empty()
+    original = ing.subprocess.run
+    ing.subprocess.run = monkeypatch_run
+    try:
+        with pytest.raises(ExtractionFailed, match="no text"):
+            ingest_path(src, corpus)
+    finally:
+        ing.subprocess.run = original
 
     assert list(corpus.rglob("*.md")) == [], "a failed ingest must leave no companion"
+    assert [p for p in (corpus / "assets").rglob("*") if p.is_file()] == [], (
+        "a failed ingest must not strand an artifact")
 
 
 def test_an_image_routes_to_the_vision_extractor_and_records_that_method(tmp_path):
@@ -230,19 +247,194 @@ def test_cli_ingests_a_whole_directory_in_one_invocation(tmp_path, capsys):
     assert len(list((corpus / "sources/assets").glob("*.md"))) == 2
 
 
-def test_cli_keeps_going_after_one_bad_file_and_reports_a_nonzero_exit(tmp_path, capsys):
-    """A batch must not lose every good artifact to one bad one -- but it also
-    must not report success when something was skipped."""
+def test_cli_keeps_going_after_a_BROKEN_supported_file_and_exits_nonzero(tmp_path, capsys):
+    """A batch must not lose every good artifact to one bad one -- and a
+    supported artifact that failed extraction must still show up in the code.
+
+    (A merely UNSUPPORTED file swept up by the directory walk is a different
+    class and must NOT force non-zero; see the exit-code tests below.)
+    """
     from alexandria.cli import app
 
     corpus = _corpus(tmp_path)
     drop = tmp_path / "drop"
     drop.mkdir()
     (drop / "good.pdf").write_bytes(_PDF)
-    (drop / "bad.bin").write_bytes(b"\x00\x01")
+    (drop / "broken.pdf").write_bytes(b"%PDF-1.4\nnot really a pdf\n")
 
     code = app(["--corpus", str(corpus), "ingest", str(drop)])
 
     assert len(list((corpus / "sources/assets").glob("*.md"))) == 1, "the good file landed"
-    assert code != 0, "a skipped artifact must not read as a clean success"
-    assert "bad.bin" in capsys.readouterr().err
+    assert code != 0, "a broken SUPPORTED artifact must not read as a clean success"
+    assert "broken.pdf" in capsys.readouterr().err
+
+
+# --- durability + batch semantics (Red review round 1) ---------------------
+
+def test_a_torn_asset_write_is_never_left_behind_or_treated_as_valid(tmp_path, monkeypatch):
+    """The dedup check makes corruption PERMANENT, so the write must be atomic.
+
+    shutil.copy2 straight to the content-addressed path leaves a truncated file
+    if interrupted (Ctrl-C mid-batch). Every later ingest of the same bytes then
+    hits `if not exists()` and skips the repair forever, while the companion
+    asserts a sha256 those bytes do not have. Byte-faithful preservation is this
+    component's entire job.
+    """
+    import alexandria.ingest as ing
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "paper.pdf"
+    src.write_bytes(_PDF)
+
+    real_copy = ing.shutil.copy2
+
+    def torn_copy(a, b, *args, **kwargs):
+        Path(b).write_bytes(_PDF[: len(_PDF) // 2])   # partial write
+        raise KeyboardInterrupt("interrupted mid-copy")
+
+    monkeypatch.setattr(ing.shutil, "copy2", torn_copy)
+    with pytest.raises(KeyboardInterrupt):
+        ingest_path(src, corpus)
+
+    monkeypatch.setattr(ing.shutil, "copy2", real_copy)
+    leftovers = [p for p in (corpus / "assets").rglob("*") if p.is_file()]
+    assert leftovers == [], f"a torn asset survived and would never be repaired: {leftovers}"
+
+    # The retry must now produce the real, complete artifact.
+    result = ingest_path(src, corpus)
+    assert (corpus / result.asset_path).read_bytes() == _PDF
+
+
+def test_a_preexisting_corrupt_asset_is_repaired_not_trusted(tmp_path):
+    """Dedup must verify what is stored, not just that something is stored."""
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "paper.pdf"
+    src.write_bytes(_PDF)
+
+    first = ingest_path(src, corpus)
+    stored = corpus / first.asset_path
+    stored.write_bytes(b"corrupted")          # simulate a torn/damaged asset
+
+    again = ingest_path(src, corpus)
+    assert (corpus / again.asset_path).read_bytes() == _PDF, (
+        "a damaged asset was trusted on the dedup path instead of repaired")
+
+
+def test_an_unreadable_file_is_skipped_without_killing_the_batch(tmp_path, capsys):
+    """OSError must be a per-file skip: one bad file must not abandon the rest."""
+    from alexandria.cli import app
+
+    corpus = _corpus(tmp_path)
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    good = drop / "good.pdf"
+    good.write_bytes(_PDF)
+    bad = drop / "locked.pdf"
+    bad.write_bytes(_PDF)
+    bad.chmod(0o000)
+    try:
+        code = app(["--corpus", str(corpus), "ingest", str(drop)])
+        assert len(list((corpus / "sources/assets").glob("*.md"))) == 1, "the good file landed"
+        assert code != 0
+        assert "locked.pdf" in capsys.readouterr().err
+    finally:
+        bad.chmod(0o644)
+
+
+def test_a_directory_of_unsupported_files_is_not_a_failure(tmp_path, capsys):
+    """Exit codes must stay meaningful.
+
+    rglob("*") sweeps .DS_Store, notes.txt and friends; if every stray file
+    forced exit 1, the operator learns to ignore the code and the signal for a
+    REAL extraction failure is destroyed. Unsupported-by-sweep and
+    supported-but-broken are different classes.
+    """
+    from alexandria.cli import app
+
+    corpus = _corpus(tmp_path)
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    (drop / "good.pdf").write_bytes(_PDF)
+    (drop / "notes.txt").write_text("not an artifact")
+    (drop / ".DS_Store").write_bytes(b"\x00")
+
+    code = app(["--corpus", str(corpus), "ingest", str(drop)])
+
+    assert len(list((corpus / "sources/assets").glob("*.md"))) == 1
+    assert code == 0, "sweeping past unsupported files in a directory is not a failure"
+
+
+def test_an_explicitly_named_unsupported_file_still_fails(tmp_path, capsys):
+    """Naming a file directly is an instruction; refusing it must be visible."""
+    from alexandria.cli import app
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "mystery.bin"
+    src.write_bytes(b"\x00\x01")
+
+    assert app(["--corpus", str(corpus), "ingest", str(src)]) != 0
+    assert "mystery.bin" in capsys.readouterr().err
+
+
+def test_the_same_bytes_under_a_new_name_stay_ONE_memory(tmp_path):
+    """Content-addressed means one artifact AND one companion.
+
+    Two companions with identical (source, source_id) but different slugs would
+    be two documents claiming to be the same memory -- the duplicate-identity
+    shape that produced a phantom shortfall before.
+    """
+    corpus = _corpus(tmp_path)
+    a = tmp_path / "resume.pdf"
+    b = tmp_path / "resume-final-v2.pdf"
+    a.write_bytes(_PDF)
+    b.write_bytes(_PDF)
+
+    first = ingest_path(a, corpus)
+    second = ingest_path(b, corpus)
+
+    assert first.asset_path == second.asset_path
+    assert first.doc_path == second.doc_path, "re-ingest under a new name forked the memory"
+    assert len(list((corpus / "sources/assets").glob("*.md"))) == 1
+
+
+def test_a_hostile_filename_cannot_break_out_of_frontmatter(tmp_path):
+    """original_name is attacker-influenced text landing in YAML."""
+    from alexandria.corpus import Doc
+
+    corpus = _corpus(tmp_path)
+    nasty = tmp_path / 'we"ird\nname.pdf'
+    nasty.write_bytes(_PDF)
+
+    result = ingest_path(nasty, corpus)
+    doc = Doc.read(corpus / result.doc_path, corpus)   # must still parse
+
+    assert doc.frontmatter["ingest"]["original_name"] == nasty.name
+    assert doc.frontmatter["type"] == "doc"
+
+
+def test_a_pdftotext_failure_is_not_accepted_as_partial_text(tmp_path, monkeypatch):
+    """A non-zero extractor must not have its partial stdout stored as the memory."""
+    import alexandria.ingest as ing
+
+    corpus = _corpus(tmp_path)
+    src = tmp_path / "corrupt.pdf"
+    src.write_bytes(_PDF)
+
+    class Result:
+        returncode = 1
+        stdout = "half a pa"
+        stderr = "Syntax Error: damaged xref"
+
+    monkeypatch.setattr(ing.subprocess, "run", lambda *a, **k: Result())
+    with pytest.raises(ExtractionFailed, match="damaged xref"):
+        ingest_path(src, corpus)
+
+
+def test_a_missing_absolute_path_reports_cleanly_instead_of_crashing(tmp_path, capsys):
+    from alexandria.cli import app
+
+    corpus = _corpus(tmp_path)
+    code = app(["--corpus", str(corpus), "ingest", "/definitely/not/here.pdf"])
+
+    assert code != 0
+    assert "no such path" in capsys.readouterr().err.lower()
