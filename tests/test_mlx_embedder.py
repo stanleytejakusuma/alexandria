@@ -86,3 +86,72 @@ def test_missing_mlx_dependency_raises_a_clear_error():
     embedder._import_error = ImportError("No module named 'mlx'")
     with pytest.raises(RuntimeError, match="mlx"):
         embedder.embed(["x"])
+
+
+# ---------------------------------------------------------------------------
+# #44: offline-degradation -- same requirement as LocalEmbedder: fail fast
+# and loud on a hung/unreachable load, never silently degrade.
+# ---------------------------------------------------------------------------
+
+def test_load_timeout_is_configurable_and_bounded_by_default():
+    default = MLXEmbedder()
+    assert 0 < default.load_timeout <= 120.0
+
+
+def test_raises_within_its_bound_on_a_hung_load(monkeypatch):
+    import sys
+    import time
+    import types
+
+    from alexandria.model_load import ModelLoadTimeout
+
+    def hanging_load(model_name):
+        time.sleep(30)
+        return object(), object()
+
+    fake = types.ModuleType("mlx_embeddings")
+    fake.load = hanging_load
+    fake.generate = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "mlx_embeddings", fake)
+
+    embedder = MLXEmbedder(load_timeout=0.2)
+    started = time.monotonic()
+    with pytest.raises(ModelLoadTimeout, match="mlx"):
+        embedder.embed(["probe"])
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, f"embed() blocked the caller for {elapsed:.1f}s past its bound"
+
+
+def test_timeout_error_names_the_model(monkeypatch):
+    import sys
+    import time
+    import types
+
+    def hanging_load(model_name):
+        time.sleep(30)
+
+    fake = types.ModuleType("mlx_embeddings")
+    fake.load = hanging_load
+    fake.generate = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "mlx_embeddings", fake)
+
+    embedder = MLXEmbedder(model="test/mlx-probe-model", load_timeout=0.1)
+    with pytest.raises(Exception, match="test/mlx-probe-model"):
+        embedder.embed(["probe"])
+
+
+def test_a_real_exception_is_not_masked_as_a_timeout(monkeypatch):
+    import sys
+    import types
+
+    def boom_load(model_name):
+        raise OSError("couldn't connect to huggingface.co and nothing is cached")
+
+    fake = types.ModuleType("mlx_embeddings")
+    fake.load = boom_load
+    fake.generate = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "mlx_embeddings", fake)
+
+    embedder = MLXEmbedder(load_timeout=5.0)
+    with pytest.raises(OSError, match="cached"):
+        embedder.embed(["probe"])

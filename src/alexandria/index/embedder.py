@@ -14,6 +14,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol, runtime_checkable
 
+from ..model_load import DEFAULT_LOAD_TIMEOUT, load_with_timeout
+
 __all__ = ["CachedEmbedder", "Embedder", "EmbeddingCacheBusy", "HashEmbedder",
            "LocalEmbedder", "MLXEmbedder"]
 
@@ -137,11 +139,13 @@ class LocalEmbedder:
     """
 
     def __init__(self, model: str = "Qwen/Qwen3-Embedding-0.6B", batch_size: int = 32,
-                 device: str | None = None, max_length: int = DEFAULT_MAX_LENGTH) -> None:
+                 device: str | None = None, max_length: int = DEFAULT_MAX_LENGTH,
+                 load_timeout: float = DEFAULT_LOAD_TIMEOUT) -> None:
         self.model_name = model
         self.batch_size = batch_size
         self.device = device
         self.max_length = max_length
+        self.load_timeout = load_timeout
         self._model = None
 
     @property
@@ -175,7 +179,15 @@ class LocalEmbedder:
         except ImportError as exc:  # pragma: no cover - exercised in installed runtime
             raise RuntimeError("local embeddings require sentence-transformers") from exc
         device = self.device or _best_device(torch)
-        self._model = SentenceTransformer(self.model_name, device=device)
+        # #44: unlike the reranker, an embedder must NEVER silently degrade --
+        # there is no safe substitute for a real vector, and a garbage/zero
+        # vector would poison the index or a query invisibly. This bounds the
+        # load so a slow (not absent) network fails FAST AND LOUD with a
+        # clear cause instead of hanging the caller's first index/search.
+        self._model = load_with_timeout(
+            lambda: SentenceTransformer(self.model_name, device=device),
+            timeout=self.load_timeout,
+            description=f"local embedder model {self.model_name!r} (provider: local)")
         return self._model
 
 
@@ -203,10 +215,12 @@ class MLXEmbedder:
     """
 
     def __init__(self, model: str = "mlx-community/Qwen3-Embedding-0.6B-8bit",
-                 batch_size: int = 32, max_length: int = DEFAULT_MAX_LENGTH) -> None:
+                 batch_size: int = 32, max_length: int = DEFAULT_MAX_LENGTH,
+                 load_timeout: float = DEFAULT_LOAD_TIMEOUT) -> None:
         self.model_name = model
         self.batch_size = batch_size
         self.max_length = max_length
+        self.load_timeout = load_timeout
         self._model = None
         self._processor = None
         self._generate = None
@@ -246,7 +260,14 @@ class MLXEmbedder:
         except ImportError as exc:  # pragma: no cover - exercised in installed runtime
             raise RuntimeError(
                 "MLX embeddings require the 'mlx' and 'mlx-embeddings' packages") from exc
-        self._model, self._processor = load(self.model_name)
+        # #44: same requirement as LocalEmbedder -- load(model_name) pulls
+        # weights over the network with no native timeout, and there is no
+        # safe substitute for a real vector, so this must fail fast and loud
+        # on a slow/hung network rather than silently degrade or hang.
+        self._model, self._processor = load_with_timeout(
+            lambda: load(self.model_name),
+            timeout=self.load_timeout,
+            description=f"MLX embedder model {self.model_name!r} (provider: mlx)")
         self._generate = generate
 
 

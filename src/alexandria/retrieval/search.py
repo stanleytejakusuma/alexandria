@@ -349,6 +349,13 @@ class SearchEngine:
             reranked = candidates[:limit]
             degraded = True
             error = f"{type(exc).__name__}: {exc}"
+            # #44: this is the one place every caller (CLI search/answer, serve's
+            # /search and /answer) funnels through, so it is the one place a
+            # degraded reranker can be made loud unconditionally -- printing it
+            # only under --trace left a plain `alexandria search` with zero
+            # indication reranking silently skipped.
+            print(f"alexandria: reranker degraded (fell back to fusion order): "
+                  f"{error}", file=sys.stderr)
         trace["reranker"] = {
             "in": len(candidates), "out": len(reranked), "degraded": degraded, "error": error,
             "timing_ms": _elapsed_ms(rerank_started),

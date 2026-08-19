@@ -659,3 +659,77 @@ def test_cache_identity_key_keeps_both_widths_addressable(tmp_path: Path):
     rows = b._connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
     assert rows == 2, "a width change overwrote the other width's entry instead of keying apart"
     b.close()
+
+
+# ---------------------------------------------------------------------------
+# #44: offline-degradation -- LocalEmbedder must FAIL FAST AND LOUD on a
+# hung/unreachable network, never silently degrade (unlike the reranker,
+# there is no safe substitute for a real vector: a garbage embedding would
+# poison the index or a query invisibly).
+# ---------------------------------------------------------------------------
+
+def test_local_embedder_load_timeout_is_configurable_and_bounded_by_default():
+    default = LocalEmbedder()
+    assert 0 < default.load_timeout <= 120.0
+
+
+def test_local_embedder_raises_within_its_bound_on_a_hung_load(monkeypatch):
+    import time
+    import types
+
+    from alexandria.model_load import ModelLoadTimeout
+
+    class HangingST:
+        def __init__(self, *args, **kwargs):
+            time.sleep(30)
+
+    fake_st = types.ModuleType("sentence_transformers")
+    fake_st.SentenceTransformer = HangingST
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+
+    embedder = LocalEmbedder(load_timeout=0.2)
+    started = time.monotonic()
+    with pytest.raises(ModelLoadTimeout, match="Qwen"):
+        embedder.embed(["probe"])
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, f"embed() blocked the caller for {elapsed:.1f}s past its bound"
+
+
+def test_local_embedder_timeout_error_names_the_provider_and_model(monkeypatch):
+    import time
+    import types
+
+    fake_st = types.ModuleType("sentence_transformers")
+
+    class HangingST:
+        def __init__(self, *args, **kwargs):
+            time.sleep(30)
+
+    fake_st.SentenceTransformer = HangingST
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+
+    embedder = LocalEmbedder(model="test/probe-model-name", load_timeout=0.1)
+    try:
+        embedder.embed(["probe"])
+        assert False, "must have raised"
+    except Exception as exc:
+        assert "test/probe-model-name" in str(exc)
+
+
+def test_local_embedder_a_real_exception_is_not_masked_as_a_timeout(monkeypatch):
+    """load_with_timeout must propagate a genuine failure (bad model id, no
+    network at all under HF_HUB_OFFLINE) AS ITSELF, not disguise it as a
+    generic timeout -- the cause (offline vs slow) must stay distinguishable."""
+    import types
+
+    class BoomST:
+        def __init__(self, *args, **kwargs):
+            raise OSError("couldn't connect to huggingface.co and nothing is cached")
+
+    fake_st = types.ModuleType("sentence_transformers")
+    fake_st.SentenceTransformer = BoomST
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+
+    embedder = LocalEmbedder(load_timeout=5.0)
+    with pytest.raises(OSError, match="cached"):
+        embedder.embed(["probe"])

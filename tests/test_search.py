@@ -66,6 +66,29 @@ def test_search_degrades_to_fusion_order_when_reranking_fails(tmp_path: Path):
     assert "model unavailable" in results[0].trace["reranker"]["error"]
 
 
+def test_a_degraded_reranker_prints_a_loud_warning_unconditionally(tmp_path: Path, capsys):
+    """#44: the trace already recorded degraded=True, but nothing was ever
+    PRINTED, so a plain `alexandria search` (no --trace flag) gave a user zero
+    indication their results skipped reranking. This is the one place every
+    caller (CLI search, CLI answer, serve's /search, /answer) funnels through,
+    so the warning belongs here, not duplicated in each entry point."""
+    build_engine(tmp_path, BrokenReranker()).search("sweep page lint")
+
+    warning = capsys.readouterr().err
+    assert warning, "degradation must be printed unconditionally, not only under --trace"
+    assert "rerank" in warning.lower()
+    assert "model unavailable" in warning
+    assert "degrad" in warning.lower() or "fell back" in warning.lower() or "fallback" in warning.lower()
+
+
+def test_a_healthy_reranker_prints_nothing(tmp_path: Path, capsys):
+    """The warning must be conditional on ACTUAL degradation -- a healthy path
+    must stay silent, or the signal is worthless."""
+    build_engine(tmp_path).search("sweep page lint")
+
+    assert capsys.readouterr().err == ""
+
+
 class BrokenLexicalIndex:
     def search(self, query, k, where):
         raise RuntimeError("fts unavailable")

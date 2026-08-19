@@ -6,6 +6,8 @@ import threading
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from ..model_load import DEFAULT_LOAD_TIMEOUT, load_with_timeout
+
 __all__ = ["CrossEncoderReranker", "IdentityReranker", "RerankCandidate", "Reranker"]
 
 # Keyed by (model_name, half_precision): the underlying torch CrossEncoder,
@@ -72,9 +74,10 @@ class CrossEncoderReranker:
     """
 
     def __init__(self, model: str = "BAAI/bge-reranker-v2-m3", *,
-                 half_precision: bool = True) -> None:
+                 half_precision: bool = True, load_timeout: float = DEFAULT_LOAD_TIMEOUT) -> None:
         self.model_name = model
         self.half_precision = half_precision
+        self.load_timeout = load_timeout
         self._model = None
 
     def rerank(self, query: str, candidates: list[RerankCandidate], k: int) -> list[RerankCandidate]:
@@ -101,7 +104,17 @@ class CrossEncoderReranker:
             from sentence_transformers import CrossEncoder
         except ImportError as exc:  # pragma: no cover - exercised in installed runtime
             raise RuntimeError("cross-encoder reranking requires sentence-transformers") from exc
-        model = CrossEncoder(self.model_name)
+        # #44: CrossEncoder(...) issues several sequential, individually-bounded
+        # HTTP requests with no bound on the TOTAL -- a slow (not absent)
+        # network hangs the caller's first query for minutes. Bounding it here
+        # turns that hang into a raised ModelLoadTimeout, which propagates
+        # through rerank() unswallowed so search.py's existing try/except
+        # (already correct for any reranker failure) catches it and degrades to
+        # fusion order -- this function does not duplicate that fallback.
+        model = load_with_timeout(
+            lambda: CrossEncoder(self.model_name),
+            timeout=self.load_timeout,
+            description=f"reranker model {self.model_name!r}")
         if self.half_precision:
             try:
                 model.model.half()
