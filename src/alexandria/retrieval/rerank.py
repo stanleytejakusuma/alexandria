@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from ..model_load import DEFAULT_LOAD_TIMEOUT, load_with_timeout
+from ..model_load import DEFAULT_LOAD_TIMEOUT, ModelLoadTimeout, load_with_timeout
 
 __all__ = ["CrossEncoderReranker", "IdentityReranker", "RerankCandidate", "Reranker"]
 
@@ -20,6 +21,22 @@ __all__ = ["CrossEncoderReranker", "IdentityReranker", "RerankCandidate", "Reran
 # to destabilize the MPS backend (a segfault) under back-to-back test runs
 # each constructing their own CrossEncoderReranker.
 _MODEL_CACHE: dict[tuple[str, bool], object] = {}
+# THE BUG THAT HUNG CI (2026-08-20): a failed load was never remembered, so a
+# persistently slow/unreachable network made EVERY caller independently
+# re-pay the full load_timeout -- one 30s bound, multiplied by every search in
+# a test suite (or every real query in production), compounded into an
+# 11-minute-plus stall. Observed live: two consecutive CI runs on the same
+# commit, both cancelled by the 30-minute job cap, the gap between test
+# progress lines matching exactly. Same bug CLASS this repo already fixed
+# once for LLM calls (backlog #28 -> #47, RequestDeadline): a per-call cap
+# that does not compose across repeated callers is not actually a cap.
+# Keyed identically to _MODEL_CACHE; value is the monotonic time the failure
+# was recorded. A cache_key present here (and NOT in _MODEL_CACHE) means "do
+# not attempt this again until the cooldown expires" -- checked BEFORE
+# touching the network, so the second-and-later caller fails in microseconds,
+# not by re-running the doomed load.
+_FAILURE_CACHE: dict[tuple[str, bool], float] = {}
+_FAILURE_COOLDOWN = 60.0  # a network blip must not become a process-lifetime outage
 # Sharing one torch model across ServeContext instances (each with its own
 # engine_lock) means the engine_lock no longer serializes every caller of
 # that model -- two different SearchEngines, or leftover daemon threads
@@ -100,6 +117,18 @@ class CrossEncoderReranker:
         if cached is not None:
             self._model = cached
             return self._model
+        # Fail FAST on a remembered recent failure -- checked before touching
+        # the network at all -- instead of re-attempting a load that just
+        # timed out. See _FAILURE_CACHE's module-level comment for the bug
+        # this closes.
+        failed_at = _FAILURE_CACHE.get(cache_key)
+        if failed_at is not None and time.monotonic() - failed_at < _FAILURE_COOLDOWN:
+            remaining = _FAILURE_COOLDOWN - (time.monotonic() - failed_at)
+            raise ModelLoadTimeout(
+                f"reranker model {self.model_name!r} failed to load "
+                f"{time.monotonic() - failed_at:.0f}s ago and is in a "
+                f"{remaining:.0f}s cooldown before retrying -- not re-attempting "
+                f"a load that just failed")
         try:
             from sentence_transformers import CrossEncoder
         except ImportError as exc:  # pragma: no cover - exercised in installed runtime
@@ -111,10 +140,15 @@ class CrossEncoderReranker:
         # through rerank() unswallowed so search.py's existing try/except
         # (already correct for any reranker failure) catches it and degrades to
         # fusion order -- this function does not duplicate that fallback.
-        model = load_with_timeout(
-            lambda: CrossEncoder(self.model_name),
-            timeout=self.load_timeout,
-            description=f"reranker model {self.model_name!r}")
+        try:
+            model = load_with_timeout(
+                lambda: CrossEncoder(self.model_name),
+                timeout=self.load_timeout,
+                description=f"reranker model {self.model_name!r}")
+        except BaseException:
+            _FAILURE_CACHE[cache_key] = time.monotonic()
+            raise
+        _FAILURE_CACHE.pop(cache_key, None)  # a later success clears any stale failure
         if self.half_precision:
             try:
                 model.model.half()

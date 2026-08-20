@@ -147,6 +147,7 @@ class LocalEmbedder:
         self.max_length = max_length
         self.load_timeout = load_timeout
         self._model = None
+        self._load_error: BaseException | None = None
 
     @property
     def name(self) -> str:
@@ -173,6 +174,15 @@ class LocalEmbedder:
     def _load(self):
         if self._model is not None:
             return self._model
+        # THE BUG THAT HUNG CI (2026-08-20, found via the reranker's identical
+        # gap): a failed load was never remembered, so .embed()/.dim -- both
+        # call _load() independently -- each re-paid the FULL timeout on a
+        # SECOND call on the same instance. Unlike the reranker, this instance
+        # is never retried by construction (a fresh LocalEmbedder is built per
+        # top-level CLI operation), so remembering the failure for this
+        # instance's lifetime is correct, not merely a cooldown.
+        if self._load_error is not None:
+            raise self._load_error
         try:
             import torch
             from sentence_transformers import SentenceTransformer
@@ -184,10 +194,14 @@ class LocalEmbedder:
         # vector would poison the index or a query invisibly. This bounds the
         # load so a slow (not absent) network fails FAST AND LOUD with a
         # clear cause instead of hanging the caller's first index/search.
-        self._model = load_with_timeout(
-            lambda: SentenceTransformer(self.model_name, device=device),
-            timeout=self.load_timeout,
-            description=f"local embedder model {self.model_name!r} (provider: local)")
+        try:
+            self._model = load_with_timeout(
+                lambda: SentenceTransformer(self.model_name, device=device),
+                timeout=self.load_timeout,
+                description=f"local embedder model {self.model_name!r} (provider: local)")
+        except BaseException as exc:
+            self._load_error = exc
+            raise
         return self._model
 
 
@@ -225,6 +239,7 @@ class MLXEmbedder:
         self._processor = None
         self._generate = None
         self._import_error: Exception | None = None
+        self._load_error: BaseException | None = None
 
     @property
     def name(self) -> str:
@@ -255,6 +270,12 @@ class MLXEmbedder:
                 f"({self._import_error})") from self._import_error
         if self._model is not None:
             return
+        # Same fix as LocalEmbedder's, same bug (2026-08-20): .dim and .embed
+        # both reach _load() independently, so a failed load must be
+        # remembered for this instance's lifetime -- never re-attempted by a
+        # second call on the same (never-reused) instance.
+        if self._load_error is not None:
+            raise self._load_error
         try:
             from mlx_embeddings import generate, load
         except ImportError as exc:  # pragma: no cover - exercised in installed runtime
@@ -264,10 +285,14 @@ class MLXEmbedder:
         # weights over the network with no native timeout, and there is no
         # safe substitute for a real vector, so this must fail fast and loud
         # on a slow/hung network rather than silently degrade or hang.
-        self._model, self._processor = load_with_timeout(
-            lambda: load(self.model_name),
-            timeout=self.load_timeout,
-            description=f"MLX embedder model {self.model_name!r} (provider: mlx)")
+        try:
+            self._model, self._processor = load_with_timeout(
+                lambda: load(self.model_name),
+                timeout=self.load_timeout,
+                description=f"MLX embedder model {self.model_name!r} (provider: mlx)")
+        except BaseException as exc:
+            self._load_error = exc
+            raise
         self._generate = generate
 
 

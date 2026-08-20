@@ -733,3 +733,38 @@ def test_local_embedder_a_real_exception_is_not_masked_as_a_timeout(monkeypatch)
     embedder = LocalEmbedder(load_timeout=5.0)
     with pytest.raises(OSError, match="cached"):
         embedder.embed(["probe"])
+
+
+def test_local_embedder_does_not_retry_the_full_timeout_on_a_second_call(monkeypatch):
+    """Same bug class as the reranker's (the one that hung CI): a failed load
+    on ONE instance must not be re-attempted by a second call to .embed()/.dim
+    on that SAME instance -- dim and embed both call _load() independently."""
+    import time
+    import types
+
+    load_calls = []
+
+    class HangingST:
+        def __init__(self, *args, **kwargs):
+            load_calls.append(time.monotonic())
+            time.sleep(30)
+
+    fake_st = types.ModuleType("sentence_transformers")
+    fake_st.SentenceTransformer = HangingST
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+
+    embedder = LocalEmbedder(load_timeout=0.1)
+    started = time.monotonic()
+    with pytest.raises(Exception):
+        embedder.embed(["probe one"])
+    with pytest.raises(Exception):
+        embedder.embed(["probe two"])
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5, (
+        f"a second call on the same failed instance took {elapsed:.2f}s -- "
+        f"it re-attempted the load instead of failing fast")
+    assert len(load_calls) == 1, (
+        f"the underlying SentenceTransformer constructor was invoked "
+        f"{len(load_calls)} times for two calls on one instance -- only the "
+        f"FIRST should ever attempt the network")

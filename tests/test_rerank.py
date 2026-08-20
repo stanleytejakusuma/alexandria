@@ -101,3 +101,80 @@ def test_a_hung_load_propagates_as_a_named_timeout_not_a_swallowed_hang(monkeypa
 def test_a_load_timeout_is_configurable_and_bounded_by_default():
     default_reranker = CrossEncoderReranker()
     assert 0 < default_reranker.load_timeout <= 120.0
+
+
+def test_a_failed_load_does_not_retry_the_full_timeout_on_every_call(monkeypatch):
+    """THE BUG THAT HUNG CI: _MODEL_CACHE only cached SUCCESS, never failure.
+    On a persistently slow/unreachable network, every single search
+    independently re-paid the full load_timeout -- 36+ call sites in one test
+    suite compounded a 30s bound into an 11-minute-plus hang (observed live,
+    two consecutive CI runs, same commit, cancelled by the 30-minute job cap).
+    A failure must be remembered (for a bounded cooldown) so the SECOND call
+    within that window fails FAST, not by re-attempting the doomed load."""
+    import time
+    import types
+
+    load_calls = []
+
+    class HangingCE:
+        def __init__(self, *args, **kwargs):
+            load_calls.append(time.monotonic())
+            time.sleep(30)  # never actually reached within this test's timeout
+
+    fake = types.ModuleType("sentence_transformers")
+    fake.CrossEncoder = HangingCE
+    monkeypatch.setitem(__import__("sys").modules, "sentence_transformers", fake)
+
+    model_name = "offline-degrade-no-retry-storm-probe"
+    candidates = [RerankCandidate("a", "alpha text", 0.9)]
+
+    first = CrossEncoderReranker(model=model_name, load_timeout=0.2)
+    second = CrossEncoderReranker(model=model_name, load_timeout=0.2)
+
+    started = time.monotonic()
+    with pytest.raises(Exception):
+        first.rerank("query", candidates, k=1)
+    with pytest.raises(Exception):
+        second.rerank("query", candidates, k=1)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, (
+        f"two calls within the cooldown took {elapsed:.2f}s -- the second call "
+        f"re-attempted the load instead of failing fast on the cached failure")
+    assert len(load_calls) == 1, (
+        f"the underlying CrossEncoder constructor was invoked {len(load_calls)} "
+        f"times for two calls within the cooldown window -- only the FIRST "
+        f"should ever actually attempt the network")
+
+
+def test_a_failed_load_retries_after_the_cooldown_expires(monkeypatch):
+    """The failure cache must not be permanent -- a network that recovers must
+    eventually be retried, or a transient blip becomes a process-lifetime outage."""
+    import time
+    import types
+
+    load_calls = []
+
+    class HangingCE:
+        def __init__(self, *args, **kwargs):
+            load_calls.append(time.monotonic())
+            time.sleep(30)
+
+    fake = types.ModuleType("sentence_transformers")
+    fake.CrossEncoder = HangingCE
+    monkeypatch.setitem(__import__("sys").modules, "sentence_transformers", fake)
+
+    model_name = "offline-degrade-cooldown-expiry-probe"
+    candidates = [RerankCandidate("a", "alpha text", 0.9)]
+
+    import alexandria.retrieval.rerank as rerank_mod
+    monkeypatch.setattr(rerank_mod, "_FAILURE_COOLDOWN", 0.1)
+
+    reranker = CrossEncoderReranker(model=model_name, load_timeout=0.05)
+    with pytest.raises(Exception):
+        reranker.rerank("query", candidates, k=1)
+    time.sleep(0.15)  # past the (patched) cooldown
+    with pytest.raises(Exception):
+        reranker.rerank("query", candidates, k=1)
+
+    assert len(load_calls) == 2, "a call after the cooldown must retry, not stay cached-failed forever"

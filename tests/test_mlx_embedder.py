@@ -155,3 +155,32 @@ def test_a_real_exception_is_not_masked_as_a_timeout(monkeypatch):
     embedder = MLXEmbedder(load_timeout=5.0)
     with pytest.raises(OSError, match="cached"):
         embedder.embed(["probe"])
+
+
+def test_does_not_retry_the_full_timeout_on_a_second_call(monkeypatch):
+    """Same bug class as LocalEmbedder's and the reranker's."""
+    import sys
+    import time
+    import types
+
+    load_calls = []
+
+    def hanging_load(model_name):
+        load_calls.append(time.monotonic())
+        time.sleep(30)
+
+    fake = types.ModuleType("mlx_embeddings")
+    fake.load = hanging_load
+    fake.generate = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "mlx_embeddings", fake)
+
+    embedder = MLXEmbedder(load_timeout=0.1)
+    started = time.monotonic()
+    with pytest.raises(Exception):
+        embedder.embed(["probe one"])
+    with pytest.raises(Exception):
+        embedder.embed(["probe two"])
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5, f"second call took {elapsed:.2f}s -- re-attempted the load"
+    assert len(load_calls) == 1
