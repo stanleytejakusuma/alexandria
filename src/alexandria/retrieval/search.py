@@ -80,6 +80,15 @@ class SearchEngine:
         self.last_trace: dict[str, Any] = {}
         self.last_cache_hit = 0
         self._corpus_root = corpus_root
+        # #9/C1.1: the query_id QueryLogger.log() generates internally, surfaced
+        # per-call (same pattern as last_trace/last_cache_hit above) so the CLI
+        # answer path can thread it into the durable citation record. None
+        # whenever no logger is configured, logging failed, OR this call was a
+        # response-cache hit that never reached retrieval (search.py's own
+        # cache-hit branch returns before any search happens at all -- see
+        # QueryCache handling above __init__, a query_id would misleadingly
+        # imply retrieval occurred).
+        self.last_query_id: str | None = None
 
     @property
     def _generation(self) -> int:
@@ -127,6 +136,7 @@ class SearchEngine:
     def _search_unlocked(self, query: str, *, k: int | None = None,
                          filters: Mapping[str, Any] | None = None,
                          tier: str = "map") -> list[SearchResult]:
+        self.last_query_id = None  # #9/C1.1: reset per call, same as last_trace below
         started = time.perf_counter()
         # Execute the SAME normalized query that keys the cache (Red: the
         # first spelling must not control later results).
@@ -189,7 +199,7 @@ class SearchEngine:
                 trace["latency_ms"] = _elapsed_ms(started)
                 self.last_trace = trace
                 if self.logger is not None:
-                    self.logger.log(
+                    self.last_query_id = self.logger.log(
                         query=query, filters=metadata_filter, tier=tier,
                         retrieved_ids=[r.chunk_id for r in cached],
                         scores=[r.score for r in cached], latency_ms=trace["latency_ms"],
@@ -381,12 +391,16 @@ class SearchEngine:
             # hit-source: 2 = embedding-cache only, 1 = query-cache (returned
             # earlier), 0 = neither. Separate semantics (Red release change 7).
             hit = 2 if cache_stats.get("hits") else self.last_cache_hit
-            trace["logging"] = {"ok": self.logger.log(
+            self.last_query_id = self.logger.log(
                 query=query, filters=metadata_filter, tier=tier,
                 retrieved_ids=[result.chunk_id for result in results],
                 scores=[result.score for result in results], latency_ms=trace["latency_ms"],
                 cache_hit=hit, client=self.client,
-            )}
+            )
+            # trace["logging"]["ok"] is an EXISTING external contract (traces
+            # are serialized to JSON for --trace/serve callers) -- keep it a
+            # bool, derived from the id, rather than changing its shape.
+            trace["logging"] = {"ok": self.last_query_id is not None}
         # QUERY CACHE write: only cacheable (complete) result sets.
         # Red release change 5: a partial failure (one retrieval leg down,
         # reranker degraded) must not be cached as a snapshot of health.

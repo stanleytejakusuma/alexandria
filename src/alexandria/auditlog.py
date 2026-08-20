@@ -42,14 +42,27 @@ class AuditLogger:
                model: str, n_claims: int = 0, failed_claims: list[str] | None = None,
                error: str = "", stages: dict[str, int] | None = None,
                caller: str = "cli", user: str = "local",
-               trace: dict | None = None, id: str = "") -> None:
+               trace: dict | None = None, id: str = "",
+               query_id: str | None = None,
+               citations: list[dict] | None = None) -> None:
+        # #9/C1 requirement 2: the durable citation-linkage signal, written
+        # HERE (answers.jsonl, append-only, no TTL) rather than into
+        # ResponseCache (TTL'd 7 days, wholesale-DELETEd on clear() -- a
+        # training signal must outlive cache eviction, per the spec). Each
+        # entry is a (claim_id, doc_id, chunk_id, rank, claim_verdict,
+        # source_round) tuple built by cli._citation_records; query_id joins
+        # this row back to the QueryLogger.log() row that produced the
+        # retrieval evidence (spec requirement 1's whole point -- without a
+        # join key, retrieval-time and answer-time records could never be
+        # linked even in principle).
         self._append("answers", {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "kind": "answer", "id": id, "query": query, "total_ms": total_ms,
             "emitted": emitted, "model": model, "n_claims": n_claims,
             "failed_claims": failed_claims or [], "error": error,
             "stages": stages or {}, "caller": caller, "user": user,
-            "trace": trace or {},
+            "trace": trace or {}, "query_id": query_id,
+            "citations": citations or [],
         })
 
     def search(self, *, query: str, k: int, latency_ms: int,

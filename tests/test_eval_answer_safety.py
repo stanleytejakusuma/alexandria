@@ -616,3 +616,119 @@ def test_serve_reports_SALVAGE_as_503_with_emitted_false(tmp_path, monkeypatch):
     assert payload["emitted"] is False
     assert payload["salvaged"] is True
     assert payload["text"] == "Draft text."
+
+
+def test_citation_records_built_from_a_full_pipeline_are_durably_logged(monkeypatch, tmp_path):
+    """#9/C1: the end-to-end proof -- a real gather -> write -> judge pipeline
+    result produces durable (query_id, claim_id, doc_id, chunk_id, rank,
+    claim_verdict, source_round) tuples written into answers.jsonl, not
+    discarded like the spec's own audit found (cli.py's response_cache.put
+    only ever stored {text, n_claims})."""
+    import json as _json
+
+    from alexandria import cli
+    from alexandria.audit import AuditResult, Verdict
+    from alexandria.synthesis.gather import GatherResult, SourceChunk
+    from alexandria.synthesis.judge import JudgeVerdict
+    from alexandria.synthesis.pipeline import PipelineResult
+    from alexandria.synthesis.repair import RepairResult
+    from alexandria.synthesis.write import Citation, Claim, SynthesisPage
+
+    round_one = (SourceChunk("sources/a#1", "sources/a", "Evidence A.", 0.9),)
+    round_two = (SourceChunk("sources/b#1", "sources/b", "Evidence B.", 0.5),)
+    gathered = GatherResult(
+        topic_query="q", chunks=(*round_one, *round_two),
+        round_one=round_one, round_two=round_two,
+        follow_up_queries=("follow-up q",), gap_response='{"queries": ["follow-up q"]}')
+
+    page = SynthesisPage(
+        topic_query="q", text="Published page.",
+        claims=(
+            Claim("c1", "Supported claim.", (Citation("sources/a", "sources/a#1"),)),
+            Claim("c2", "Unsupported claim.", (Citation("sources/b", "sources/b#1"),)),
+        ),
+        author="synthesis-sweep@m@v1", skip_log=())
+
+    audit = AuditResult(verdicts=[
+        Verdict(note_id="c1", verdict="supported", reason="matches"),
+        Verdict(note_id="c2", verdict="unsupported", reason="not found"),
+    ])
+    verdict = JudgeVerdict(
+        page=page, chunk_accounted=True, entailment_passed=False, coverage_passed=True,
+        audit=audit, coverage=(), failed_claim_ids=("c2",),
+        failing_skip_ids=(), borderline_skip_ids=(), errors=())
+    repair = RepairResult(page=page, verdict=verdict, iterations=0, errors=())
+
+    page_path = tmp_path / "wiki" / "q.md"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_text("Published page.\n")
+    result = PipelineResult(gathered=gathered, repair=repair, emitted=False,
+                            page_path=page_path, skip_log_path=None, timings_ms={})
+
+    import alexandria.synthesis.pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "run_pipeline", lambda *a, **k: result, raising=False)
+    monkeypatch.setattr(cli, "_answer_retrieval_fingerprint",
+                        lambda engine: {"fake": True}, raising=False)
+
+    class FakeEngine:
+        embedder = type("E", (), {"name": "hash-24"})()
+        reranker = type("R", (), {"model_name": "fake", "half_precision": True})()
+        config = type("C", (), {"prefetch": 8, "top_k": 5, "rrf_k": 60, "wiki_boost": 1.25})()
+        logger = type("L", (), {"log_usage": lambda self, **kw: None})()
+        last_query_id = "search-query-abc"
+
+    cli.run_answer(
+        cli.AppConfig(corpus_path=tmp_path), tmp_path, "q",
+        engine=FakeEngine(), k=5, llm_model="m",
+        grader_a_model="a", grader_b_model="b",
+        base_url=None, api_key_env=None, prompt_version="v1")
+
+    rows = [_json.loads(l) for l in
+           (tmp_path / ".alexandria" / "audit" / "answers.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["query_id"] == "search-query-abc"
+    citations = {(c["claim_id"], c["chunk_id"]): c for c in row["citations"]}
+    assert len(citations) == 2
+
+    c1 = citations[("c1", "sources/a#1")]
+    assert c1["doc_id"] == "sources/a"
+    assert c1["claim_verdict"] == "supported"
+    assert c1["source_round"] == "round_one"
+    assert c1["rank"] == 1
+
+    c2 = citations[("c2", "sources/b#1")]
+    assert c2["claim_verdict"] == "unsupported"  # the NEGATIVE signal (requirement 4)
+    assert c2["source_round"] == "round_two"
+    assert c2["rank"] == 1
+
+
+def test_citation_records_stay_empty_when_no_query_id_or_no_verdict_exists():
+    """_citation_records must degrade to [] rather than raise -- citation
+    linkage is a durable SIGNAL, never a correctness gate an answer's
+    emission depends on."""
+    from alexandria.cli import _citation_records
+
+    assert _citation_records(None, object(), object(), generated_by_round={}) == []
+    assert _citation_records("qid", None, object(), generated_by_round={}) == []
+    assert _citation_records("qid", object(), None, generated_by_round={}) == []
+
+
+def test_chunk_source_round_first_seen_wins_and_defaults_to_seed():
+    """#9/C1 requirement 5: round_one beats round_two on overlap (matching how
+    GatherResult.chunks itself dedupes -- seed then round_one then round_two,
+    first doc_id wins); a chunk in neither round (a seed_chunk) is 'seed'."""
+    from alexandria.cli import _chunk_source_round
+    from alexandria.synthesis.gather import GatherResult, SourceChunk
+
+    overlap = SourceChunk("sources/x#1", "sources/x", "text")
+    gathered = GatherResult(
+        topic_query="q", chunks=(overlap,),
+        round_one=(overlap,),
+        round_two=(overlap, SourceChunk("sources/y#1", "sources/y", "text2")),
+        follow_up_queries=(), gap_response="{}")
+
+    rounds = _chunk_source_round(gathered)
+    assert rounds["sources/x#1"] == "round_one"  # first-seen wins
+    assert rounds["sources/y#1"] == "round_two"
+    assert rounds.get("sources/never-retrieved#1", "seed") == "seed"

@@ -17,8 +17,18 @@ class QueryLogger:
         self.path = Path(path)
 
     def log(self, *, query: str, filters: Mapping, tier: str, retrieved_ids: Sequence[str],
-            scores: Sequence[float], latency_ms: float, cache_hit: int, client: str) -> bool:
-        """Append a query record, returning false rather than disrupting retrieval on error."""
+            scores: Sequence[float], latency_ms: float, cache_hit: int, client: str) -> str | None:
+        """Append a query record, returning the generated query_id on success or
+        None on error (falsy either way -- `if not logger.log(...)` still reads
+        correctly as "logging failed").
+
+        #9/C1.1: returning the id (not a bare bool) makes this record JOINABLE
+        to a later citation record written from the SAME search -- the id was
+        always generated internally (uuid4 below) but discarded, so retrieval-
+        time and answer-time records could not be linked even in principle
+        (spec's own framing). The caller threads this id through to
+        AuditLogger.answer's new query_id parameter (see auditlog.py)."""
+        query_id = str(uuid.uuid4())
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as connection:
@@ -30,13 +40,13 @@ class QueryLogger:
                 )
                 connection.execute(
                     "INSERT INTO queries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (str(uuid.uuid4()), datetime.now(timezone.utc).isoformat(), query,
+                    (query_id, datetime.now(timezone.utc).isoformat(), query,
                      json.dumps(dict(filters), sort_keys=True), tier, json.dumps(list(retrieved_ids)),
                      json.dumps(list(scores)), float(latency_ms), int(cache_hit), client),
                 )
-            return True
+            return query_id
         except (OSError, sqlite3.Error):
-            return False
+            return None
 
     def log_usage(self, *, query_id: str, model: str, prompt_tokens: int, completion_tokens: int,
                   total_tokens: int, cache_read: int = 0) -> bool:

@@ -492,3 +492,44 @@ def test_reranking_happens_outside_the_shared_epoch_so_readers_cannot_starve_wri
     assert observed["writer_admitted_during_rerank"] is True, (
         "the shared epoch was still held during reranking -- query traffic can "
         "starve `index` for the full cross-encoder latency")
+
+
+def test_search_surfaces_the_query_id_from_a_configured_logger(tmp_path: Path):
+    """#9/C1.1: SearchEngine.last_query_id makes the retrieval-time query_id
+    available to the CLI answer path (same pattern as last_trace/
+    last_cache_hit), so a durable citation record can be joined back to the
+    search that produced its evidence."""
+    from alexandria.monitor import QueryLogger
+
+    embedder = HashEmbedder(dim=24)
+    vectors = embedder.embed(["sweep page fails lint"])
+    rows = [record("sources/a", "sources/a", "sweep page fails lint", vectors[0])]
+    store = VectorStore(tmp_path / "index")
+    store.upsert(rows)
+    lexical = BM25Index(tmp_path / "fts.sqlite")
+    lexical.index(rows)
+    logger = QueryLogger(tmp_path / "queries.sqlite")
+    engine = SearchEngine(embedder, store, lexical, IdentityReranker(),
+                          SearchConfig(prefetch=5, top_k=2, wiki_boost=1.25),
+                          logger=logger, corpus_root=tmp_path)
+
+    assert engine.last_query_id is None  # nothing searched yet
+    engine.search("sweep page lint")
+    assert engine.last_query_id is not None
+    import uuid as _uuid
+    _uuid.UUID(engine.last_query_id)
+
+    # A second call resets it -- last_query_id tracks the MOST RECENT search,
+    # same contract as last_trace, not an accumulating log.
+    first_id = engine.last_query_id
+    engine.search("sweep page lint")
+    assert engine.last_query_id is not None
+    assert engine.last_query_id != first_id
+
+
+def test_search_last_query_id_is_none_without_a_configured_logger(tmp_path: Path):
+    """No logger configured (e.g. synthetic-gate harnesses) -> no query_id to
+    surface, rather than fabricating one nothing will ever look up."""
+    engine = build_engine(tmp_path)
+    engine.search("sweep page lint")
+    assert engine.last_query_id is None
