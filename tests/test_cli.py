@@ -969,3 +969,153 @@ def test_index_enrich_invalidate_drops_a_stored_payload_and_reports_honestly(tmp
     assert rc2 == 1
     err = capsys.readouterr().err
     assert "no stored enrichment" in err.lower()
+
+
+def test_caller_label_passes_through_known_callers_unchanged():
+    """#8 residual: the only two values with any documented provenance on
+    the CLI path pass through as-is -- 'cli' (nothing specified) and
+    'pi-extension' (the one external, documented caller: demand-report.py's
+    own GENUINE_CALLERS methodology, and ~/.pi/agent/extensions/alexandria.ts
+    outside this repo, which sets ALEXANDRIA_CALLER=pi-extension)."""
+    from alexandria.cli import caller_label
+
+    assert caller_label("cli") == "cli"
+    assert caller_label("pi-extension") == "pi-extension"
+
+
+def test_caller_label_flags_any_unrecognized_value():
+    """The actual fix: a forged or novel --caller value can no longer look
+    exactly as credible as a documented one in the audit trail -- it is
+    visibly prefixed, distinguishing 'a string someone typed' from 'the one
+    value with any provenance'. This includes a value that CLAIMS to be
+    pi-extension's sibling or otherwise plausible-sounding."""
+    from alexandria.cli import caller_label
+
+    assert caller_label("weekly-loop") == "unverified:weekly-loop"
+    assert caller_label("totally-legit-tool") == "unverified:totally-legit-tool"
+    assert caller_label("pi-extension-v2") == "unverified:pi-extension-v2"
+    assert caller_label("") == "unverified:"
+
+
+def test_caller_label_handles_none_and_non_string_input():
+    from alexandria.cli import caller_label
+
+    assert caller_label(None) == "unverified:"
+    assert caller_label(123) == "unverified:"
+
+
+def test_search_audit_row_flags_an_unrecognized_caller(tmp_path, monkeypatch, capsys):
+    """End-to-end: a forged --caller value on `alexandria search` is written
+    to the audit trail visibly marked, not verbatim."""
+    import json
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nsome searchable body text here\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+
+    rc = app(["--corpus", str(corpus), "search", "searchable", "--caller", "definitely-pi-extension"])
+    assert rc == 0
+
+    audit_path = corpus / ".alexandria" / "audit" / "search.jsonl"
+    rows = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
+    assert rows[-1]["caller"] == "unverified:definitely-pi-extension"
+
+
+def test_search_audit_row_keeps_the_real_pi_extension_caller_unmarked(tmp_path, monkeypatch):
+    """The documented caller value is not penalized by the fix -- only
+    UNRECOGNIZED values get flagged."""
+    import json
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nsome searchable body text here\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+
+    rc = app(["--corpus", str(corpus), "search", "searchable", "--caller", "pi-extension"])
+    assert rc == 0
+
+    audit_path = corpus / ".alexandria" / "audit" / "search.jsonl"
+    rows = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
+    assert rows[-1]["caller"] == "pi-extension"
+
+
+def test_sync_now_actually_records_the_caller_flag(tmp_path, monkeypatch):
+    """#8 residual, found in passing: --caller existed on the sync verb's
+    argparse but cmd_sync never read args.caller -- a silently dead flag."""
+    import json
+    from types import SimpleNamespace
+
+    from alexandria import cli
+    from alexandria.connectors.base import RawItem
+    from alexandria.corpus import Doc
+
+    class _FakeConn:
+        name = "fake"
+
+        def __init__(self):
+            self.errors = []
+            self.committed = []
+
+        def discover(self):
+            return [RawItem(source_id="one", content="c")]
+
+        def normalize(self, item):
+            return [Doc(path="sources/fake/a.md",
+                       frontmatter={"type": "memory", "title": "T",
+                                   "generated": {"by": "test", "at": "2026-01-01"},
+                                   "status": "stable", "source": "fake", "source_id": "x"},
+                       body="body\n")]
+
+        def commit(self, items):
+            self.committed.extend(i.source_id for i in items)
+
+        def skip_log(self):
+            return []
+
+    monkeypatch.setattr(cli, "_sync_connector", lambda args: _FakeConn())
+    args = SimpleNamespace(connector="fake", corpus=str(tmp_path), workers=2,
+                          limit=0, dry_run=False, caller="pi-extension")
+    assert cli.cmd_sync(args) == 0
+
+    audit_path = tmp_path / ".alexandria" / "audit" / "sync.jsonl"
+    rows = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
+    assert rows[-1]["caller"] == "pi-extension"
+
+
+def test_sync_flags_an_unrecognized_caller_too(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from alexandria import cli
+    from alexandria.connectors.base import RawItem
+
+    class _EmptyConn:
+        name = "fake"
+
+        def __init__(self):
+            self.errors = []
+            self.committed = []
+
+        def discover(self):
+            return [RawItem(source_id="one", content="c")]
+
+        def normalize(self, item):
+            return []
+
+        def commit(self, items):
+            self.committed.extend(i.source_id for i in items)
+
+        def skip_log(self):
+            return []
+
+    monkeypatch.setattr(cli, "_sync_connector", lambda args: _EmptyConn())
+    args = SimpleNamespace(connector="fake", corpus=str(tmp_path), workers=2,
+                          limit=0, dry_run=False, caller="my-custom-script")
+    assert cli.cmd_sync(args) == 0
+
+    audit_path = tmp_path / ".alexandria" / "audit" / "sync.jsonl"
+    rows = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
+    assert rows[-1]["caller"] == "unverified:my-custom-script"

@@ -363,9 +363,13 @@ def cmd_sync(args) -> int:
         print(f"  error: {err}", file=sys.stderr)
     if len(conn.errors) > 10:
         print(f"  ... and {len(conn.errors)-10} more", file=sys.stderr)
+    # #8 residual, found while fixing the CLI attribution gap: --caller has
+    # existed on this verb's argparse but was never actually read here --
+    # a silently dead flag, not a security gap, but wrong all the same.
     logger.sync(connector=conn.name, duration_ms=int((time.time() - t0) * 1000),
                 discovered=total, normalized=total - failed,
-                committed=written, skipped=len(skipped), errors=conn.errors[:20])
+                committed=written, skipped=len(skipped), errors=conn.errors[:20],
+                caller=caller_label(getattr(args, "caller", "cli")), user=cli_identity())
     return 0
 
 
@@ -1230,7 +1234,7 @@ def cmd_search(args) -> int:
     logger = AuditLogger(corpus)
     logger.search(query=args.query, k=args.k,
                   latency_ms=int((time.time() - _t0) * 1000),
-                  hits=len(results), caller=args.caller, user=cli_identity(),
+                  hits=len(results), caller=caller_label(args.caller), user=cli_identity(),
                   cache_hit=engine.last_cache_hit)
     for result in results:
         print(f"{result.rank}. {result.chunk_id}  score={result.score:.6f}\n"
@@ -1419,7 +1423,7 @@ def cmd_answer(args) -> int:
         audit_concurrency=getattr(args, "audit_concurrency", 4),
         api_key_env=args.api_key_env, prompt_version=args.prompt_version,
         answer_timeout=getattr(args, "answer_timeout", DEFAULT_ANSWER_TIMEOUT),
-        save_dir=args.save_dir, caller=args.caller, user=cli_identity())
+        save_dir=args.save_dir, caller=caller_label(args.caller), user=cli_identity())
     if outcome.cached:
         print("[cached] " + outcome.text)
         return 0
@@ -1641,6 +1645,43 @@ def cli_identity() -> str:
         return getpass.getuser()
     except Exception:  # no passwd entry (some containers); never fail a query
         return "unknown"
+
+
+# BACKLOG #8 residual (2026-08-20): the CLI half. serve's identity is already
+# structurally verified (socket ownership, §5.2/§5.3) -- what remains is
+# `--caller`, which any invocation can set to any string. Removing it (like
+# `--user`) is not viable: real, documented, non-forgeable-in-PRACTICE callers
+# genuinely depend on it -- scripts/demand-report.py's own methodology treats
+# `caller=pi-extension` as the ONE positive-evidence value in the audit log,
+# because the pi extension (~/.pi/agent/extensions/alexandria.ts, outside this
+# repo) sets ALEXANDRIA_CALLER=pi-extension on every CLI-exec fallback call.
+# There is no cryptographic proof of that claim on this path -- nothing stops
+# a human from typing --caller pi-extension by hand -- but it is categorically
+# different from an unrecognized string: it is the value ONE SPECIFIC,
+# DOCUMENTED, non-CLI component is known to set, not an arbitrary claim.
+#
+# The fix cannot be "verify --caller" (there is no trust boundary on this path
+# to verify against -- see cli_identity()'s reasoning above, which is why the
+# OS-user half took the derived-not-accepted route instead). It CAN make the
+# audit trail honest about what it knows: a value from this known set is
+# recorded as-is; anything else is prefixed "unverified:" so a forged claim
+# is VISUALLY DISTINGUISHABLE from the one value with any actual provenance,
+# rather than sitting in the log looking exactly as credible as a real one.
+KNOWN_CALLERS = frozenset({"cli", "pi-extension"})
+
+
+def caller_label(raw: str) -> str:
+    """Mark an unrecognized --caller value so it cannot be mistaken for the
+    one caller identity with documented provenance (see KNOWN_CALLERS above).
+    "cli" (the argparse default -- nothing was specified) and "pi-extension"
+    (the one external, documented, non-forgeable-in-practice caller) pass
+    through unchanged; anything else -- including a value that merely CLAIMS
+    to be "pi-extension" via handwritten --caller from an untrusted script --
+    stays visually flagged as unverified, since this path has no way to tell
+    the difference."""
+    if not isinstance(raw, str) or not raw:
+        return "unverified:"
+    return raw if raw in KNOWN_CALLERS else f"unverified:{raw}"
 
 
 def _config_for(args) -> AppConfig:
