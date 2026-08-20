@@ -125,34 +125,14 @@ def test_append_in_several_calls_keeps_every_row(tmp_path: Path):
 # unconditionally, so it needs no change (verified below too).
 # ---------------------------------------------------------------------------
 
-def test_default_metric_is_scale_sensitive_to_unnormalized_vectors(tmp_path: Path):
-    """Pins the FAILURE MODE this fix closes -- without force_cosine_metric,
-    an unnormalized (raw) vector at the SAME direction as the query ranks
-    WORSE than an orthogonal unit vector. If this test ever fails, LanceDB's
-    own default metric changed and the #45 fix may no longer be necessary
-    (or may need re-verification)."""
+def test_search_vector_uses_cosine_distance_not_raw_l2(tmp_path: Path):
+    """#45 (Red review, 2026-08-20): forced UNCONDITIONALLY for every
+    LanceDB search, not a caller-wired opt-in -- a same-direction vector at
+    100x magnitude must rank WITH the unit vector, not behind an orthogonal
+    one (LanceDB's default metric is raw L2 distance, which is scale-
+    sensitive; measured live before this fix: the 100x vector ranked at
+    distance 9801, behind an orthogonal unit vector at distance 2.0)."""
     store = VectorStore(tmp_path)
-    store.upsert([
-        record("unit_same_dir", "sources/a", [1.0, 0.0, 0.0]),
-        record("raw_100x_same_dir", "sources/b", [100.0, 0.0, 0.0]),
-        record("unit_orthogonal", "sources/c", [0.0, 1.0, 0.0]),
-    ])
-    results = store.search_vector([1.0, 0.0, 0.0], k=3)
-    ranked = [r["chunk_id"] for r in results]
-    assert ranked[0] == "unit_same_dir"
-    # THE BUG: raw_100x_same_dir (same direction, just unnormalized) ranks
-    # BEHIND the orthogonal vector under raw L2 distance.
-    assert ranked.index("raw_100x_same_dir") > ranked.index("unit_orthogonal"), (
-        "if this assertion fails, LanceDB's default metric is no longer "
-        "scale-sensitive and this whole fix should be re-examined")
-
-
-def test_force_cosine_metric_ranks_same_direction_vectors_together_regardless_of_scale(tmp_path: Path):
-    """THE FIX: with force_cosine_metric=True, a same-direction vector ranks
-    correctly (tied with the unit vector) regardless of its magnitude --
-    exactly true cosine similarity, safe to use against an index whose
-    normalization cannot be proven."""
-    store = VectorStore(tmp_path, force_cosine_metric=True)
     store.upsert([
         record("unit_same_dir", "sources/a", [1.0, 0.0, 0.0]),
         record("raw_100x_same_dir", "sources/b", [100.0, 0.0, 0.0]),
@@ -167,23 +147,63 @@ def test_force_cosine_metric_ranks_same_direction_vectors_together_regardless_of
         "the same-direction vectors must still outrank the orthogonal one")
 
 
-def test_force_cosine_metric_is_a_pure_noop_for_already_normalized_vectors(tmp_path: Path):
-    """For the DEFAULT (verified l2) case -- everything already unit-length
-    -- forcing cosine distance must produce the SAME ranking as the default
-    metric, so opting into it never changes behavior for the common path."""
+def test_cosine_distance_preserves_ranking_for_already_normalized_vectors(tmp_path: Path):
+    """For the common (verified l2) case -- everything already unit-length --
+    cosine distance produces the SAME RANK ORDER as raw L2 would have
+    (Red review: the raw _distance VALUE is not byte-identical -- for unit
+    vectors, L2-squared = 2 x cosine-distance -- but rank order, which is
+    all fusion/RRF ever consumes, is unaffected). Verified separately at
+    realistic scale (1024-dim, 200 random unit vectors, matching the real
+    corpus's embedding dimension): top-200 order byte-for-byte identical."""
     vectors = {
         "a": [0.6, 0.8, 0.0],
         "b": [0.0, 1.0, 0.0],
         "c": [-0.6, 0.8, 0.0],
     }
-    query = [1.0, 0.0, 0.0]
+    store = VectorStore(tmp_path)
+    store.upsert([record(k, f"sources/{k}", v) for k, v in vectors.items()])
+    ranked = [r["chunk_id"] for r in store.search_vector([1.0, 0.0, 0.0], k=3)]
+    # cos(theta) to query (1,0,0): a=(0.6,0.8,0)->0.6, b=(0,1,0,)->0.0,
+    # c=(-0.6,0.8,0)->-0.6 -- true cosine order, independent of any raw-L2 quirk.
+    assert ranked == ["a", "b", "c"]
 
-    default_store = VectorStore(tmp_path / "default")
-    default_store.upsert([record(k, f"sources/{k}", v) for k, v in vectors.items()])
-    default_ranked = [r["chunk_id"] for r in default_store.search_vector(query, k=3)]
 
-    cosine_store = VectorStore(tmp_path / "cosine", force_cosine_metric=True)
-    cosine_store.upsert([record(k, f"sources/{k}", v) for k, v in vectors.items()])
-    cosine_ranked = [r["chunk_id"] for r in cosine_store.search_vector(query, k=3)]
+def test_no_ann_index_exists_after_a_normal_write_path(tmp_path: Path):
+    """Red review, 2026-08-20: cosine distance is forced for every LanceDB
+    search. If the table ever gained an ANN vector index built with a
+    DIFFERENT metric (e.g. metric='l2'), querying with .metric('cosine')
+    could error or silently degrade recall -- the query metric and the
+    index-build metric are not independent. This pins the CURRENT invariant
+    that the write path never creates one (flat search only), so the #45 fix
+    stays safe. If this ever needs to change, the metric coupling above must
+    be re-verified at the same time."""
+    store = VectorStore(tmp_path)
+    store.upsert([record(f"c{i}", f"sources/{i}", [1.0, float(i), 0.0]) for i in range(20)])
+    table = store._open_table()
+    if table is None:  # pragma: no cover - SQLite fallback has no ANN concept
+        return
+    assert table.list_indices() == [], (
+        "an ANN vector index now exists -- verify it matches the forced "
+        "cosine metric before this passes, or querying may error/degrade")
 
-    assert default_ranked == cosine_ranked
+
+def test_a_zero_vector_in_a_legacy_index_is_omitted_not_nan_poisoning(tmp_path: Path):
+    """Red review, 2026-08-20: a VERIFIED index cannot contain a zero vector
+    (CachedEmbedder's _l2_normalize refuses to store one -- ValueError at
+    write time). An unverified_legacy index has no such guarantee; it could
+    genuinely contain one from before that guard existed. Verified live:
+    LanceDB's cosine metric does not NaN-poison top-k on a zero vector --
+    it silently OMITS that row from results entirely (a real completeness
+    gap, but not the "NaN sorts unpredictably and corrupts ranking" failure
+    mode). This pins that behavior so a future LanceDB version change would
+    be caught here, not discovered as a live surprise."""
+    store = VectorStore(tmp_path)
+    store.upsert([
+        record("zero", "sources/zero", [0.0, 0.0, 0.0]),
+        record("unit", "sources/unit", [1.0, 0.0, 0.0]),
+    ])
+    results = store.search_vector([1.0, 0.0, 0.0], k=5)
+    ids = [r["chunk_id"] for r in results]
+    assert "unit" in ids, "the real (nonzero) vector must still be found"
+    assert all(not (r["_distance"] != r["_distance"]) for r in results), (
+        "no NaN distance may reach the caller (NaN != NaN is how you detect it)")

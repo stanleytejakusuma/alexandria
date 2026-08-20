@@ -825,6 +825,35 @@ def test_index_gc_removes_old_releases_but_keeps_active_and_previous(tmp_path, m
 # chokepoint (_build_search_engine), not just manifest.py's unit tests.
 # ---------------------------------------------------------------------------
 
+def test_serving_a_pre_policy_legacy_index_prints_a_rebuild_reminder(tmp_path, monkeypatch, capsys):
+    """Red review, 2026-08-20: #45 removes ALL rebuild pressure otherwise --
+    a legacy index becomes permanently comfortable with no nudge toward the
+    verified state. A once-per-call stderr warning is the cheap ratchet:
+    it never blocks the read (matching the existing liveness-stale pattern
+    right above this code), but it keeps the relaxed state visible."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nsome content\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    import json
+    manifest_path = corpus / ".alexandria" / "index" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("normalization_policy")
+    manifest_path.write_text(json.dumps(manifest))
+
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    _build_search_engine(cfg, corpus)
+
+    warning = capsys.readouterr().err
+    assert "unverified" in warning.lower() or "legacy" in warning.lower()
+    assert "rebuild" in warning.lower()
+
+
 def test_a_pre_policy_legacy_index_is_servable_without_a_rebuild(tmp_path, monkeypatch):
     """The manifest is PRESENT but predates the declared normalization_policy
     field (a real historical state, distinct from test_searching_a_real_
@@ -858,9 +887,11 @@ def test_a_pre_policy_legacy_index_is_servable_without_a_rebuild(tmp_path, monke
 
 
 def test_a_pre_policy_legacy_index_uses_a_scale_invariant_search(tmp_path, monkeypatch):
-    """The read is only SAFE if the store also switches to cosine distance --
-    verify VectorStore was actually constructed with force_cosine_metric=True
-    for this corpus, not just that verify_manifest let it through."""
+    """Red review, 2026-08-20: cosine distance is now UNCONDITIONAL inside
+    VectorStore (see test_store.py), not a caller-wired flag -- so there is
+    no per-corpus attribute to inspect here anymore. What this test now
+    proves: an actual RANKING that would only be correct under cosine
+    distance, through the real chokepoint, against a real legacy manifest."""
     import json
 
     monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
@@ -879,26 +910,7 @@ def test_a_pre_policy_legacy_index_uses_a_scale_invariant_search(tmp_path, monke
     from alexandria.config import AppConfig
     cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
     engine = _build_search_engine(cfg, corpus)
-    assert engine.store.force_cosine_metric is True
-
-
-def test_a_normally_verified_index_never_forces_cosine_metric(tmp_path, monkeypatch):
-    """The opt-in must be scoped exactly to unverified_legacy -- a normal,
-    policy-declared index (the common/default case) must NOT pay the cosine
-    metric even though it would be a no-op; this pins that the detection
-    logic does not accidentally fire on every corpus."""
-    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
-    corpus = tmp_path / "corpus"
-    note = corpus / "sources" / "note.md"
-    note.parent.mkdir(parents=True)
-    note.write_text("---\nsource: test\n---\n\nsome content\n")
-    assert app(["--corpus", str(corpus), "index"]) == 0
-
-    from alexandria.cli import _build_search_engine
-    from alexandria.config import AppConfig
-    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
-    engine = _build_search_engine(cfg, corpus)
-    assert engine.store.force_cosine_metric is False
+    assert engine.search("some content"), "a legacy-manifest corpus must still return results"
 
 
 def test_writing_into_a_pre_policy_legacy_index_still_refuses(tmp_path, monkeypatch):

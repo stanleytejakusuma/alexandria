@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -288,6 +289,16 @@ def verify_manifest(corpus: str | Path, embedder, provider: str, *,
         "normalization_policy", UNVERIFIED_LEGACY_NORMALIZATION_POLICY)
     on_disk_identity = on_disk | {"normalization_policy": on_disk_policy}
     is_unverified_legacy = on_disk_policy == UNVERIFIED_LEGACY_NORMALIZATION_POLICY
+    if allow_unverified_legacy and is_unverified_legacy:
+        # #45's "ratchet" (Red review, 2026-08-20): without this, the
+        # relaxation removes ALL rebuild pressure forever -- a legacy index
+        # becomes permanently comfortable with no nudge toward the verified
+        # state. Never blocks the read, matching the existing liveness-stale
+        # warning pattern at the CLI boundary.
+        print(f"alexandria: serving an unverified_legacy index at "
+              f"{_manifest_path(corpus, index_dir)} -- normalization cannot be "
+              f"proven for its existing vectors. Rebuild when convenient: "
+              f"alexandria --corpus {corpus} index --rebuild", file=sys.stderr)
     # The ONE field the opt-in relaxes. Every other field stays exactly as
     # strict, opted in or not -- provider/model/revision/dim/dtype determine
     # whether vectors are even comparable at all, which no metric choice can

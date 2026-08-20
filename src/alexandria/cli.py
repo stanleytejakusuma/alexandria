@@ -51,9 +51,8 @@ from .index.chunker import (
     is_indexable_source,
 )
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
-from .index.manifest import (UNVERIFIED_LEGACY_NORMALIZATION_POLICY, ManifestCorrupt,
-                             ManifestMismatch, ManifestMissing, read_manifest, verify_manifest,
-                             verify_manifest_for_write, write_manifest)
+from .index.manifest import (ManifestCorrupt, ManifestMismatch, ManifestMissing,
+                             verify_manifest, verify_manifest_for_write, write_manifest)
 from .index.releases import (ActiveReleaseMissing, ReleaseCorrupt, activate_release,
                               active_release_id, checksum_release, list_releases,
                               new_release_dir, resolve_active_index_dir, verify_checksums)
@@ -1628,22 +1627,18 @@ def _build_search_engine_unlocked(config: AppConfig, corpus: Path, query_cache: 
         # manifest -- "servable without a forced rebuild" is the whole point
         # of this opt-in. Writes stay exactly as strict as before:
         # verify_manifest_for_write has no such parameter at all (pinned by
-        # test_verify_manifest_for_write_never_accepts_the_opt_in).
+        # test_verify_manifest_for_write_never_accepts_the_opt_in). A safe
+        # read against an unverified index also needs a scale-invariant
+        # search metric (Red review, 2026-08-20): VectorStore now forces
+        # cosine distance UNCONDITIONALLY for every LanceDB search, so that
+        # half of the fix needs no wiring here at all -- see store.py.
         verify_manifest(corpus, embedder, config.embed_provider, index_dir=index_dir,
                         allow_unverified_legacy=True)
     except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
         raise SystemExit(f"alexandria: {exc}") from exc
-    # A relaxed manifest comparison is only HALF of a safe read: the store's
-    # search metric must also become scale-invariant, or an unverified
-    # index's possibly-unnormalized vectors rank incorrectly under LanceDB's
-    # default (raw L2) metric. See VectorStore's force_cosine_metric.
-    on_disk_manifest = read_manifest(corpus, index_dir=index_dir)
-    is_unverified_legacy = bool(on_disk_manifest) and on_disk_manifest.get(
-        "normalization_policy", UNVERIFIED_LEGACY_NORMALIZATION_POLICY
-    ) == UNVERIFIED_LEGACY_NORMALIZATION_POLICY
     return SearchEngine(
         embedder,
-        VectorStore(index_dir, force_cosine_metric=is_unverified_legacy),
+        VectorStore(index_dir),
         BM25Index(index_dir / "fts.sqlite"),
         CrossEncoderReranker(config.rerank_model),
         SearchConfig(prefetch=config.rerank_prefetch, top_k=config.rerank_top_k,
