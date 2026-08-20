@@ -1654,34 +1654,59 @@ def cli_identity() -> str:
 # genuinely depend on it -- scripts/demand-report.py's own methodology treats
 # `caller=pi-extension` as the ONE positive-evidence value in the audit log,
 # because the pi extension (~/.pi/agent/extensions/alexandria.ts, outside this
-# repo) sets ALEXANDRIA_CALLER=pi-extension on every CLI-exec fallback call.
-# There is no cryptographic proof of that claim on this path -- nothing stops
-# a human from typing --caller pi-extension by hand -- but it is categorically
-# different from an unrecognized string: it is the value ONE SPECIFIC,
-# DOCUMENTED, non-CLI component is known to set, not an arbitrary claim.
+# repo) sets ALEXANDRIA_CALLER=pi-extension as a subprocess ENV VAR on every
+# CLI-exec fallback call (confirmed live: `env: { ...process.env,
+# ALEXANDRIA_CALLER: "pi-extension", ...env }`), which this CLI's --caller
+# flag then defaults from (`os.environ.get("ALEXANDRIA_CALLER", "cli")`).
+#
+# RESIDUAL, documented rather than solved (Red review 2026-08-20, finding #2):
+# because the channel is an inherited env var, a human who happens to have
+# ALEXANDRIA_CALLER=pi-extension exported in their OWN shell (e.g. copied from
+# a debugging session) would have every manual invocation pass through
+# unmarked too. This is an ACCIDENTAL misattribution channel, not an
+# adversarial one -- a real attacker types --caller pi-extension directly,
+# which this fix explicitly does not and cannot stop either (see below). Both
+# residuals exist because there is no cryptographic trust boundary on this
+# path at all, which is the CLI's structural limit, not a bug in this fix.
 #
 # The fix cannot be "verify --caller" (there is no trust boundary on this path
 # to verify against -- see cli_identity()'s reasoning above, which is why the
 # OS-user half took the derived-not-accepted route instead). It CAN make the
 # audit trail honest about what it knows: a value from this known set is
-# recorded as-is; anything else is prefixed "unverified:" so a forged claim
-# is VISUALLY DISTINGUISHABLE from the one value with any actual provenance,
-# rather than sitting in the log looking exactly as credible as a real one.
+# recorded as CLAIMED, unchanged; any OTHER value is prefixed "unverified:".
+#
+# What this narrows, precisely (Red review finding #3 -- do not overclaim):
+# it flags a NOVEL or MUTATED value someone did not bother to spell exactly
+# right (a typo, a new unregistered script, an evolving convention). It does
+# NOT and cannot catch exact-string forgery -- literally typing
+# `--caller pi-extension` by hand still passes through clean, because this
+# path has no way to distinguish that from the real extension. "Forged"
+# claims about this fix must say "novel/mutated," never "any forged value."
 KNOWN_CALLERS = frozenset({"cli", "pi-extension"})
+_UNVERIFIED_PREFIX = "unverified:"
+assert not any(name.startswith(_UNVERIFIED_PREFIX) for name in KNOWN_CALLERS), (
+    "a known caller name must never collide with the unverified marker, or "
+    "the labeling below would not be unambiguous")
 
 
-def caller_label(raw: str) -> str:
-    """Mark an unrecognized --caller value so it cannot be mistaken for the
-    one caller identity with documented provenance (see KNOWN_CALLERS above).
-    "cli" (the argparse default -- nothing was specified) and "pi-extension"
-    (the one external, documented, non-forgeable-in-practice caller) pass
-    through unchanged; anything else -- including a value that merely CLAIMS
-    to be "pi-extension" via handwritten --caller from an untrusted script --
-    stays visually flagged as unverified, since this path has no way to tell
-    the difference."""
-    if not isinstance(raw, str) or not raw:
-        return "unverified:"
-    return raw if raw in KNOWN_CALLERS else f"unverified:{raw}"
+def caller_label(raw) -> str:
+    """Mark a --caller value that is NOT one of the known, documented values
+    (see KNOWN_CALLERS above) so it cannot be mistaken for the one identity
+    with any actual provenance. "cli" (nothing specified) and "pi-extension"
+    (the one external, documented convention) pass through as CLAIMS, not
+    proof -- see the module-level comment for exactly what this does and does
+    not catch. None/empty/non-string inputs get distinct sentinels rather
+    than collapsing to one bare "unverified:" (Red review finding #5): each
+    names a different failure mode a log reader might need to tell apart --
+    a caller genuinely calling with no value, vs a caller passing an empty
+    string, vs a programmatic bug passing the wrong type entirely."""
+    if raw is None:
+        return f"{_UNVERIFIED_PREFIX}<none>"
+    if not isinstance(raw, str):
+        return f"{_UNVERIFIED_PREFIX}<non-string:{type(raw).__name__}>"
+    if raw == "":
+        return f"{_UNVERIFIED_PREFIX}<empty>"
+    return raw if raw in KNOWN_CALLERS else f"{_UNVERIFIED_PREFIX}{raw}"
 
 
 def _config_for(args) -> AppConfig:

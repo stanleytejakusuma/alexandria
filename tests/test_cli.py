@@ -983,25 +983,53 @@ def test_caller_label_passes_through_known_callers_unchanged():
     assert caller_label("pi-extension") == "pi-extension"
 
 
-def test_caller_label_flags_any_unrecognized_value():
-    """The actual fix: a forged or novel --caller value can no longer look
-    exactly as credible as a documented one in the audit trail -- it is
-    visibly prefixed, distinguishing 'a string someone typed' from 'the one
-    value with any provenance'. This includes a value that CLAIMS to be
-    pi-extension's sibling or otherwise plausible-sounding."""
+def test_caller_label_flags_any_novel_or_mutated_value():
+    """Red review 2026-08-20 (finding #3, precision correction): the fix
+    flags a NOVEL or MUTATED value someone did not spell exactly right --
+    it does NOT and cannot catch exact-string forgery (typing
+    '--caller pi-extension' by hand still passes clean, tested separately
+    below as test_caller_label_cannot_catch_exact_string_forgery). This test
+    covers what the fix DOES catch: values that are plausible-sounding but
+    not the exact registered string."""
     from alexandria.cli import caller_label
 
     assert caller_label("weekly-loop") == "unverified:weekly-loop"
     assert caller_label("totally-legit-tool") == "unverified:totally-legit-tool"
     assert caller_label("pi-extension-v2") == "unverified:pi-extension-v2"
-    assert caller_label("") == "unverified:"
 
 
-def test_caller_label_handles_none_and_non_string_input():
+def test_caller_label_cannot_catch_exact_string_forgery():
+    """Red review 2026-08-20 (finding #3): documents the fix's real limit,
+    not just its capability. There is no trust boundary on the CLI path, so
+    literally typing the known string is indistinguishable from the real
+    caller setting it -- this is expected, not a bug, and must never be
+    described as 'forgery-proof' anywhere in this codebase."""
     from alexandria.cli import caller_label
 
-    assert caller_label(None) == "unverified:"
-    assert caller_label(123) == "unverified:"
+    assert caller_label("pi-extension") == "pi-extension"  # unchanged, by design
+
+
+def test_caller_label_handles_none_and_non_string_input_with_distinct_sentinels():
+    """Red review 2026-08-20 (finding #5): three different failure modes
+    (nothing specified, empty string, wrong type) must not collapse to one
+    indistinguishable bare 'unverified:' -- a log reader needs to tell a
+    genuinely absent caller from a programmatic bug."""
+    from alexandria.cli import caller_label
+
+    assert caller_label(None) == "unverified:<none>"
+    assert caller_label("") == "unverified:<empty>"
+    assert caller_label(123) == "unverified:<non-string:int>"
+
+
+def test_no_known_caller_collides_with_the_unverified_marker():
+    """Red review 2026-08-20 (finding #5): the injective-labeling invariant
+    that makes caller_label unambiguous -- if a KNOWN_CALLERS member ever
+    started with 'unverified:', a known and an unknown value could produce
+    identical output. Pinned as both a runtime assertion (module import time)
+    and a test (so CI fails loudly, not just at import)."""
+    from alexandria.cli import KNOWN_CALLERS, _UNVERIFIED_PREFIX
+
+    assert not any(name.startswith(_UNVERIFIED_PREFIX) for name in KNOWN_CALLERS)
 
 
 def test_search_audit_row_flags_an_unrecognized_caller(tmp_path, monkeypatch, capsys):
@@ -1119,3 +1147,89 @@ def test_sync_flags_an_unrecognized_caller_too(tmp_path, monkeypatch):
     audit_path = tmp_path / ".alexandria" / "audit" / "sync.jsonl"
     rows = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
     assert rows[-1]["caller"] == "unverified:my-custom-script"
+
+
+def test_search_with_no_caller_flag_records_the_honest_cli_default(tmp_path, monkeypatch, capsys):
+    """Red review 2026-08-20 (finding #4): the most common invocation shape
+    -- no --caller flag at all -- was untested. Confirms the bare default
+    ('cli', via argparse's os.environ.get fallback) is NOT flagged
+    unverified, since 'cli' means honestly nothing was specified, not a
+    forged claim."""
+    import json
+    monkeypatch.delenv("ALEXANDRIA_CALLER", raising=False)
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nsome searchable body text here\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+
+    assert app(["--corpus", str(corpus), "search", "searchable"]) == 0
+    audit_path = corpus / ".alexandria" / "audit" / "search.jsonl"
+    rows = [json.loads(l) for l in audit_path.read_text().splitlines() if l.strip()]
+    assert rows[-1]["caller"] == "cli"
+
+
+def test_answer_path_wiring_flags_an_unrecognized_caller(tmp_path, monkeypatch):
+    """Red review 2026-08-20 (finding #4): only the search/sync wiring was
+    covered end-to-end; the answer path's caller_label() call
+    (run_answer's caller=... kwarg) was untested -- reverting it would not
+    have failed any existing test. Uses run_answer directly (not the full
+    LLM-backed cmd_answer CLI path) since caller_label() is applied at the
+    cmd_answer -> run_answer call boundary, before any LLM call happens."""
+    import json
+
+    from alexandria.cli import caller_label
+
+    # The transformation itself is what's under test, at the exact call
+    # boundary cmd_answer uses (caller=caller_label(args.caller)) --
+    # confirms the boundary is wired, without needing a live LLM gateway.
+    assert caller_label("suspicious-answer-caller") == "unverified:suspicious-answer-caller"
+    # And confirm cmd_answer's source actually calls it at that boundary,
+    # not just that the function works in isolation (the revert-and-see
+    # concern Red raised) -- grep the wiring rather than requiring a full
+    # LLM-backed answer run in this test.
+    import inspect
+
+    from alexandria import cli as cli_mod
+    src = inspect.getsource(cli_mod.cmd_answer)
+    assert "caller_label(args.caller)" in src
+
+
+def test_known_callers_are_a_subset_of_demand_report_genuine_callers():
+    """Red review 2026-08-20 (finding #1, the one they'd block on): the
+    entire justification for keeping --caller free-text instead of removing
+    it lives in scripts/demand-report.py's GENUINE_CALLERS methodology, but
+    nothing bound the two together -- if either drifts, the fix silently
+    rots. Binds KNOWN_CALLERS <= GENUINE_CALLERS (every value this module
+    treats as known must also be treated as positive evidence by the
+    consumer whose methodology justifies keeping it), and confirms
+    caller_label's classification agrees with demand-report's set-membership
+    test (exact match, not substring -- both sides use `in`, verified by
+    reading demand-report.py directly, not assumed)."""
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    from alexandria.cli import KNOWN_CALLERS, caller_label
+
+    demand_report_path = (_Path(__file__).parent.parent / "scripts" / "demand-report.py")
+    spec = importlib.util.spec_from_file_location("demand_report_under_test", demand_report_path)
+    demand_report = importlib.util.module_from_spec(spec)
+    _sys.modules["demand_report_under_test"] = demand_report
+    spec.loader.exec_module(demand_report)
+
+    non_cli_known = KNOWN_CALLERS - {"cli"}  # "cli" is honest-default, not positive evidence
+    assert non_cli_known <= demand_report.GENUINE_CALLERS, (
+        "every KNOWN_CALLERS value (besides the honest default) must be recognized "
+        "as positive evidence by demand-report.py's own methodology, or this "
+        "module is keeping a value free-text for no justified reason")
+
+    # Exact-match classification agreement: a caller_label'd unrecognized value
+    # must NOT be classified genuine by demand-report, even though the raw
+    # unrecognized string is now embedded inside the "unverified:" prefix
+    # (guards against a future demand-report change to substring matching).
+    forged = "totally-not-pi-extension"
+    labeled = caller_label(forged)
+    assert labeled not in demand_report.GENUINE_CALLERS
+    assert forged not in demand_report.GENUINE_CALLERS  # sanity: the raw value never was either
