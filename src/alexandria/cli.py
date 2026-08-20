@@ -894,16 +894,26 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
         # payload to be dropped, independent of content/recipe -- for an
         # operator who has judged a payload bad (e.g. a hostile hypothetical
         # that slipped past the F3c filter) on a document whose content and
-        # recipe have not otherwise changed. The next `index --enrich` run
-        # re-calls the LLM for it instead of silently reattaching the
-        # rejected payload forever.
+        # recipe have not otherwise changed.
+        #
+        # Red review 2026-08-20 (finding #2): this clears the CACHE, not the
+        # already-served poison. Any synthetic rows and the enrichment
+        # summary already written into the ACTIVE index release keep serving
+        # until a full --rebuild replaces that release -- incremental writes
+        # (upsert) only touch chunk_ids present in the new batch, they never
+        # delete rows absent from it, so a stale synthetic ::hq1/::hq2/::hq3
+        # chunk from the rejected payload is not removed by re-enriching
+        # alone. Say so explicitly rather than implying more remediation
+        # than actually occurs.
         from .enrich import EnrichmentStore
         index_dir = resolve_active_index_dir(corpus)
         store = EnrichmentStore(index_dir)
         removed = store.invalidate(args.enrich_invalidate)
         if removed:
-            print(f"index: invalidated enrichment for {args.enrich_invalidate!r}; "
-                  "run with --enrich to re-enrich it")
+            print(f"index: invalidated cached enrichment for {args.enrich_invalidate!r}. "
+                  "This clears the CACHE only -- any synthetic vectors/summary text "
+                  "already written into the active index release keep serving until "
+                  "you run `index --enrich --rebuild` to fully purge and replace them.")
             return 0
         print(f"index: {args.enrich_invalidate!r} had no stored enrichment "
               "to invalidate", file=sys.stderr)

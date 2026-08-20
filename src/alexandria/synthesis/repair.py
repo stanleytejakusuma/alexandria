@@ -140,12 +140,20 @@ def _repair_prompt(gathered: GatherResult, page: SynthesisPage, verdict: JudgeVe
         )
         lines.append(f"- {claim.id}: {escape_for_prompt(claim.text)} "
                      f"[{escape_for_prompt(citations)}]")
+    # Red review 2026-08-20: verdict.* fields trace back to the judge's
+    # LLM-parsed output, which is itself influenced by attacker content in
+    # the gathered pool (the second-hop echo path this function's own
+    # comment above already argues for closing) -- escape these too rather
+    # than leaving repair.py's "no exceptions" invariant with an exception.
     lines.extend((
         "</current_claims>",
-        f"<failed_claim_ids>{', '.join(verdict.failed_claim_ids)}</failed_claim_ids>",
-        f"<failed_clauses>{' | '.join(f'{cid} :: {clause}' for cid, clause in verdict.failed_clause_ids)}"
+        f"<failed_claim_ids>{escape_for_prompt(', '.join(verdict.failed_claim_ids))}"
+        "</failed_claim_ids>",
+        "<failed_clauses>"
+        f"{escape_for_prompt(' | '.join(f'{cid} :: {clause}' for cid, clause in verdict.failed_clause_ids))}"
         "</failed_clauses>",
-        f"<failing_skip_ids>{', '.join(verdict.failing_skip_ids + verdict.borderline_skip_ids)}"
+        "<failing_skip_ids>"
+        f"{escape_for_prompt(', '.join(verdict.failing_skip_ids + verdict.borderline_skip_ids))}"
         "</failing_skip_ids>",
         "<gathered_pool>",
     ))

@@ -961,6 +961,7 @@ def test_index_enrich_invalidate_drops_a_stored_payload_and_reports_honestly(tmp
     assert rc == 0
     out = capsys.readouterr().out
     assert "invalidated" in out.lower()
+    assert "rebuild" in out.lower()  # Red review: must not imply more than cache-clear
     # re-open (the CLI's store instance is separate from this test's)
     assert EnrichmentStore(index_dir).count() == 0
 

@@ -18,10 +18,12 @@ apply it locally.
 
 from __future__ import annotations
 
+import math
 import re
 
 __all__ = [
     "INERT_DATA_FRAMING",
+    "cosine_similarity",
     "escape_for_prompt",
     "looks_like_injected_instruction",
 ]
@@ -39,10 +41,14 @@ INERT_DATA_FRAMING = (
 def escape_for_prompt(text: str) -> str:
     """Make `text` safe to interpolate inside a `<tag>...</tag>` prompt block.
 
-    Escapes '&', '<', '>' (in that order -- '&' first so escaping the other
-    two does not get re-escaped) so a document cannot forge a closing tag
-    or open a new one. This is XML/HTML-style escaping, not a blocklist: it
-    is structural (every occurrence of the three characters is neutralized,
+    Escapes '&', '<', '>', '"' (in that order -- '&' first so escaping the
+    other three does not get re-escaped) so a document cannot forge a
+    closing tag, open a new one, or break out of a `attr="..."` value (Red
+    review 2026-08-20: doc_id/chunk_id are interpolated as attribute values
+    elsewhere, and a path containing a literal quote could otherwise inject
+    a fake attribute -- low severity since '<'/'>' are already dead, but
+    cheap to close). This is XML/HTML-style escaping, not a blocklist: it
+    is structural (every occurrence of the four characters is neutralized,
     not just known-dangerous substrings), so it degrades gracefully against
     a delimiter or tag name the escaper's author never anticipated.
 
@@ -51,7 +57,8 @@ def escape_for_prompt(text: str) -> str:
     """
     if not isinstance(text, str):
         text = str(text)
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
 
 
 # Cheap, deliberately conservative plausibility filter (spec F3c) for
@@ -85,3 +92,24 @@ def looks_like_injected_instruction(text: str) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
     return any(pattern.search(text) for pattern in _IMPERATIVE_PATTERNS)
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Standard cosine similarity, stdlib-only (no numpy dependency -- this
+    project deliberately stays at 3 runtime dependencies). Used as the
+    FAITHFULNESS gate (Red review 2026-08-20, finding #1): the actual
+    retrieval-poisoning attack an instruction-shaped-text filter cannot
+    catch is a perfectly ordinary-READING question aimed at a topic the
+    document does not legitimately answer -- ordinary phrasing evades both
+    framing and the imperative-pattern filter, since it is not an
+    instruction at all. Comparing a hypothetical's embedding against its
+    OWN document's embedding targets the ranking-boost mechanism directly:
+    a hypothetical must be semantically close to the document it claims to
+    be about, or it is rejected regardless of how plausible it reads.
+    """
+    if len(a) != len(b):
+        raise ValueError("vectors must have the same dimension")
+    denom = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+    if not denom:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b, strict=True)) / denom

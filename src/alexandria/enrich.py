@@ -89,9 +89,20 @@ def _parse_enrichment(raw: str) -> dict[str, Any]:
             else:
                 clean.append(h)
         out["hypotheticals"] = clean
+        # Red review 2026-08-20 (finding #8): Gate F's own wording names
+        # "reranked text" as a steering surface -- summary is appended to
+        # every real chunk's reranker input (search.py:_rerank_text) on
+        # every future query, unfiltered, until this fix. Same faithfulness
+        # concern as hypotheticals, so the same conservative filter applies:
+        # an instruction-shaped summary is dropped (falls back to the
+        # chunk's own body text for reranking) rather than trusted verbatim.
+        summary = str(out.get("summary") or "")[:200]
+        if summary and looks_like_injected_instruction(summary):
+            summary = ""
+            suspicious += 1
+        out["summary"] = summary
         if suspicious:
-            out["suspicious_hypotheticals"] = suspicious
-        out["summary"] = str(out.get("summary") or "")[:200]
+            out["suspicious_count"] = suspicious
     except (json.JSONDecodeError, TypeError, AttributeError):
         return {}
     return out
@@ -191,10 +202,16 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
         # already has the filtered (clean) hypotheticals; the count is the
         # observable signal a monitoring loop reads, the filtering already
         # happened in _parse_enrichment.
-        stats["suspicious"] += payload.pop("suspicious_hypotheticals", 0)
+        stats["suspicious"] += payload.pop("suspicious_count", 0)
+        # _apply_payload mutates payload["hypotheticals"] in place (the
+        # faithfulness gate, finding #1, may drop entries the pattern filter
+        # missed) -- it must run BEFORE store.put(), or a replay from the
+        # store would reattach the UNFILTERED list even though the live
+        # index only ever saw the filtered one. Persisting the corrected
+        # payload keeps get()'s replay semantics honest.
+        _apply_payload(doc_records, payload, embedder, records, stats)
         store.put(doc_id, sha, recipe, payload)
         stats["enriched"] += 1
-        _apply_payload(doc_records, payload, embedder, records, stats)
         _progress()
 
     # Reattached docs first (no LLM, no store writes): attach enrichment to
@@ -233,17 +250,60 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
     return stats
 
 
+# #5/F3c, Red review 2026-08-20 finding #1: the instruction-pattern filter
+# in _parse_enrichment only catches hypotheticals that READ like an attack.
+# The stronger attack is an ordinary-phrased question aimed at a topic the
+# document does not legitimately answer -- it evades framing, escaping, AND
+# the pattern filter, because it is not instruction-shaped at all. This
+# threshold gates on FAITHFULNESS instead: a hypothetical must be
+# semantically close to its own document's content, or it is rejected
+# regardless of how plausible it reads. Conservative default -- reject only
+# clearly off-topic entries, not merely-loosely-related ones (a document's
+# genuinely poor phrasing of its own hypothetical should not be punished
+# alongside genuine poisoning).
+FAITHFULNESS_MIN_SIMILARITY = 0.10
+
+
+def _faithful_hypotheticals(hypotheticals: list[str], doc_records: list[dict],
+                            embedder) -> tuple[list[str], int]:
+    """Drop hypotheticals whose embedding is not close to their own
+    document's embedding (Red review 2026-08-20, finding #1). Both sides
+    embedded with the SAME method (embed(), document-space) for a fair,
+    symmetric comparison -- this is separate from the query-space vectors
+    synthetic_records() computes for actual retrieval matching."""
+    if not hypotheticals:
+        return [], 0
+    from .untrusted import cosine_similarity
+    doc_text = "\n\n".join(r["text"] for r in doc_records)[:MAX_DOC_CHARS]
+    if not doc_text.strip():
+        return hypotheticals, 0  # nothing to compare against; do not punish
+    doc_vector = embedder.embed([doc_text])[0]
+    hyp_vectors = embedder.embed(hypotheticals)
+    clean, rejected = [], 0
+    for text, vector in zip(hypotheticals, hyp_vectors, strict=True):
+        if cosine_similarity(vector, doc_vector) >= FAITHFULNESS_MIN_SIMILARITY:
+            clean.append(text)
+        else:
+            rejected += 1
+    return clean, rejected
+
+
 def _apply_payload(doc_records, payload, embedder, records, stats) -> None:
     """Attach enrichment to chunk records + extend with synthetic vectors."""
     if payload.get("hypotheticals"):
         hypotheticals = payload["hypotheticals"][:MAX_HYPOTHETICALS]
-        if hasattr(embedder, "embed_queries"):
-            vectors = embedder.embed_queries(hypotheticals)
-        else:
-            vectors = embedder.embed(hypotheticals)
-        anchor = doc_records[0]["chunk_id"]
-        records.extend(synthetic_records(doc_records, payload, anchor, vectors))
-        stats["synthetic"] += len(hypotheticals)
+        hypotheticals, unfaithful = _faithful_hypotheticals(hypotheticals, doc_records, embedder)
+        if unfaithful:
+            stats["suspicious"] = stats.get("suspicious", 0) + unfaithful
+        if hypotheticals:
+            if hasattr(embedder, "embed_queries"):
+                vectors = embedder.embed_queries(hypotheticals)
+            else:
+                vectors = embedder.embed(hypotheticals)
+            anchor = doc_records[0]["chunk_id"]
+            records.extend(synthetic_records(doc_records, payload, anchor, vectors))
+            stats["synthetic"] += len(hypotheticals)
+        payload["hypotheticals"] = hypotheticals  # keep persisted payload consistent
     for record in doc_records:
         record["enrichment"] = json.dumps(payload, sort_keys=True)
     return stats
