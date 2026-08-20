@@ -817,3 +817,109 @@ def test_index_gc_removes_old_releases_but_keeps_active_and_previous(tmp_path, m
     assert len(ids) == 2, f"GC should retain active + previous, got {ids}"
     assert active_release_id(corpus) in ids
     assert any(r["active"] for r in after)
+
+
+# ---------------------------------------------------------------------------
+# #45: a pre-policy (unverified_legacy) index is servable on READ without a
+# forced rebuild. This is the real end-to-end proof through the actual
+# chokepoint (_build_search_engine), not just manifest.py's unit tests.
+# ---------------------------------------------------------------------------
+
+def test_a_pre_policy_legacy_index_is_servable_without_a_rebuild(tmp_path, monkeypatch):
+    """The manifest is PRESENT but predates the declared normalization_policy
+    field (a real historical state, distinct from test_searching_a_real_
+    index_that_predates_manifests_fails_loudly_with_rebuild_hint above, which
+    covers a manifest MISSING entirely and must stay refused). #45's whole
+    point: this must now be searchable, not force a rebuild."""
+    import json
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "pi" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        "---\ntype: observation\ntitle: Legacy\nproject: core\nsource: pi\ntags: []\n"
+        "entities: []\ngenerated:\n  at: '2026-08-01T00:00:00Z'\n---\n"
+        "# Legacy\n\nfindable content from before the policy field existed\n"
+    )
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    manifest_path = corpus / ".alexandria" / "index" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("normalization_policy")
+    manifest_path.write_text(json.dumps(manifest))
+
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    engine = _build_search_engine(cfg, corpus)  # must NOT raise SystemExit
+    results = engine.search("findable content")
+    assert results, "a pre-policy legacy index must still return real results"
+
+
+def test_a_pre_policy_legacy_index_uses_a_scale_invariant_search(tmp_path, monkeypatch):
+    """The read is only SAFE if the store also switches to cosine distance --
+    verify VectorStore was actually constructed with force_cosine_metric=True
+    for this corpus, not just that verify_manifest let it through."""
+    import json
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nsome content\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    manifest_path = corpus / ".alexandria" / "index" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("normalization_policy")
+    manifest_path.write_text(json.dumps(manifest))
+
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    engine = _build_search_engine(cfg, corpus)
+    assert engine.store.force_cosine_metric is True
+
+
+def test_a_normally_verified_index_never_forces_cosine_metric(tmp_path, monkeypatch):
+    """The opt-in must be scoped exactly to unverified_legacy -- a normal,
+    policy-declared index (the common/default case) must NOT pay the cosine
+    metric even though it would be a no-op; this pins that the detection
+    logic does not accidentally fire on every corpus."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nsome content\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    engine = _build_search_engine(cfg, corpus)
+    assert engine.store.force_cosine_metric is False
+
+
+def test_writing_into_a_pre_policy_legacy_index_still_refuses(tmp_path, monkeypatch):
+    """The explicit #45 requirement: reads relax, writes do not. An
+    incremental (non --rebuild) index run into an unverified_legacy index
+    must still refuse -- verify_manifest_for_write has no opt-in at all."""
+    import json
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nfirst\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    manifest_path = corpus / ".alexandria" / "index" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("normalization_policy")
+    manifest_path.write_text(json.dumps(manifest))
+
+    note2 = corpus / "sources" / "second.md"
+    note2.write_text("---\nsource: test\n---\n\nsecond, added incrementally\n")
+    with pytest.raises(SystemExit, match="--rebuild"):
+        app(["--corpus", str(corpus), "index"])  # no --rebuild: incremental write path

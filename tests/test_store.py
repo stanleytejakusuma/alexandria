@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from alexandria.index.store import VectorStore
 
 
@@ -111,3 +113,77 @@ def test_append_in_several_calls_keeps_every_row(tmp_path: Path):
     assert store.count() == 2
     assert store.get("a")["chunk_id"] == "a"
     assert store.get("b")["chunk_id"] == "b"
+
+
+# ---------------------------------------------------------------------------
+# #45: reading an unverified_legacy index must use cosine distance, not
+# LanceDB's default (raw L2, scale-sensitive) metric. Measured live: a
+# same-direction vector at 100x magnitude ranked as if nearly orthogonal
+# under the default metric -- the exact "quietly wrong ranking" this guard
+# exists to prevent. This is a LanceDB-specific fix; the SQLite fallback's
+# _cosine already computes true (scale-invariant) cosine similarity
+# unconditionally, so it needs no change (verified below too).
+# ---------------------------------------------------------------------------
+
+def test_default_metric_is_scale_sensitive_to_unnormalized_vectors(tmp_path: Path):
+    """Pins the FAILURE MODE this fix closes -- without force_cosine_metric,
+    an unnormalized (raw) vector at the SAME direction as the query ranks
+    WORSE than an orthogonal unit vector. If this test ever fails, LanceDB's
+    own default metric changed and the #45 fix may no longer be necessary
+    (or may need re-verification)."""
+    store = VectorStore(tmp_path)
+    store.upsert([
+        record("unit_same_dir", "sources/a", [1.0, 0.0, 0.0]),
+        record("raw_100x_same_dir", "sources/b", [100.0, 0.0, 0.0]),
+        record("unit_orthogonal", "sources/c", [0.0, 1.0, 0.0]),
+    ])
+    results = store.search_vector([1.0, 0.0, 0.0], k=3)
+    ranked = [r["chunk_id"] for r in results]
+    assert ranked[0] == "unit_same_dir"
+    # THE BUG: raw_100x_same_dir (same direction, just unnormalized) ranks
+    # BEHIND the orthogonal vector under raw L2 distance.
+    assert ranked.index("raw_100x_same_dir") > ranked.index("unit_orthogonal"), (
+        "if this assertion fails, LanceDB's default metric is no longer "
+        "scale-sensitive and this whole fix should be re-examined")
+
+
+def test_force_cosine_metric_ranks_same_direction_vectors_together_regardless_of_scale(tmp_path: Path):
+    """THE FIX: with force_cosine_metric=True, a same-direction vector ranks
+    correctly (tied with the unit vector) regardless of its magnitude --
+    exactly true cosine similarity, safe to use against an index whose
+    normalization cannot be proven."""
+    store = VectorStore(tmp_path, force_cosine_metric=True)
+    store.upsert([
+        record("unit_same_dir", "sources/a", [1.0, 0.0, 0.0]),
+        record("raw_100x_same_dir", "sources/b", [100.0, 0.0, 0.0]),
+        record("unit_orthogonal", "sources/c", [0.0, 1.0, 0.0]),
+    ])
+    results = store.search_vector([1.0, 0.0, 0.0], k=3)
+    by_id = {r["chunk_id"]: r["_distance"] for r in results}
+    assert by_id["unit_same_dir"] == pytest.approx(by_id["raw_100x_same_dir"], abs=1e-4), (
+        "under cosine distance, same-direction vectors must rank identically "
+        "regardless of magnitude")
+    assert by_id["unit_same_dir"] < by_id["unit_orthogonal"], (
+        "the same-direction vectors must still outrank the orthogonal one")
+
+
+def test_force_cosine_metric_is_a_pure_noop_for_already_normalized_vectors(tmp_path: Path):
+    """For the DEFAULT (verified l2) case -- everything already unit-length
+    -- forcing cosine distance must produce the SAME ranking as the default
+    metric, so opting into it never changes behavior for the common path."""
+    vectors = {
+        "a": [0.6, 0.8, 0.0],
+        "b": [0.0, 1.0, 0.0],
+        "c": [-0.6, 0.8, 0.0],
+    }
+    query = [1.0, 0.0, 0.0]
+
+    default_store = VectorStore(tmp_path / "default")
+    default_store.upsert([record(k, f"sources/{k}", v) for k, v in vectors.items()])
+    default_ranked = [r["chunk_id"] for r in default_store.search_vector(query, k=3)]
+
+    cosine_store = VectorStore(tmp_path / "cosine", force_cosine_metric=True)
+    cosine_store.upsert([record(k, f"sources/{k}", v) for k, v in vectors.items()])
+    cosine_ranked = [r["chunk_id"] for r in cosine_store.search_vector(query, k=3)]
+
+    assert default_ranked == cosine_ranked

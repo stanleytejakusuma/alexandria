@@ -13,6 +13,7 @@ from alexandria.index.manifest import (
     compute_manifest,
     read_manifest,
     verify_manifest,
+    verify_manifest_for_write,
     write_manifest,
 )
 
@@ -393,3 +394,90 @@ def test_existing_callers_with_no_index_dir_argument_are_unaffected(tmp_path):
     assert on_disk == written
     legacy = tmp_path / ".alexandria" / "index" / "manifest.json"
     assert legacy.exists()
+
+
+# ---------------------------------------------------------------------------
+# #45: allow unverified_legacy manifests on the READ path (opt-in,
+# allow_unverified_legacy=True), while the DEFAULT (and every write path)
+# stays exactly as strict as before. The two tests above
+# (test_verify_manifest_reads_but_refuses_a_pre_policy_legacy_manifest,
+# test_verify_manifest_refuses_a_legacy_raw_policy) pin that the DEFAULT
+# behavior is unchanged -- this section is additive, never a relaxation of
+# the existing guard.
+# ---------------------------------------------------------------------------
+
+def test_verify_manifest_permits_unverified_legacy_on_read_when_opted_in(tmp_path):
+    import json
+
+    embedder = _hash_embedder(tmp_path)
+    write_manifest(tmp_path, embedder, "hash")
+    path = tmp_path / ".alexandria" / "index" / "manifest.json"
+    legacy = json.loads(path.read_text())
+    legacy.pop("normalization_policy")
+    path.write_text(json.dumps(legacy))
+
+    # default (opt-out) behavior is UNCHANGED -- still refuses
+    with pytest.raises(ManifestMismatch, match="normalization_policy"):
+        verify_manifest(tmp_path, embedder, "hash")
+
+    # explicit opt-in permits it
+    verify_manifest(tmp_path, embedder, "hash", allow_unverified_legacy=True)  # must not raise
+
+
+def test_allow_unverified_legacy_does_not_weaken_any_OTHER_identity_field(tmp_path):
+    """The opt-in exists for exactly ONE unprovable field (normalization
+    policy). Every other identity -- provider, model, revision, dim, dtype --
+    determines whether vectors are even comparable at all, and must stay
+    strict even when the caller opts into reading an unverified index."""
+    import json
+
+    embedder = _hash_embedder(tmp_path, dim=384)
+    write_manifest(tmp_path, embedder, "hash")
+    path = tmp_path / ".alexandria" / "index" / "manifest.json"
+    legacy = json.loads(path.read_text())
+    legacy.pop("normalization_policy")
+    legacy["provider"] = "some-other-provider"
+    path.write_text(json.dumps(legacy))
+
+    with pytest.raises(ManifestMismatch, match="provider"):
+        verify_manifest(tmp_path, embedder, "hash", allow_unverified_legacy=True)
+
+
+def test_allow_unverified_legacy_still_refuses_a_dimension_mismatch(tmp_path):
+    import json
+
+    embedder = _hash_embedder(tmp_path, dim=384)
+    write_manifest(tmp_path, embedder, "hash")
+    path = tmp_path / ".alexandria" / "index" / "manifest.json"
+    legacy = json.loads(path.read_text())
+    legacy.pop("normalization_policy")
+    legacy["dim"] = 999
+    path.write_text(json.dumps(legacy))
+
+    with pytest.raises(ManifestMismatch, match="dim"):
+        verify_manifest(tmp_path, embedder, "hash", allow_unverified_legacy=True)
+
+
+def test_allow_unverified_legacy_is_a_pure_noop_for_a_verified_manifest(tmp_path):
+    """The opt-in only ever changes behavior for an unverified_legacy index --
+    a normally-verified (policy-declared) manifest behaves identically with
+    or without it."""
+    embedder = _hash_embedder(tmp_path)
+    write_manifest(tmp_path, embedder, "hash")
+
+    verify_manifest(tmp_path, embedder, "hash")  # must not raise
+    verify_manifest(tmp_path, embedder, "hash", allow_unverified_legacy=True)  # must not raise
+
+
+def test_verify_manifest_for_write_never_accepts_the_opt_in(tmp_path):
+    """The write guard must have NO way to relax into an unverified_legacy
+    index -- this is the explicit backlog #45 requirement ('still refusing
+    writes into them'). verify_manifest_for_write's signature simply has no
+    allow_unverified_legacy parameter to pass -- this pins that as a fact,
+    not an assumption."""
+    import inspect
+
+    sig = inspect.signature(verify_manifest_for_write)
+    assert "allow_unverified_legacy" not in sig.parameters, (
+        "the write guard must never be able to opt into reading/writing an "
+        "unverified_legacy index -- that parameter belongs on the read path only")

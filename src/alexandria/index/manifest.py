@@ -239,7 +239,8 @@ def _current_compatibility(embedder, provider: str) -> dict[str, Any]:
 
 
 def verify_manifest(corpus: str | Path, embedder, provider: str, *,
-                    index_dir: str | Path | None = None) -> None:
+                    index_dir: str | Path | None = None,
+                    allow_unverified_legacy: bool = False) -> None:
     """Refuse loudly on a missing or mismatched manifest (gate F4).
 
     Provider/model/revision/dimension/declared-policy/dtype are strict
@@ -253,6 +254,26 @@ def verify_manifest(corpus: str | Path, embedder, provider: str, *,
     answer, and eval all go through).
 
     ``index_dir`` (#30 P2a): see `_manifest_path`.
+
+    ``allow_unverified_legacy`` (#45, READ PATH ONLY, default False -- every
+    existing caller is unaffected): a pre-policy manifest's single raw probe
+    cannot prove every vector was L2-normalized, so by default it stays a
+    hard refusal (see the tests above this one, which pin that unchanged
+    behavior). Cosine similarity is scale-invariant by construction --
+    dot(a,b)/(|a||b|) -- so an index whose vectors happen to be UNNORMALIZED
+    ranks identically under cosine distance to one that is; the risk this
+    guard actually protects against is LanceDB's DEFAULT search metric,
+    which is raw L2 distance, not cosine, and IS scale-sensitive (measured:
+    a same-direction vector at 100x magnitude ranked as if it were nearly
+    orthogonal). The caller opting in here MUST also force cosine distance
+    at the store (VectorStore's ``force_cosine_metric``) -- this function
+    only relaxes the manifest comparison; it does not make a read safe by
+    itself. Writes must NEVER opt in: verify_manifest_for_write has no such
+    parameter (pinned by test_verify_manifest_for_write_never_accepts_the_
+    opt_in), because incrementally writing a KNOWN-normalized vector into a
+    column of UNKNOWN normalization is the actual mixing this guard exists
+    to prevent -- that risk is unrelated to which distance metric a query
+    later uses.
     """
     on_disk = read_manifest(corpus, index_dir=index_dir)
     if on_disk is None:
@@ -266,6 +287,14 @@ def verify_manifest(corpus: str | Path, embedder, provider: str, *,
     on_disk_policy = on_disk.get(
         "normalization_policy", UNVERIFIED_LEGACY_NORMALIZATION_POLICY)
     on_disk_identity = on_disk | {"normalization_policy": on_disk_policy}
+    is_unverified_legacy = on_disk_policy == UNVERIFIED_LEGACY_NORMALIZATION_POLICY
+    # The ONE field the opt-in relaxes. Every other field stays exactly as
+    # strict, opted in or not -- provider/model/revision/dim/dtype determine
+    # whether vectors are even comparable at all, which no metric choice can
+    # fix.
+    policy_fields = (("provider", "model", "revision", "dtype") if
+                     (allow_unverified_legacy and is_unverified_legacy) else
+                     ("provider", "model", "revision", "normalization_policy", "dtype"))
 
     # CHEAP FIELDS FIRST (#27): provider/model/revision/policy/dtype are
     # metadata, so a mismatch refuses here without loading the provider. dim
@@ -273,7 +302,7 @@ def verify_manifest(corpus: str | Path, embedder, provider: str, *,
     # cheap identity agrees.
     cheap = _current_compatibility_cheap(embedder, provider)
     cheap_diffs = [f"{field}: index={on_disk_identity.get(field)!r} current={cheap[field]!r}"
-                   for field in ("provider", "model", "revision", "normalization_policy", "dtype")
+                   for field in policy_fields
                    if on_disk_identity.get(field) != cheap[field]]
     if cheap_diffs:
         raise ManifestMismatch(
@@ -285,8 +314,10 @@ def verify_manifest(corpus: str | Path, embedder, provider: str, *,
         )
 
     fresh = {**cheap, "dim": len(embedder.embed([_PROBE_TEXT])[0])}
+    identity_fields = (tuple(f for f in IDENTITY_FIELDS if f != "normalization_policy")
+                       if (allow_unverified_legacy and is_unverified_legacy) else IDENTITY_FIELDS)
     diffs = [f"{field}: index={on_disk_identity.get(field)!r} current={fresh[field]!r}"
-              for field in IDENTITY_FIELDS if on_disk_identity.get(field) != fresh[field]]
+              for field in identity_fields if on_disk_identity.get(field) != fresh[field]]
     if diffs:
         raise ManifestMismatch(
             f"embedding config does not match the index manifest at "

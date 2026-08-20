@@ -31,9 +31,22 @@ class VectorStore:
 
     table_name = "chunks"
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, force_cosine_metric: bool = False) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
+        # #45: LanceDB's DEFAULT search metric is raw L2 distance, which is
+        # scale-sensitive (measured: a same-direction vector at 100x
+        # magnitude ranks as if nearly orthogonal). That is harmless for a
+        # VERIFIED (l2-policy) index, where CachedEmbedder guarantees every
+        # stored vector is already unit length -- raw L2 and cosine distance
+        # then rank identically. It is NOT harmless for an unverified_legacy
+        # index, whose normalization cannot be proven. force_cosine_metric
+        # makes ranking scale-invariant regardless, at no cost to the
+        # already-normalized default case (see
+        # test_force_cosine_metric_is_a_pure_noop_for_already_normalized_vectors).
+        # The SQLite fallback needs no equivalent: its _cosine() computes
+        # true cosine similarity unconditionally already.
+        self.force_cosine_metric = force_cosine_metric
         self._lancedb = _try_lancedb()
         if self._lancedb is None:
             self._fallback = _SQLiteVectorStore(self.path / "fallback.sqlite")
@@ -113,6 +126,8 @@ class VectorStore:
         if table is None:
             return []
         search = table.search(query_vec)
+        if self.force_cosine_metric:
+            search = search.metric("cosine")
         # not_deleted_clause is applied with prefilter=True so a deleted row
         # never occupies one of the k slots in the first place (a post-hoc
         # filter after limit() would silently shrink the candidate pool
