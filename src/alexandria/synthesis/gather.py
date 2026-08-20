@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 
 from ..llm import LLMError
+from ..untrusted import escape_for_prompt
 
 __all__ = ["GatherResult", "SourceChunk", "gather"]
 
@@ -114,11 +115,14 @@ def gather(engine, topic_query: str, *, llm, seed_k: int = 8,
 
 
 def _gap_prompt(topic_query: str, chunks: tuple[SourceChunk, ...]) -> str:
-    lines = [f"<topic>{topic_query}</topic>", "<candidate_pool>"]
+    # #5/F3a: same escaping requirement as write.py's _writer_prompt -- chunk
+    # text is retrieved content and must not be able to forge a delimiter.
+    lines = [f"<topic>{escape_for_prompt(topic_query)}</topic>", "<candidate_pool>"]
     for chunk in chunks:
         lines.extend((
-            f'<chunk doc_id="{chunk.doc_id}" chunk_id="{chunk.chunk_id}">',
-            chunk.text,
+            f'<chunk doc_id="{escape_for_prompt(chunk.doc_id)}" '
+            f'chunk_id="{escape_for_prompt(chunk.chunk_id)}">',
+            escape_for_prompt(chunk.text),
             "</chunk>",
         ))
     lines.append("</candidate_pool>")

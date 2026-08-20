@@ -889,6 +889,26 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
         print(f"index: gc removed {removed} release(s); keeping {sorted(keep)}")
         return 0
 
+    if getattr(args, "enrich_invalidate", None):
+        # #5/F3d escape hatch: force a specific doc_id's stored enrichment
+        # payload to be dropped, independent of content/recipe -- for an
+        # operator who has judged a payload bad (e.g. a hostile hypothetical
+        # that slipped past the F3c filter) on a document whose content and
+        # recipe have not otherwise changed. The next `index --enrich` run
+        # re-calls the LLM for it instead of silently reattaching the
+        # rejected payload forever.
+        from .enrich import EnrichmentStore
+        index_dir = resolve_active_index_dir(corpus)
+        store = EnrichmentStore(index_dir)
+        removed = store.invalidate(args.enrich_invalidate)
+        if removed:
+            print(f"index: invalidated enrichment for {args.enrich_invalidate!r}; "
+                  "run with --enrich to re-enrich it")
+            return 0
+        print(f"index: {args.enrich_invalidate!r} had no stored enrichment "
+              "to invalidate", file=sys.stderr)
+        return 1
+
     if getattr(args, "backfill_manifest", False):
         # A pre-policy manifest cannot establish that every persisted vector
         # crossed CachedEmbedder's L2 boundary. Never relabel non-empty legacy
@@ -1929,6 +1949,10 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--reattach-only", action="store_true",
                        help="replay stored enrichment without an LLM gateway "
                             "(for rebuilding an index over an already-enriched corpus)")
+    index.add_argument("--enrich-invalidate", default=None, metavar="DOC_ID",
+                       help="force-drop DOC_ID's stored enrichment payload (#5/F3d); "
+                            "the next --enrich run re-calls the LLM for it instead of "
+                            "reattaching a payload judged bad since it was accepted")
     index.add_argument("--base-url", default="http://127.0.0.1:20128/v1",
                        help="gateway base URL for the enrichment LLM")
     index.add_argument("--api-key-env", default="ALEXANDRIA_LLM_KEY",

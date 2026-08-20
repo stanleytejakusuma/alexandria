@@ -935,3 +935,36 @@ def test_writing_into_a_pre_policy_legacy_index_still_refuses(tmp_path, monkeypa
     note2.write_text("---\nsource: test\n---\n\nsecond, added incrementally\n")
     with pytest.raises(SystemExit, match="--rebuild"):
         app(["--corpus", str(corpus), "index"])  # no --rebuild: incremental write path
+
+
+def test_index_enrich_invalidate_drops_a_stored_payload_and_reports_honestly(tmp_path, monkeypatch, capsys):
+    """#5/F3d escape hatch, wired at the CLI: --enrich-invalidate DOC_ID drops
+    a stored enrichment payload even with content/recipe unchanged, and is
+    honest about whether there was anything to drop (exit 1 + stderr note
+    when there was not, matching the CLI's existing refusal conventions)."""
+    from alexandria.enrich import EnrichmentStore
+    from alexandria.index.releases import resolve_active_index_dir
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nbody\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+
+    index_dir = resolve_active_index_dir(corpus)
+    store = EnrichmentStore(index_dir)
+    store.put("sources/note.md", "somesha", "m@v1", {"summary": "s"})
+    assert store.count() == 1
+
+    rc = app(["--corpus", str(corpus), "index", "--enrich-invalidate", "sources/note.md"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "invalidated" in out.lower()
+    # re-open (the CLI's store instance is separate from this test's)
+    assert EnrichmentStore(index_dir).count() == 0
+
+    rc2 = app(["--corpus", str(corpus), "index", "--enrich-invalidate", "sources/nothing-here.md"])
+    assert rc2 == 1
+    err = capsys.readouterr().err
+    assert "no stored enrichment" in err.lower()

@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 
 from ..llm import LLMError
+from ..untrusted import escape_for_prompt
 from .gather import GatherResult, SourceChunk
 
 __all__ = ["Claim", "Citation", "SynthesisPage", "parse_page_response", "write_page"]
@@ -129,11 +130,15 @@ def _parse_claim(value: object, index: int) -> Claim:
 
 
 def _writer_prompt(topic_query: str, chunks: tuple[SourceChunk, ...]) -> str:
-    lines = [f"<topic>{topic_query}</topic>", "<gathered_pool>"]
+    # #5/F3a: chunk.text is retrieved (potentially untrusted) content -- escape
+    # it before interpolating into the <chunk>...</chunk> delimiter structure
+    # so it cannot forge a closing tag and escape its data region.
+    lines = [f"<topic>{escape_for_prompt(topic_query)}</topic>", "<gathered_pool>"]
     for chunk in chunks:
         lines.extend((
-            f'<chunk doc_id="{chunk.doc_id}" chunk_id="{chunk.chunk_id}">',
-            chunk.text,
+            f'<chunk doc_id="{escape_for_prompt(chunk.doc_id)}" '
+            f'chunk_id="{escape_for_prompt(chunk.chunk_id)}">',
+            escape_for_prompt(chunk.text),
             "</chunk>",
         ))
     lines.append("</gathered_pool>")

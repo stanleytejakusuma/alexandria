@@ -17,6 +17,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .untrusted import INERT_DATA_FRAMING, escape_for_prompt, looks_like_injected_instruction
+
+# #5/F3b: this builder was the one prompt builder in the codebase missing the
+# inert-data framing already carried by synthesis/write.py, gather.py, and
+# repair.py (docs/SPEC-multi-tenant-and-learning-loop.md Part F). Shares the
+# exact wording via untrusted.INERT_DATA_FRAMING rather than restating it, so
+# the four builders cannot silently drift from each other.
 ENRICH_SYSTEM = (
     "You enrich a private knowledge-base document for retrieval. Read the "
     "document and return ONE JSON object with exactly these keys:\n"
@@ -25,17 +32,28 @@ ENRICH_SYSTEM = (
     "\"hypotheticals\": array of 3-5 plausible USER QUESTIONS this document "
     "would answer, phrased the way a user would actually ask them, not "
     "using the document's own wording.}\n"
+    f"{INERT_DATA_FRAMING}\n"
     "Return ONLY the JSON object, no prose, no markdown fences."
 )
 
 MAX_DOC_CHARS = 8000
 MAX_HYPOTHETICALS = 3
+MAX_HYPOTHETICAL_CHARS = 200  # #5/F3c: only array length was capped before
 
 
 def enrich_doc(llm, doc_id: str, doc_text: str) -> dict[str, Any]:
     """One LLM call; returns {"summary", "keywords", "hypotheticals"} (any
     subset on failure -- the caller attaches whatever came back)."""
-    user = f"DOCUMENT id: {doc_id}\n\n{doc_text[:MAX_DOC_CHARS]}"
+    # #5/F3a: doc_text is retrieved corpus content, potentially third-party
+    # and untrusted (the spec calls this the real unframed surface -- a
+    # retrieval-POISONING vector, not just an answer-poisoning one, since a
+    # hypothetical becomes a first-class synthetic vector that boosts ranking
+    # for future queries). Give it an explicit <document> delimiter (the same
+    # pattern write.py/gather.py/repair.py already use) so escaping has a
+    # real boundary to protect, then escape both the id and the text.
+    user = (f'<document id="{escape_for_prompt(doc_id)}">\n'
+            f"{escape_for_prompt(doc_text[:MAX_DOC_CHARS])}\n"
+            "</document>")
     try:
         raw = llm.complete(ENRICH_SYSTEM, user, temperature=0.1)
     except Exception as exc:
@@ -57,7 +75,22 @@ def _parse_enrichment(raw: str) -> dict[str, Any]:
             if key in parsed:
                 out[key] = parsed[key]
         out["keywords"] = [str(k) for k in (out.get("keywords") or [])][:8]
-        out["hypotheticals"] = [str(h) for h in (out.get("hypotheticals") or [])][:MAX_HYPOTHETICALS]
+        # #5/F3c: per-item length cap (only array length was capped before)
+        # plus a plausibility filter that drops instruction-shaped entries
+        # BEFORE they can become synthetic retrieval vectors. suspicious_count
+        # is surfaced to the caller (enrich_docs_for_index's stats dict) so
+        # an operator can see attempts, not only successes (F3e).
+        raw_hypotheticals = [str(h)[:MAX_HYPOTHETICAL_CHARS]
+                             for h in (out.get("hypotheticals") or [])][:MAX_HYPOTHETICALS]
+        clean, suspicious = [], 0
+        for h in raw_hypotheticals:
+            if looks_like_injected_instruction(h):
+                suspicious += 1
+            else:
+                clean.append(h)
+        out["hypotheticals"] = clean
+        if suspicious:
+            out["suspicious_hypotheticals"] = suspicious
         out["summary"] = str(out.get("summary") or "")[:200]
     except (json.JSONDecodeError, TypeError, AttributeError):
         return {}
@@ -127,7 +160,10 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
             by_doc[doc_id] = []
             order.append(doc_id)
         by_doc[doc_id].append(record)
-    stats = {"enriched": 0, "reattached": 0, "failed": 0, "synthetic": 0}
+    stats = {"enriched": 0, "reattached": 0, "failed": 0, "synthetic": 0,
+             "suspicious": 0}  # #5/F3e: count of hypotheticals dropped as
+             # instruction-shaped, so a monitoring loop observes injection
+             # ATTEMPTS, not only whatever survived filtering
     next_progress = progress_every
     def _progress() -> None:
         nonlocal next_progress
@@ -151,6 +187,11 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
             stats["failed"] += 1
             _progress()
             return
+        # #5/F3e: surface suspicion BEFORE persisting -- the stored payload
+        # already has the filtered (clean) hypotheticals; the count is the
+        # observable signal a monitoring loop reads, the filtering already
+        # happened in _parse_enrichment.
+        stats["suspicious"] += payload.pop("suspicious_hypotheticals", 0)
         store.put(doc_id, sha, recipe, payload)
         stats["enriched"] += 1
         _apply_payload(doc_records, payload, embedder, records, stats)
@@ -252,6 +293,19 @@ class EnrichmentStore:
             "sha=excluded.sha, recipe=excluded.recipe, payload=excluded.payload",
             (doc_id, sha, recipe, json.dumps(payload, sort_keys=True)))
         self.con.commit()
+
+    def invalidate(self, doc_id: str) -> bool:
+        """#5/F3d: force-drop a stored payload independent of content-hash or
+        recipe change. Without this, an accepted poisoned payload is sticky
+        forever -- get() only refuses a STALE fingerprint/recipe, never a
+        payload an operator has since judged bad on an unchanged document.
+        Returns True if a row existed and was removed, False otherwise (so a
+        caller invalidating a doc that was never enriched gets an honest
+        signal rather than a silent no-op)."""
+        cur = self.con.execute(
+            "DELETE FROM enriched_docs WHERE doc_id = ?", (doc_id,))
+        self.con.commit()
+        return cur.rowcount > 0
 
     def count(self) -> int:
         return int(self.con.execute("SELECT COUNT(*) FROM enriched_docs").fetchone()[0])

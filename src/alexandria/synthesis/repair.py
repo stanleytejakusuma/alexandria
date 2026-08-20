@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from ..llm import LLMError
+from ..untrusted import escape_for_prompt
 from .gather import GatherResult
 from .judge import JudgeVerdict, complete_skip_log, judge_page
 from .write import SynthesisPage, parse_page_response
@@ -120,10 +121,16 @@ def repair_until_done(gathered: GatherResult, page: SynthesisPage, *, repair_llm
 
 
 def _repair_prompt(gathered: GatherResult, page: SynthesisPage, verdict: JudgeVerdict) -> str:
+    # #5/F3a: escape every dynamic interpolation into this delimited prompt.
+    # `gathered.chunks` is retrieved content (the primary risk, same as
+    # write.py/gather.py); `page`/`verdict` are LLM-generated, but since the
+    # writer's own output can itself echo escaped-but-rendered injected text
+    # from an upstream chunk, staying consistent here closes that path too
+    # rather than trusting one generation hop to have been safe.
     lines = [
-        f"<topic>{page.topic_query}</topic>",
+        f"<topic>{escape_for_prompt(page.topic_query)}</topic>",
         "<current_page>",
-        page.text,
+        escape_for_prompt(page.text),
         "</current_page>",
         "<current_claims>",
     ]
@@ -131,7 +138,8 @@ def _repair_prompt(gathered: GatherResult, page: SynthesisPage, verdict: JudgeVe
         citations = ", ".join(
             citation.chunk_id or citation.doc_id for citation in claim.citations
         )
-        lines.append(f"- {claim.id}: {claim.text} [{citations}]")
+        lines.append(f"- {claim.id}: {escape_for_prompt(claim.text)} "
+                     f"[{escape_for_prompt(citations)}]")
     lines.extend((
         "</current_claims>",
         f"<failed_claim_ids>{', '.join(verdict.failed_claim_ids)}</failed_claim_ids>",
@@ -143,8 +151,9 @@ def _repair_prompt(gathered: GatherResult, page: SynthesisPage, verdict: JudgeVe
     ))
     for chunk in gathered.chunks:
         lines.extend((
-            f'<chunk doc_id="{chunk.doc_id}" chunk_id="{chunk.chunk_id}">',
-            chunk.text,
+            f'<chunk doc_id="{escape_for_prompt(chunk.doc_id)}" '
+            f'chunk_id="{escape_for_prompt(chunk.chunk_id)}">',
+            escape_for_prompt(chunk.text),
             "</chunk>",
         ))
     lines.append("</gathered_pool>")
