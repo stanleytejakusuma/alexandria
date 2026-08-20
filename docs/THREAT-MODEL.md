@@ -1,6 +1,6 @@
 # Threat model
 
-**Status:** built 2026-08-20, verified against live code at commit HEAD of this branch.
+**Status:** built 2026-08-20, verified against live code as of the commit that introduced this file (see this file's own git blame for the exact SHA -- a "HEAD of this branch" reference goes stale the moment a later commit lands, so this document does not hardcode one).
 Companion to `SECURITY.md` (which states current mitigations and known gaps) -- this
 document works through the actual attack surface systematically, so a reviewer can check
 "did they think about X" rather than trusting an unstructured list.
@@ -52,9 +52,16 @@ file permissions correctly; it does not reimplement that).
   from a flag — spoofing requires actually being that OS user, which is not a forgery at
   that point (`cli.py:cli_identity`).
 - **`serve` caller identity**: derived from the connecting socket. A Unix socket path IS the
-  identity (one socket per identity, filesystem-permission-protected); any TCP connection
-  gets the fixed label `local-anonymous` regardless of claimed identity — no request body
-  field can override this (`serve.py`, `LOCAL_ANONYMOUS`).
+  identity (one socket per identity); any TCP connection gets the fixed label
+  `local-anonymous` regardless of claimed identity — no request body field can override this
+  (`serve.py`, `LOCAL_ANONYMOUS`). **Verified caveat**: the Unix socket file's permissions
+  are NOT explicitly set by this code (no `os.chmod` call found) -- protection currently
+  relies on the process umask at socket-creation time and the containing directory's
+  permissions, not an explicit, verified mode. **Second caveat**: if
+  `ALEXANDRIA_SERVE_ALLOW_REMOTE=1` is set, a genuinely remote TCP peer is stamped with the
+  SAME `local-anonymous` label a same-host anonymous caller would get — the label name
+  becomes misleading in that (opt-in, non-default) configuration. Treat `local-anonymous` as
+  "unauthenticated," not literally "on this machine," once remote binding is enabled.
 - **`--caller` (a tool label, not an identity)**: free text, cannot be verified on the CLI
   path (no trust boundary exists there to check against). Mitigated to "honest, not
   verified": a small known set of documented values (the CLI default, and the one external
@@ -69,7 +76,13 @@ file permissions correctly; it does not reimplement that).
 - **Corpus writes**: exclusive `flock`-based `WriteLock` around every mutation
   (`index`/`promote`/`delete`/`ingest`); a network-filesystem mount is explicitly refused
   (`assert_local_filesystem`) because `flock` is unreliable there, which would silently
-  defeat this protection.
+  defeat this protection. Verified live: this is a DENYLIST of known network filesystem
+  types (`nfs`, `nfs4`, `smbfs`, `cifs`, `afpfs`, `webdav`), not an allowlist of known-safe
+  local types -- an unrecognized or undetectable filesystem type is allowed through by
+  design (documented in the function's own docstring: "this guards the documented NFS/SMB
+  failure mode, not an allowlist"). A network filesystem exposed through a mechanism this
+  denylist does not recognize (e.g. sshfs/FUSE mounts, which can have equally unreliable
+  `flock` semantics) would not be caught.
 - **Index rebuild atomicity**: `--rebuild` builds a complete new release beside the active
   one, validates it (checksums, manifest, row counts), then atomically repoints a single
   pointer file (`os.replace`) — a crash or failure at any point before that repoint leaves
@@ -129,6 +142,20 @@ file permissions correctly; it does not reimplement that).
 - **Concurrent reader/writer contention**: a reader (`IndexReadLock`) never blocks
   indefinitely behind an active writer — a short bounded retry, then an explicit "retry
   later" refusal (`IndexReadUnavailable`), never a hang.
+- **Gap, accepted for now**: `serve.py` uses stdlib `ThreadingHTTPServer`/
+  `ThreadingMixIn` with no explicit per-connection socket timeout set. `ThreadingMixIn`
+  means one slow client ties up one worker thread, not the whole server (unlike a
+  single-threaded HTTP server, where this would be a full slowloris outage) -- but enough
+  slow connections could still exhaust available threads. Consistent with the accepted
+  "loopback-only, no auth" boundary: the threat model for this server today is "a
+  cooperating local process," not "an adversarial network client holding connections
+  open," so this has not been prioritized. Would need a real fix before any
+  `ALEXANDRIA_SERVE_ALLOW_REMOTE=1` deployment.
+- **Gap, accepted for now**: the audit trail (`queries.sqlite`, `answers.jsonl`) and the
+  citation-linkage records within it (backlog #9) are append-only with no TTL, rotation, or
+  size cap. A very long-lived corpus with heavy query volume grows this without bound. No
+  disk-exhaustion DoS has been observed in practice, and no rotation exists to prevent one
+  in principle.
 
 ### Elevation of privilege
 
@@ -187,6 +214,35 @@ explicitly account for citation tuples, not just source documents and indexes. T
 flagged here so a future erasure implementation does not treat the audit trail as
 out-of-scope by default.
 
+## Additional supply-chain and parsing surfaces (Red review 2026-08-20)
+
+The STRIDE walk-through above covers PyPI dependency pinning, but two adjacent surfaces
+needed their own verification against live code rather than being folded into a general
+"supply chain" wave:
+
+- **Embedding/reranker model weights (HuggingFace Hub).** `sentence-transformers` pulls
+  weights from HF Hub at runtime, not from a package registry -- a mutable model repo unless
+  a specific revision is pinned. Verified live: `Embedder.revision` (`embedder.py`) is a real
+  FIELD threaded through the manifest/cache-key system, but its VALUE defaults to `""`
+  (unpinned) for the shipped providers -- **this is a known, tracked gap** ("model revision
+  identity" in `docs/BACKLOG.md`'s open items), not a false claim of protection. A same-name
+  weight swap on HuggingFace between two runs is not currently detectable by this engine.
+  Separately: this codebase does not construct any raw pickle-format (`.bin` via
+  `torch.load`) checkpoint path itself -- `sentence-transformers`' own loading code is
+  upstream of this engine's control and out of this document's scope to audit line-by-line;
+  operators should be aware that a HuggingFace model repo IS a code-adjacent trust boundary,
+  not just a data file.
+- **Local parsing of hostile document bytes.** Verified live: this engine parses YAML
+  frontmatter via `yaml.safe_load` (`corpus.py`) -- never the arbitrary-code-execution-
+  capable `yaml.load`/`yaml.unsafe_load`. PDF extraction shells out to the external
+  `pdftotext` binary (poppler-utils, a subprocess call, not an in-process Python PDF parsing
+  library) or degrades to `ExtractionFailed` if the binary is absent; image
+  extraction routes to the configured vision gateway, not an in-process image-parsing
+  library. **No untrusted PDF or image bytes are parsed by an in-process Python library
+  vulnerable to a crafted-file exploit in this codebase** -- the exposure, if any, lives in
+  `pdftotext` itself (a well-established, narrowly-scoped external tool) or in whatever
+  vision gateway the operator has configured, both outside this document's direct control.
+
 ## What this document does not cover
 
 - Any specific third-party LLM/vision gateway's own security posture — that is the operator's
@@ -196,3 +252,11 @@ out-of-scope by default.
 - Supply-chain integrity of PyPI packages themselves beyond version pinning (`uv.lock`) — a
   compromised upstream package release that matches its pinned version+hash would not be
   caught by this document's controls. No SBOM or package-signature verification exists yet.
+  As of this document, 3 direct runtime dependencies (`lancedb`, `pyyaml`,
+  `sentence-transformers`) resolve to a much larger total transitive dependency graph pinned
+  in `uv.lock` (77 packages as of the commit that introduced this document) -- a procurement
+  reviewer evaluating attack surface should weigh the total, not just the direct count.
+- Line-by-line audit of any upstream dependency's own parsing/loading code (e.g.
+  `sentence-transformers`' model-loading internals) -- out of scope for a single-maintainer
+  project to independently verify; treated as a trusted-but-unverified supply chain like any
+  other dependency.

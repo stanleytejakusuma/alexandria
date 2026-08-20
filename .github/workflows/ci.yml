@@ -10,10 +10,17 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # #10 procurement floor (Red review 2026-08-20): pinned to full commit
+      # SHAs, not mutable version tags -- a repointed or compromised tag on
+      # either of these two actions runs with workflow-level privileges and
+      # is exactly the "silently changes what CI runs with no diff to
+      # review" failure mode this PR's own PyPI-pinning fix exists to close.
+      # Comment names the human-readable tag each SHA corresponds to at pin
+      # time; bump both together when intentionally upgrading.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.12"
 
@@ -39,10 +46,16 @@ jobs:
         # hoping the network cooperates.
         env:
           HF_HUB_OFFLINE: "1"
-        run: uv run --locked python -m pytest tests/ -q
+        # --no-sync (Red review 2026-08-20): `uv run` performs its own sync
+        # pass by default, and that pass does not include the dev extra
+        # unless told to -- risking a re-sync that strips pytest right after
+        # the explicit `uv sync --locked --extra dev` step installed it. One
+        # explicit sync, then --no-sync on every run step, so there is
+        # exactly one install action to reason about.
+        run: uv run --no-sync python -m pytest tests/ -q
 
       - name: Leak scanner (unconditional)
-        run: uv run --locked python scripts/precommit-scan.py --all
+        run: uv run --no-sync python scripts/precommit-scan.py --all
 
       # eval-gate.py skips itself on CI (no private corpus/index here) -- its
       # retrieval regression measurement is a local-machine gate by design.
