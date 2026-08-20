@@ -10,6 +10,15 @@ Every test here runs offline against a fake -- no model download, no network.
 
 import pytest
 
+from alexandria.model_load import clear_failure_cache
+
+
+@pytest.fixture(autouse=True)
+def _clear_model_load_cache():
+    clear_failure_cache()
+    yield
+    clear_failure_cache()
+
 from alexandria.index.embedder import MLXEmbedder
 
 
@@ -158,7 +167,9 @@ def test_a_real_exception_is_not_masked_as_a_timeout(monkeypatch):
 
 
 def test_does_not_retry_the_full_timeout_on_a_second_call(monkeypatch):
-    """Same bug class as LocalEmbedder's and the reranker's."""
+    """The CI-hang bug class, through the shared keyed cooldown -- same as
+    LocalEmbedder's test: two calls within the cooldown window share one
+    remembered failure instead of each re-paying the full timeout."""
     import sys
     import time
     import types

@@ -14,7 +14,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol, runtime_checkable
 
-from ..model_load import DEFAULT_LOAD_TIMEOUT, load_with_timeout
+from ..model_load import DEFAULT_COOLDOWN, DEFAULT_LOAD_TIMEOUT, load_with_timeout
 
 __all__ = ["CachedEmbedder", "Embedder", "EmbeddingCacheBusy", "HashEmbedder",
            "LocalEmbedder", "MLXEmbedder"]
@@ -140,14 +140,15 @@ class LocalEmbedder:
 
     def __init__(self, model: str = "Qwen/Qwen3-Embedding-0.6B", batch_size: int = 32,
                  device: str | None = None, max_length: int = DEFAULT_MAX_LENGTH,
-                 load_timeout: float = DEFAULT_LOAD_TIMEOUT) -> None:
+                 load_timeout: float = DEFAULT_LOAD_TIMEOUT,
+                 cooldown: float = DEFAULT_COOLDOWN) -> None:
         self.model_name = model
         self.batch_size = batch_size
         self.device = device
         self.max_length = max_length
         self.load_timeout = load_timeout
+        self.cooldown = cooldown
         self._model = None
-        self._load_error: BaseException | None = None
 
     @property
     def name(self) -> str:
@@ -174,15 +175,6 @@ class LocalEmbedder:
     def _load(self):
         if self._model is not None:
             return self._model
-        # THE BUG THAT HUNG CI (2026-08-20, found via the reranker's identical
-        # gap): a failed load was never remembered, so .embed()/.dim -- both
-        # call _load() independently -- each re-paid the FULL timeout on a
-        # SECOND call on the same instance. Unlike the reranker, this instance
-        # is never retried by construction (a fresh LocalEmbedder is built per
-        # top-level CLI operation), so remembering the failure for this
-        # instance's lifetime is correct, not merely a cooldown.
-        if self._load_error is not None:
-            raise self._load_error
         try:
             import torch
             from sentence_transformers import SentenceTransformer
@@ -194,14 +186,21 @@ class LocalEmbedder:
         # vector would poison the index or a query invisibly. This bounds the
         # load so a slow (not absent) network fails FAST AND LOUD with a
         # clear cause instead of hanging the caller's first index/search.
-        try:
-            self._model = load_with_timeout(
-                lambda: SentenceTransformer(self.model_name, device=device),
-                timeout=self.load_timeout,
-                description=f"local embedder model {self.model_name!r} (provider: local)")
-        except BaseException as exc:
-            self._load_error = exc
-            raise
+        # The shared keyed cooldown in model_load.py (Red review, 2026-08-20)
+        # makes a persistently-dead network cost ONE attempt per cooldown
+        # window, NOT one per instance lifetime: serve holds ONE embedder for
+        # the whole process and warms it at boot, so a per-instance-forever
+        # failure memoization would have turned a boot-time network blip into
+        # a permanent, restart-only outage -- the exact opposite of the
+        # intended asymmetry. A cooldown (not forever) is correct for both
+        # the CLI's fresh-instance-per-call and serve's one-instance-forever
+        # shapes without either needing to know which it is.
+        self._model = load_with_timeout(
+            lambda: SentenceTransformer(self.model_name, device=device),
+            timeout=self.load_timeout,
+            description=f"local embedder model {self.model_name!r} (provider: local)",
+            key=f"local-embedder:{self.model_name}:{device}",
+            cooldown=self.cooldown)
         return self._model
 
 
@@ -230,16 +229,17 @@ class MLXEmbedder:
 
     def __init__(self, model: str = "mlx-community/Qwen3-Embedding-0.6B-8bit",
                  batch_size: int = 32, max_length: int = DEFAULT_MAX_LENGTH,
-                 load_timeout: float = DEFAULT_LOAD_TIMEOUT) -> None:
+                 load_timeout: float = DEFAULT_LOAD_TIMEOUT,
+                 cooldown: float = DEFAULT_COOLDOWN) -> None:
         self.model_name = model
         self.batch_size = batch_size
         self.max_length = max_length
         self.load_timeout = load_timeout
+        self.cooldown = cooldown
         self._model = None
         self._processor = None
         self._generate = None
         self._import_error: Exception | None = None
-        self._load_error: BaseException | None = None
 
     @property
     def name(self) -> str:
@@ -270,29 +270,22 @@ class MLXEmbedder:
                 f"({self._import_error})") from self._import_error
         if self._model is not None:
             return
-        # Same fix as LocalEmbedder's, same bug (2026-08-20): .dim and .embed
-        # both reach _load() independently, so a failed load must be
-        # remembered for this instance's lifetime -- never re-attempted by a
-        # second call on the same (never-reused) instance.
-        if self._load_error is not None:
-            raise self._load_error
         try:
             from mlx_embeddings import generate, load
         except ImportError as exc:  # pragma: no cover - exercised in installed runtime
             raise RuntimeError(
                 "MLX embeddings require the 'mlx' and 'mlx-embeddings' packages") from exc
-        # #44: same requirement as LocalEmbedder -- load(model_name) pulls
-        # weights over the network with no native timeout, and there is no
-        # safe substitute for a real vector, so this must fail fast and loud
-        # on a slow/hung network rather than silently degrade or hang.
-        try:
-            self._model, self._processor = load_with_timeout(
-                lambda: load(self.model_name),
-                timeout=self.load_timeout,
-                description=f"MLX embedder model {self.model_name!r} (provider: mlx)")
-        except BaseException as exc:
-            self._load_error = exc
-            raise
+        # #44 + shared keyed cooldown (same rationale as LocalEmbedder's:
+        # serve holds one instance for the process's life and warms it at
+        # boot, so per-instance-forever failure memoization would turn a
+        # boot-time blip into a permanent restart-only outage -- Red review,
+        # 2026-08-20).
+        self._model, self._processor = load_with_timeout(
+            lambda: load(self.model_name),
+            timeout=self.load_timeout,
+            description=f"MLX embedder model {self.model_name!r} (provider: mlx)",
+            key=f"mlx-embedder:{self.model_name}",
+            cooldown=self.cooldown)
         self._generate = generate
 
 

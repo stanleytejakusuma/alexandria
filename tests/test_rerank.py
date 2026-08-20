@@ -2,6 +2,15 @@
 
 import pytest
 
+from alexandria.model_load import clear_failure_cache
+
+
+@pytest.fixture(autouse=True)
+def _clear_model_load_cache():
+    clear_failure_cache()
+    yield
+    clear_failure_cache()
+
 from alexandria.retrieval.rerank import CrossEncoderReranker, IdentityReranker, RerankCandidate
 
 
@@ -149,7 +158,9 @@ def test_a_failed_load_does_not_retry_the_full_timeout_on_every_call(monkeypatch
 
 def test_a_failed_load_retries_after_the_cooldown_expires(monkeypatch):
     """The failure cache must not be permanent -- a network that recovers must
-    eventually be retried, or a transient blip becomes a process-lifetime outage."""
+    eventually be retried, or a transient blip becomes a process-lifetime outage.
+    The cooldown now lives in model_load.py as a shared keyed facility; this
+    test proves the reranker's key participates in it correctly."""
     import time
     import types
 
@@ -167,13 +178,10 @@ def test_a_failed_load_retries_after_the_cooldown_expires(monkeypatch):
     model_name = "offline-degrade-cooldown-expiry-probe"
     candidates = [RerankCandidate("a", "alpha text", 0.9)]
 
-    import alexandria.retrieval.rerank as rerank_mod
-    monkeypatch.setattr(rerank_mod, "_FAILURE_COOLDOWN", 0.1)
-
-    reranker = CrossEncoderReranker(model=model_name, load_timeout=0.05)
+    reranker = CrossEncoderReranker(model=model_name, load_timeout=0.05, cooldown=0.1)
     with pytest.raises(Exception):
         reranker.rerank("query", candidates, k=1)
-    time.sleep(0.15)  # past the (patched) cooldown
+    time.sleep(0.15)  # past the cooldown
     with pytest.raises(Exception):
         reranker.rerank("query", candidates, k=1)
 

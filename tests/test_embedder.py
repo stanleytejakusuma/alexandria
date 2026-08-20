@@ -8,6 +8,17 @@ import threading
 import pytest
 from pathlib import Path
 
+from alexandria.model_load import clear_failure_cache
+
+
+@pytest.fixture(autouse=True)
+def _clear_model_load_cache():
+    """The shared keyed failure cache in model_load.py must not leak one
+    test's cached failure/success into the next (Red review, 2026-08-20)."""
+    clear_failure_cache()
+    yield
+    clear_failure_cache()
+
 from alexandria.index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, QUERY_PREFIX
 
 
@@ -736,9 +747,12 @@ def test_local_embedder_a_real_exception_is_not_masked_as_a_timeout(monkeypatch)
 
 
 def test_local_embedder_does_not_retry_the_full_timeout_on_a_second_call(monkeypatch):
-    """Same bug class as the reranker's (the one that hung CI): a failed load
-    on ONE instance must not be re-attempted by a second call to .embed()/.dim
-    on that SAME instance -- dim and embed both call _load() independently."""
+    """The CI-hang bug class, through the shared keyed cooldown: a failed load
+    must not be re-attempted by a second call within the cooldown window --
+    .dim and .embed both call _load() independently, and under the OLD
+    design every such call re-paid the full timeout (36+ call sites = 18
+    minutes, observed live). Now the first failure is remembered keyed by
+    model+device, and the second call fails in microseconds."""
     import time
     import types
 
