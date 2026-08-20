@@ -76,7 +76,15 @@ class ManifestMismatch(Exception):
     """The current embedding config does not match the index manifest."""
 
 
-def _manifest_path(corpus: str | Path) -> Path:
+def _manifest_path(corpus: str | Path, index_dir: str | Path | None = None) -> Path:
+    """#30 P2a: index_dir is an ADDITIVE override, defaulting to None so every
+    existing caller (7 sites in cli.py/promote.py) is byte-identical to
+    before. When given, the manifest lives directly under it (a staged
+    release directory) instead of under the legacy `.alexandria/index/`
+    derived from corpus -- this is what lets a release carry its own
+    manifest independent of whatever is currently active."""
+    if index_dir is not None:
+        return Path(index_dir).expanduser() / MANIFEST_FILE
     return Path(corpus).expanduser() / ".alexandria" / "index" / MANIFEST_FILE
 
 
@@ -110,19 +118,22 @@ def compute_manifest(embedder, provider: str) -> dict[str, Any]:
     }
 
 
-def write_manifest(corpus: str | Path, embedder, provider: str) -> dict[str, Any]:
+def write_manifest(corpus: str | Path, embedder, provider: str, *,
+                   index_dir: str | Path | None = None) -> dict[str, Any]:
     """Compute and atomically persist the manifest for the current index.
 
     ``compute_manifest`` records the raw backend probe diagnostic. Also put the
     wrapper-normalized probe in its cache, so later read-side compatibility
     checks can inspect the declared boundary without an avoidable provider
     load during server startup.
+
+    ``index_dir`` (#30 P2a): see `_manifest_path`.
     """
     manifest = compute_manifest(embedder, provider)
     if hasattr(embedder, "normalization_policy"):
         embedder.embed([_PROBE_TEXT])
     manifest["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    path = _manifest_path(corpus)
+    path = _manifest_path(corpus, index_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
     tmp.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
@@ -130,15 +141,17 @@ def write_manifest(corpus: str | Path, embedder, provider: str) -> dict[str, Any
     return manifest
 
 
-def read_manifest(corpus: str | Path) -> dict[str, Any] | None:
+def read_manifest(corpus: str | Path, *, index_dir: str | Path | None = None) -> dict[str, Any] | None:
     """Return the on-disk manifest, or None if none has ever been written.
 
     Raises ManifestCorrupt if the file exists but cannot be parsed -- treated
     as distinct from "missing" for the same reason as generation.json (see
     cache.GenerationFileCorrupt): silently falling back to "no manifest" on a
     corrupt-but-present file would make a real backfill invisible.
+
+    ``index_dir`` (#30 P2a): see `_manifest_path`.
     """
-    path = _manifest_path(corpus)
+    path = _manifest_path(corpus, index_dir)
     if not path.exists():
         return None
     try:
@@ -181,10 +194,16 @@ def verify_manifest_for_write(corpus: str | Path, embedder, provider: str, store
     An empty index has no vectors to disagree with, so both a missing manifest
     and a provider change are legitimate there; the manifest is written at the
     end of the run. That also covers --rebuild, which drops the table first.
+
+    #30 P2a: checks the manifest at `store.path` -- wherever THIS store
+    actually writes (the active release once one exists, the legacy path
+    otherwise) -- never a separately-resolved directory that could drift out
+    of sync with what `store` itself points at.
     """
     if store.count() == 0:
         return
-    verify_manifest(corpus, embedder, provider)
+    index_dir = getattr(store, "path", None)
+    verify_manifest(corpus, embedder, provider, index_dir=index_dir)
 
 
 def _current_compatibility_cheap(embedder, provider: str) -> dict[str, Any]:
@@ -219,7 +238,8 @@ def _current_compatibility(embedder, provider: str) -> dict[str, Any]:
     return {**cheap, "dim": len(vector)}
 
 
-def verify_manifest(corpus: str | Path, embedder, provider: str) -> None:
+def verify_manifest(corpus: str | Path, embedder, provider: str, *,
+                    index_dir: str | Path | None = None) -> None:
     """Refuse loudly on a missing or mismatched manifest (gate F4).
 
     Provider/model/revision/dimension/declared-policy/dtype are strict
@@ -231,8 +251,10 @@ def verify_manifest(corpus: str | Path, embedder, provider: str) -> None:
     the CLI/serve boundary should catch these and exit with the message
     (see cli.py's _build_search_engine, the single chokepoint search,
     answer, and eval all go through).
+
+    ``index_dir`` (#30 P2a): see `_manifest_path`.
     """
-    on_disk = read_manifest(corpus)
+    on_disk = read_manifest(corpus, index_dir=index_dir)
     if on_disk is None:
         raise ManifestMissing(
             f"index at {corpus} has no manifest -- cannot verify which "

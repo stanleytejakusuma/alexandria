@@ -121,16 +121,26 @@ def test_a_rebuild_and_a_concurrent_promote_no_longer_race_the_promote_defers_in
                           "Racy fact that must not be silently lost by a concurrent rebuild.")
     config, embedder, store, lexical = _engine_pieces(corpus)
 
+    # #30 P2a: the rebuild no longer calls lexical.drop() -- it stages a
+    # fresh release instead. The synchronization point is now the FIRST
+    # write into the staged release (write_manifest inside the candidate
+    # directory), which is inside cmd_index's write-lock critical section --
+    # the property under test is unchanged: a concurrent promote must defer.
+    from alexandria import cli as cli_mod
+
     reached_drop = threading.Event()
     go_ahead = threading.Event()
-    original_drop = BM25Index.drop
+    original_write = cli_mod.write_manifest
 
-    def paused_drop(self):
-        reached_drop.set()
-        assert go_ahead.wait(timeout=10), "test synchronization stalled waiting for go_ahead"
-        original_drop(self)
+    def paused_write(*args, **kwargs):
+        if "index_dir" in kwargs:  # only the rebuild's staged write pauses
+            reached_drop.set()
+            assert go_ahead.wait(timeout=10), "test synchronization stalled waiting for go_ahead"
+        return original_write(*args, **kwargs)
 
-    monkeypatch.setattr(BM25Index, "drop", paused_drop)
+    # patch the name cli.py actually CALLS (bound at import time into its own
+    # namespace), not the module attribute -- the classic import-binding trap
+    monkeypatch.setattr(cli_mod, "write_manifest", paused_write)
 
     index_result: list[int] = []
 
@@ -140,7 +150,7 @@ def test_a_rebuild_and_a_concurrent_promote_no_longer_race_the_promote_defers_in
     thread = threading.Thread(target=run_rebuild)
     thread.start()
     try:
-        assert reached_drop.wait(timeout=15), "rebuild never reached lexical.drop() -- lock wiring changed?"
+        assert reached_drop.wait(timeout=15), "rebuild never reached its staged write -- lock wiring changed?"
 
         # The dangerous window: reached exactly where the old code would have
         # let a concurrent promote's FTS insert land before the drop wipes it.

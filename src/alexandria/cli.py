@@ -53,6 +53,9 @@ from .index.chunker import (
 from .index.embedder import CachedEmbedder, HashEmbedder, LocalEmbedder, MLXEmbedder
 from .index.manifest import (ManifestCorrupt, ManifestMismatch, ManifestMissing, verify_manifest,
                              verify_manifest_for_write, write_manifest)
+from .index.releases import (ActiveReleaseMissing, ReleaseCorrupt, activate_release,
+                              active_release_id, checksum_release, list_releases,
+                              new_release_dir, resolve_active_index_dir, verify_checksums)
 from .index.store import VectorStore
 from . import liveness
 from .backup import backup_state, restore_state
@@ -446,8 +449,15 @@ def cmd_promote(args) -> int:
     config = _config_for(args)
     corpus = config.corpus_path
     embedder = _cached_embedder(config, corpus)
-    store = VectorStore(corpus / ".alexandria" / "index")
-    lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+    # #30 P2a: write into whatever is CURRENTLY active, same resolution as
+    # every read -- once a release is active, a promoted fact must land
+    # where search actually looks, not the abandoned legacy path.
+    try:
+        index_dir = resolve_active_index_dir(corpus)
+    except (ActiveReleaseMissing, ReleaseCorrupt) as exc:
+        raise SystemExit(f"alexandria: {exc}") from exc
+    store = VectorStore(index_dir)
+    lexical = BM25Index(index_dir / "fts.sqlite")
     try:
         result = promote_pending(corpus, config, embedder, store, lexical)
     except ManifestMissing as exc:
@@ -638,8 +648,14 @@ def cmd_delete(args) -> int:
         return 1
     updated = 0
     try:
-        store = VectorStore(corpus / ".alexandria" / "index")
-        lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
+        # #30 P2a: same active-index resolution as promote/index -- a
+        # tombstone must land where search actually looks.
+        try:
+            index_dir = resolve_active_index_dir(corpus)
+        except (ActiveReleaseMissing, ReleaseCorrupt) as exc:
+            raise SystemExit(f"alexandria: {exc}") from exc
+        store = VectorStore(index_dir)
+        lexical = BM25Index(index_dir / "fts.sqlite")
         # Dense first. If the dense flip commits and the lexical flip then
         # fails, the dense record's deleted='true' is still enforced at
         # hydration in search.py, so a stale lexical candidate cannot surface
@@ -718,9 +734,15 @@ def _guarded_write_embedder(config: AppConfig, corpus: Path) -> CachedEmbedder:
     vectors into the existing column and then rewrites the manifest to match,
     after which the read-path guard passes forever over a mixed vector space."""
     embedder = _cached_embedder(config, corpus)
+    # #30 P2a: guard the index this write will ACTUALLY land in (the active
+    # release once one exists), not always the legacy path.
+    try:
+        index_dir = resolve_active_index_dir(corpus)
+    except (ActiveReleaseMissing, ReleaseCorrupt) as exc:
+        raise SystemExit(f"alexandria: {exc}") from exc
     try:
         verify_manifest_for_write(corpus, embedder, config.embed_provider,
-                                  VectorStore(corpus / ".alexandria" / "index"))
+                                  VectorStore(index_dir))
     except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
         raise SystemExit(f"alexandria: {exc}") from exc
     return embedder
@@ -762,13 +784,61 @@ def cmd_index(args) -> int:
 
 def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
     """The body of `index`, run while BACKLOG #50's write lock is held."""
+    if getattr(args, "list_releases", False):
+        releases = list_releases(corpus)
+        if not releases:
+            print("index: no releases staged yet (corpus uses the legacy layout)")
+            return 0
+        for r in releases:
+            marker = "ACTIVE" if r["active"] else ""
+            print(f"{r['release_id']}  {marker}")
+        return 0
+
+    if getattr(args, "rollback", False):
+        releases = list_releases(corpus)
+        active_id = active_release_id(corpus)
+        # list_releases returns ids sorted (YYYYMMDDTHHMMSS-<uuid8>), so the
+        # most recent NON-active release is simply the last one that is not
+        # the current active id.
+        prior = [r["release_id"] for r in releases if r["release_id"] != active_id]
+        if not prior:
+            print("index: no previous release to roll back to", file=sys.stderr)
+            return 1
+        target = prior[-1]
+        activate_release(corpus, target)
+        print(f"index: rolled back to release {target}")
+        return 0
+
+    if getattr(args, "gc", False):
+        from pathlib import Path as _P
+        import shutil as _shutil
+        releases = list_releases(corpus)
+        active_id = active_release_id(corpus)
+        keep = set()
+        if active_id:
+            keep.add(active_id)
+            prior = [r["release_id"] for r in releases if r["release_id"] != active_id]
+            if prior:
+                keep.add(prior[-1])  # the most recent non-active release
+        removed = 0
+        for r in releases:
+            if r["release_id"] not in keep:
+                _shutil.rmtree(_P(corpus) / ".alexandria" / "index" / "releases" / r["release_id"])
+                removed += 1
+        print(f"index: gc removed {removed} release(s); keeping {sorted(keep)}")
+        return 0
+
     if getattr(args, "backfill_manifest", False):
         # A pre-policy manifest cannot establish that every persisted vector
         # crossed CachedEmbedder's L2 boundary. Never relabel non-empty legacy
         # storage as l2 by operator assertion: rebuild is the only safe migration.
         # Empty storage has no vector representation to attest, so it may receive
         # an initial manifest for a new writer.
-        store = VectorStore(corpus / ".alexandria" / "index")
+        try:
+            index_dir = resolve_active_index_dir(corpus)
+        except (ActiveReleaseMissing, ReleaseCorrupt) as exc:
+            raise SystemExit(f"alexandria: {exc}") from exc
+        store = VectorStore(index_dir)
         if store.count() != 0:
             raise SystemExit(
                 "alexandria: refusing to backfill normalization policy over a non-empty "
@@ -776,7 +846,8 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
                 "Rebuild explicitly: alexandria --corpus "
                 f"{corpus} index --rebuild")
         embedder = _cached_embedder(config, corpus)
-        manifest = write_manifest(corpus, embedder, config.embed_provider)
+        manifest = write_manifest(corpus, embedder, config.embed_provider,
+                                  index_dir=index_dir if active_release_id(corpus) else None)
         print(f"index: manifest backfilled -> provider={manifest['provider']} "
               f"model={manifest['model']} dim={manifest['dim']} "
               f"normalized={manifest['normalized']} dtype={manifest['dtype']}")
@@ -785,7 +856,11 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
     if getattr(args, "backfill_meta", False):
         from .index.chunker import backfill_meta
         from .index.store import VectorStore as _VS
-        store = _VS(corpus / ".alexandria" / "index")
+        try:
+            index_dir = resolve_active_index_dir(corpus)
+        except (ActiveReleaseMissing, ReleaseCorrupt) as exc:
+            raise SystemExit(f"alexandria: {exc}") from exc
+        store = _VS(index_dir)
         stats = backfill_meta(corpus, store, config)
         gen = write_index_generation(corpus)
         print(f"index: backfilled meta on {stats.chunks} chunks across {stats.docs} docs "
@@ -844,24 +919,24 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
             store=store, recipe=recipe, limit=args.enrich_limit,
             workers=args.enrich_workers, progress_every=100)
         print(f"enrich: {estats}")
-    store = VectorStore(corpus / ".alexandria" / "index")
-    lexical = BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite")
     if args.rebuild:
-        # SPEC C6: --rebuild drops the table, so from here until the pipeline
-        # finishes the index is partial. The marker makes that state visible to
-        # anything that measures the index; it is deliberately NOT removed on
-        # failure, because a crashed rebuild leaves exactly the partial index
-        # the marker is warning about.
-        marker = _rebuild_marker(corpus)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(
-            f"rebuild of {len(records)} chunks started "
-            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} (pid {os.getpid()})\n")
-        store.drop()
-        lexical.drop()
-        # store.append() cannot deduplicate the way merge_insert does, so the
-        # uniqueness it assumes is verified once here rather than trusted. Checking
-        # per batch would miss a collision that spans two batches.
+        # #30 P2a: build a COMPLETE new release beside whatever is currently
+        # active, validate it, then atomically publish one pointer. A crash
+        # or failure at any point before activate_release() leaves the OLD
+        # release serving, untouched -- see docs/DECISION-staged-releases-p2a.md.
+        # This replaces the old drop-in-place behavior (store.drop() +
+        # lexical.drop() before refilling), which destroyed the only index
+        # copy the instant a rebuild started.
+        release_dir = new_release_dir(corpus)
+        release_dir.mkdir(parents=True)
+        store = VectorStore(release_dir)
+        lexical = BM25Index(release_dir / "fts.sqlite")
+        # append_only is safe here: release_dir is BRAND NEW and empty by
+        # construction (never reused -- new_release_dir() guarantees a fresh
+        # path), so every id is new by definition. The duplicate check still
+        # runs because a bug in _load_chunk_records producing two rows for
+        # one chunk_id is a real, distinct failure append_only would silently
+        # multiply, not a property of reusing storage.
         ids = [record["chunk_id"] for record in records]
         if len(ids) != len(set(ids)):
             from collections import Counter
@@ -869,13 +944,45 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
             raise ValueError(
                 "rebuild set contains duplicate chunk_id(s); append would insert "
                 f"every copy: {dupes}")
+        started = time.monotonic()
+        stats = _run_index_pipeline(records, embedder, store, lexical,
+                                    batch_size=config.embed_batch_size,
+                                    progress_every=config.index_progress_every,
+                                    progress_stream=sys.stdout,
+                                    write_batch=config.index_write_batch,
+                                    append_only=True)
+        elapsed = time.monotonic() - started
+        print(f"index: {len(records)} chunks from {len({record['doc_id'] for record in records})} documents "
+              f"in {elapsed:.2f}s (cache {stats.cache_hits} hit/"
+              f"{stats.cache_misses} miss)")
+        write_manifest(corpus, embedder, config.embed_provider, index_dir=release_dir)
+        checksum_release(release_dir)
+        verify_checksums(release_dir)  # fail loudly on our own write, before anyone can read it
+        activate_release(corpus, release_dir.name)
+        gen = write_index_generation(corpus)
+        print(f"index: staged release {release_dir.name} activated; "
+              f"corpus generation {gen} (query/response caches invalidated)")
+        liveness.record_success(corpus, promoted_count=0, generation=gen)
+        return 0
+
+    # Incremental path (no --rebuild): write into whatever is CURRENTLY
+    # active -- the legacy layout before any release exists, or the active
+    # release once one does. This must resolve the SAME way reads do, or a
+    # fact indexed after a staged rebuild would silently land somewhere no
+    # reader ever looks.
+    try:
+        index_dir = resolve_active_index_dir(corpus)
+    except (ActiveReleaseMissing, ReleaseCorrupt) as exc:
+        raise SystemExit(f"alexandria: {exc}") from exc
+    store = VectorStore(index_dir)
+    lexical = BM25Index(index_dir / "fts.sqlite")
     started = time.monotonic()
     stats = _run_index_pipeline(records, embedder, store, lexical,
                                 batch_size=config.embed_batch_size,
                                 progress_every=config.index_progress_every,
                                 progress_stream=sys.stdout,
                                 write_batch=config.index_write_batch,
-                                append_only=args.rebuild)
+                                append_only=False)
     elapsed = time.monotonic() - started
     print(f"index: {len(records)} chunks from {len({record['doc_id'] for record in records})} documents "
           f"in {elapsed:.2f}s (cache {stats.cache_hits} hit/"
@@ -884,10 +991,8 @@ def _cmd_index_locked(args, config: AppConfig, corpus: Path) -> int:
     # reindex invalidates stale query/response cache entries.
     gen = write_index_generation(corpus)
     print(f"index: corpus generation {gen} (query/response caches invalidated)")
-    write_manifest(corpus, embedder, config.embed_provider)
+    write_manifest(corpus, embedder, config.embed_provider, index_dir=index_dir if active_release_id(corpus) else None)
     liveness.record_success(corpus, promoted_count=0, generation=gen)
-    if args.rebuild:
-        _rebuild_marker(corpus).unlink(missing_ok=True)
     return 0
 
 
@@ -1461,7 +1566,10 @@ def _require_index(corpus: Path) -> None:
     a confident false negative rather than a loud failure. Checked here because
     this is the single chokepoint for search, answer, and eval.
     """
-    index_dir = corpus / ".alexandria" / "index"
+    try:
+        index_dir = resolve_active_index_dir(corpus)
+    except (ActiveReleaseMissing, ReleaseCorrupt) as exc:
+        raise SystemExit(f"alexandria: {exc}") from exc
     if (index_dir / "chunks.lance").exists() or (index_dir / "fallback.sqlite").exists():
         return
     raise SystemExit(
@@ -1505,14 +1613,23 @@ def _build_search_engine_unlocked(config: AppConfig, corpus: Path, query_cache: 
     if live.stale:
         print(f"alexandria: stale -- {live.reason}", file=sys.stderr)
     embedder = _cached_embedder(config, corpus, read_only=embedding_cache_read_only)
+    # #30 P2a: resolved ONCE, used for every store construction below, so a
+    # concurrent activation cannot land mid-construction and mix legs from
+    # two different releases -- the read-side half of "one pointer, one
+    # source of truth" (the write side stages a COMPLETE release before this
+    # function ever sees it).
     try:
-        verify_manifest(corpus, embedder, config.embed_provider)
+        index_dir = resolve_active_index_dir(corpus)
+    except (ActiveReleaseMissing, ReleaseCorrupt) as exc:
+        raise SystemExit(f"alexandria: {exc}") from exc
+    try:
+        verify_manifest(corpus, embedder, config.embed_provider, index_dir=index_dir)
     except (ManifestMissing, ManifestMismatch, ManifestCorrupt) as exc:
         raise SystemExit(f"alexandria: {exc}") from exc
     return SearchEngine(
         embedder,
-        VectorStore(corpus / ".alexandria" / "index"),
-        BM25Index(corpus / ".alexandria" / "index" / "fts.sqlite"),
+        VectorStore(index_dir),
+        BM25Index(index_dir / "fts.sqlite"),
         CrossEncoderReranker(config.rerank_model),
         SearchConfig(prefetch=config.rerank_prefetch, top_k=config.rerank_top_k,
                      wiki_boost=config.wiki_boost, rrf_k=config.rrf_k),
@@ -1704,6 +1821,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="annotate already-indexed chunks with meta (page anchors, "
                             "asset pointers) by re-running the chunker and updating only "
                             "the meta column; never re-embeds (#52)")
+    index.add_argument("--list-releases", action="store_true",
+                       help="list every staged release and which is active (#30 P2a)")
+    index.add_argument("--rollback", action="store_true",
+                       help="repoint the active pointer to the PREVIOUS release "
+                            "(no file copy; the previous release is always retained) "
+                            "(#30 P2a)")
+    index.add_argument("--gc", action="store_true",
+                       help="delete all but the active + immediately previous "
+                            "release; never deletes active or previous (#30 P2a)")
     index.add_argument("--limit", type=int, default=0, help="maximum documents to index")
     index.add_argument("--workers", type=int, default=1, help="parallel document chunking workers")
     index.add_argument("--enrich", action="store_true",

@@ -124,7 +124,12 @@ def test_rebuild_is_the_escape_hatch_when_the_manifest_mismatches(tmp_path, monk
     manifest_path.write_text(json.dumps(manifest))
 
     assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
-    assert read_manifest(corpus)["provider"] == "hash"
+    # #30 P2a: the rebuild stages a NEW release, so the manifest to inspect
+    # is the ACTIVE release's, not the legacy path (which still carries the
+    # tampered value until the legacy layout is retired).
+    from alexandria.index.releases import resolve_active_index_dir
+    assert read_manifest(corpus,
+                         index_dir=resolve_active_index_dir(corpus))["provider"] == "hash"
 
 
 def test_index_allows_a_fresh_corpus_that_has_no_manifest_yet(tmp_path, monkeypatch):

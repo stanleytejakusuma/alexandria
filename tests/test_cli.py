@@ -563,3 +563,257 @@ def test_every_production_search_engine_is_built_with_a_corpus_root(tmp_path):
     assert any(kw.arg == "corpus_root" for kw in calls[0].keywords), (
         "the production engine builder stopped passing corpus_root -- every "
         "search built through it would silently bypass the reader fence")
+
+
+def test_build_search_engine_reads_from_an_activated_release_not_the_legacy_path(tmp_path, monkeypatch):
+    """#30 P2a: once a release is activated, search/answer/eval must read
+    FROM that release directory -- not from the legacy flat layout, which
+    stays whatever it last was (possibly stale, possibly absent)."""
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    from alexandria.index.chunker import chunk_doc_records
+    from alexandria.index.releases import activate_release, new_release_dir
+    from alexandria.index.embedder import CachedEmbedder, HashEmbedder
+    from alexandria.index.manifest import write_manifest
+    from alexandria.index.store import VectorStore
+    from alexandria.index.bm25 import BM25Index
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    legacy_note = corpus / "sources" / "legacy.md"
+    legacy_note.parent.mkdir(parents=True)
+    legacy_note.write_text("---\nsource: test\n---\n\nlegacy layout content\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    # stage a SEPARATE release with DIFFERENT real content and activate it --
+    # the legacy chunks must become invisible, because the release is now the
+    # single source of truth (this is a real build, not a hand-faked empty one).
+    release_note = corpus / "sources" / "release_only.md"
+    release_note.write_text("---\nsource: test\n---\n\nrelease-only content\n")
+    from alexandria.config import AppConfig as _Cfg
+    records, _ = chunk_doc_records(release_note, corpus, _Cfg(corpus_path=corpus))
+
+    release_dir = new_release_dir(corpus)
+    embedder = CachedEmbedder(HashEmbedder(), corpus / ".alexandria" / "cache" / "embeddings.sqlite")
+    store = VectorStore(release_dir)
+    lexical = BM25Index(release_dir / "fts.sqlite")
+    for record in records:
+        record["vector"] = embedder.embed([record["text"]])[0]
+    store.upsert(records)
+    lexical.index(records)
+    write_manifest(corpus, embedder, "hash", index_dir=release_dir)
+    activate_release(corpus, release_dir.name)
+
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    engine = _build_search_engine(cfg, corpus)
+    hits = engine.search("release-only content")
+    assert hits, "must find content that is ONLY in the release"
+    doc_ids = {r.doc_id for r in engine.search("legacy layout content", k=10)}
+    assert "sources/legacy" not in doc_ids, (
+        "the legacy doc must be structurally unreachable once a release is "
+        "active -- it lives in a different store entirely, not merely "
+        "outranked")
+
+
+def test_build_search_engine_still_reads_the_legacy_path_when_no_release_is_active(tmp_path, monkeypatch):
+    """The zero-migration guarantee: a corpus that never activated a release
+    keeps working exactly as before P2a."""
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nunmigrated corpus content\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    engine = _build_search_engine(cfg, corpus)
+    results = engine.search("unmigrated corpus content")
+    assert results, "a corpus with no active release must still search the legacy layout"
+
+
+# ---------------------------------------------------------------------------
+# #30 P2a: --rebuild stages a new release instead of dropping the live index
+# in place. See docs/DECISION-staged-releases-p2a.md.
+# ---------------------------------------------------------------------------
+
+def test_rebuild_activates_a_new_release_and_the_old_one_is_retained(tmp_path, monkeypatch):
+    from alexandria.index.releases import active_release_id, list_releases
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nfirst content\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    assert active_release_id(corpus) is None, "the FIRST index run stays on the legacy path"
+
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    first_release = active_release_id(corpus)
+    assert first_release is not None, "--rebuild must activate a release"
+
+    note.write_text("---\nsource: test\n---\n\nsecond content, rebuilt\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    second_release = active_release_id(corpus)
+    assert second_release != first_release
+
+    releases = {r["release_id"]: r["active"] for r in list_releases(corpus)}
+    assert releases[first_release] is False, "the previous release is retained, not deleted"
+    assert releases[second_release] is True
+
+
+def test_rebuild_result_is_searchable_and_reflects_the_new_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\noriginal rebuild content\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    engine = _build_search_engine(cfg, corpus)
+    assert engine.search("original rebuild content")
+
+
+def test_a_failed_rebuild_leaves_the_previously_active_release_serving(tmp_path, monkeypatch):
+    """The whole point of P2a: a crash mid-rebuild must not destroy or
+    corrupt the index that is currently serving."""
+    from alexandria.index.releases import active_release_id
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nstable content\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    stable_release = active_release_id(corpus)
+
+    # simulate a mid-rebuild crash: patch the pipeline to blow up AFTER the
+    # candidate store has real data written but BEFORE activation
+    import alexandria.cli as cli_mod
+    original = cli_mod._run_index_pipeline
+
+    def exploding_pipeline(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("simulated crash mid-rebuild")
+
+    monkeypatch.setattr(cli_mod, "_run_index_pipeline", exploding_pipeline)
+    note.write_text("---\nsource: test\n---\n\nnever-activated content\n")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        app(["--corpus", str(corpus), "index", "--rebuild"])
+
+    assert active_release_id(corpus) == stable_release, (
+        "a crash before activation must leave the OLD release active")
+
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    engine = _build_search_engine(cfg, corpus)
+    assert engine.search("stable content"), "the pre-crash content must still be servable"
+
+
+def test_incremental_writes_after_a_rebuild_land_in_the_active_release(tmp_path, monkeypatch):
+    """Once a release is active, cmd_promote/cmd_delete and a plain (non
+    --rebuild) `alexandria index` must write INTO that release, never the
+    abandoned legacy path -- otherwise a fact remembered after the first
+    staged rebuild would be silently unsearchable."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nfirst\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+
+    note2 = corpus / "sources" / "note2.md"
+    note2.write_text("---\nsource: test\n---\n\nsecond, added incrementally\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0  # no --rebuild
+
+    from alexandria.cli import _build_search_engine
+    from alexandria.config import AppConfig
+    cfg = AppConfig(corpus_path=corpus, embed_provider="hash")
+    engine = _build_search_engine(cfg, corpus)
+    assert engine.search("second, added incrementally")
+
+
+# ---------------------------------------------------------------------------
+# #30 P2a: retention / rollback / inspection CLI surface.
+# ---------------------------------------------------------------------------
+
+def test_index_list_releases_shows_active_and_inactive_releases(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nfirst\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    note.write_text("---\nsource: test\n---\n\nsecond\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+
+    rc = app(["--corpus", str(corpus), "index", "--list-releases"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "active" in out.lower()
+
+
+def test_index_rollback_reactivates_the_previous_release(tmp_path, monkeypatch):
+    from alexandria.index.releases import active_release_id, list_releases
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nzebra migration protocol\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    first = active_release_id(corpus)
+
+    note.write_text("---\nsource: test\n---\n\nkangaroo encryption key rotation\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    second = active_release_id(corpus)
+    assert second != first
+
+    assert app(["--corpus", str(corpus), "index", "--rollback"]) == 0
+    assert active_release_id(corpus) == first, "rollback must reactivate the prior release"
+
+    # Verify by the release's actual contents, not by search semantics on a
+    # one-document corpus (a 1-doc index always returns that doc for any
+    # query, so "search returns nothing" is the wrong instrument).
+    from alexandria.index.store import VectorStore as _VS
+    from alexandria.index.releases import resolve_active_index_dir
+    from alexandria.index.bm25 import BM25Index as _BM25
+    active_dir = resolve_active_index_dir(corpus)
+    store = _VS(active_dir)
+    rows = store.get_many(list(store.chunk_ids()))
+    texts = [r["text"] for r in rows.values()]
+    assert any("zebra" in t2 for t2 in texts), "the OLD content must be servable after rollback"
+    assert not any("kangaroo" in t2 for t2 in texts), (
+        "the rolled-back release must not contain the newer content")
+
+
+def test_index_gc_removes_old_releases_but_keeps_active_and_previous(tmp_path, monkeypatch, capsys):
+    from alexandria.index.releases import active_release_id, list_releases
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    note = corpus / "sources" / "note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nsource: test\n---\n\nfirst\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    note.write_text("---\nsource: test\n---\n\nsecond\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    note.write_text("---\nsource: test\n---\n\nthird\n")
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+
+    before = {r["release_id"] for r in list_releases(corpus)}
+    assert len(before) == 3
+
+    rc = app(["--corpus", str(corpus), "index", "--gc"])
+    assert rc == 0
+    after = list_releases(corpus)
+    ids = {r["release_id"] for r in after}
+    assert len(ids) == 2, f"GC should retain active + previous, got {ids}"
+    assert active_release_id(corpus) in ids
+    assert any(r["active"] for r in after)

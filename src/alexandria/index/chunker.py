@@ -160,7 +160,7 @@ def _split_long_token(token: str, max_tokens: int) -> list[str]:
 
 
 def _raw_paragraphs(text: str) -> list[tuple[str, str]]:
-    """Split on blank lines keeping the separators, WITHOUT stripping.
+    r"""Split on blank lines keeping the separators, WITHOUT stripping.
 
     Returns (token, separator) pairs where separator is the whitespace run
     BETWEEN tokens (possibly empty for the first token). Two properties make
@@ -545,14 +545,19 @@ def backfill_meta(corpus: Path, store: "VectorStore", config: AppConfig) -> Back
       meta column.
     """
     stats = BackfillStats()
-    store_path = corpus / ".alexandria" / "index"
+    # #30 P2a: the CORRECT index dir is wherever resolve_active_index_dir
+    # says it is -- the active release once one exists, the legacy path
+    # otherwise -- never a hardcoded literal that would drift out of sync
+    # the moment a corpus adopts staged releases.
+    from .releases import resolve_active_index_dir
+    store_path = resolve_active_index_dir(corpus)
     if Path(store_path).resolve() != Path(store.path).resolve():
         # A mismatched store is a caller bug (a test or script pointing at a
         # different index than the corpus it asked to annotate); silently
         # re-opening would write to an index the caller never inspected.
         raise ValueError(
-            f"backfill store path {store.path} does not match corpus index "
-            f"{store_path}; refusing to annotate the wrong index")
+            f"backfill store path {store.path} does not match the active "
+            f"index {store_path}; refusing to annotate the wrong index")
     existing = set(store.chunk_ids())
     meta_by_chunk: dict[str, dict] = {}
     new_ids: set[str] = set()

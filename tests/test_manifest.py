@@ -340,3 +340,56 @@ def test_verify_manifest_refuses_a_provider_mismatch_WITHOUT_loading_the_provide
     with pytest.raises(ManifestMismatch, match="provider"):
         verify_manifest(tmp_path, NeverLoads(), "mlx")
     assert NeverLoads.embed_called is False
+
+
+# ---------------------------------------------------------------------------
+# #30 P2a: an explicit index_dir override, additive to every existing call --
+# lets a staged release carry its own manifest.json independent of the
+# legacy `.alexandria/index/` path, without changing any existing caller's
+# signature or behavior (index_dir defaults to None, deriving the path from
+# corpus exactly as before).
+# ---------------------------------------------------------------------------
+
+def test_write_manifest_with_an_explicit_index_dir_does_not_touch_the_legacy_path(tmp_path):
+    release_dir = tmp_path / "releases" / "r1"
+    write_manifest(tmp_path, _hash_embedder(tmp_path), "hash", index_dir=release_dir)
+
+    assert (release_dir / "manifest.json").exists()
+    legacy = tmp_path / ".alexandria" / "index" / "manifest.json"
+    assert not legacy.exists(), "an index_dir override must never write the legacy path"
+
+
+def test_read_manifest_with_an_explicit_index_dir_reads_only_that_release(tmp_path):
+    release_a = tmp_path / "releases" / "a"
+    release_b = tmp_path / "releases" / "b"
+    write_manifest(tmp_path, _hash_embedder(tmp_path, dim=8), "hash", index_dir=release_a)
+    write_manifest(tmp_path, _hash_embedder(tmp_path, dim=16), "hash", index_dir=release_b)
+
+    assert read_manifest(tmp_path, index_dir=release_a)["dim"] == 8
+    assert read_manifest(tmp_path, index_dir=release_b)["dim"] == 16
+    # the legacy (no-override) path was never written by either call
+    assert read_manifest(tmp_path) is None
+
+
+def test_verify_manifest_with_an_explicit_index_dir_checks_that_release_only(tmp_path):
+    release_dir = tmp_path / "releases" / "r1"
+    embedder = _hash_embedder(tmp_path)
+    write_manifest(tmp_path, embedder, "hash", index_dir=release_dir)
+
+    # passes against the release it matches
+    verify_manifest(tmp_path, embedder, "hash", index_dir=release_dir)
+    # refuses against the legacy path, where nothing was ever written
+    with pytest.raises(ManifestMissing):
+        verify_manifest(tmp_path, embedder, "hash")
+
+
+def test_existing_callers_with_no_index_dir_argument_are_unaffected(tmp_path):
+    """The additive contract: every one of the 7 existing call sites (cli.py,
+    promote.py) passes no index_dir and must see IDENTICAL behavior to before
+    this change -- this is the seam-pattern discipline (a strict superset,
+    never a silent behavior change to the untouched path)."""
+    written = write_manifest(tmp_path, _hash_embedder(tmp_path), "hash")
+    on_disk = read_manifest(tmp_path)
+    assert on_disk == written
+    legacy = tmp_path / ".alexandria" / "index" / "manifest.json"
+    assert legacy.exists()
