@@ -281,6 +281,13 @@ def test_s3_the_model_loads_exactly_once_across_many_requests(tmp_path, monkeypa
     # assertion is unchanged and now covers strictly more -- exactly one
     # model across startup AND five requests, not across five requests alone.
     rerank_mod._MODEL_CACHE.clear()
+    # #44 shared cooldown (model_load._state/_in_flight): a stale failure or
+    # success entry from an earlier test in this same process would make the
+    # reranker either fail-fast (never constructing -- undercounting) or,
+    # once stale, re-attempt on EVERY request (overcounting). A clean cold
+    # assertion must clear ALL of the load caches, not just _MODEL_CACHE.
+    from alexandria.model_load import clear_failure_cache
+    clear_failure_cache()
 
     load_count = 0
     original_ctor = sentence_transformers.CrossEncoder

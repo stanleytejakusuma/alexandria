@@ -170,10 +170,30 @@ def _find_companion(corpus: Path, digest: str) -> Path | None:
     # 8-wide name made widened companions invisible, so every re-ingest
     # re-extracted and allocated ANOTHER name -- duplicates asserting one
     # identity, then a hard failure once the widths ran out.
-    for candidate in sorted(companion_dir.glob(f"*-{digest[:8]}*.md")):
-        if _companion_claims(candidate, digest):
-            return candidate
-    return None
+    matches = _find_companions(corpus, digest)
+    return matches[0] if matches else None
+
+
+def _find_companions(corpus: Path, digest: str) -> list[Path]:
+    """EVERY companion that claims these exact bytes, in sorted order.
+
+    ``_find_companion`` returns the first (fine for the ingest no-op path,
+    where any matching companion is correct because the bytes are identical).
+    ``refresh_ingest`` uses THIS plural form and refuses on ambiguity: with
+    two companions claiming one digest, choosing either one would silently
+    fork the memory (Red review, 2026-08-20).
+    """
+    companion_dir = corpus / COMPANION_ROOT
+    if not companion_dir.is_dir():
+        return []
+    # Match every width the allocator can emit (8/12/16/64). They all share the
+    # 8-char prefix, so a prefix-anywhere pattern finds them; the full-sha
+    # confirmation below makes stray glob hits harmless. Globbing only the
+    # 8-wide name made widened companions invisible, so every re-ingest
+    # re-extracted and allocated ANOTHER name -- duplicates asserting one
+    # identity, then a hard failure once the widths ran out.
+    return [candidate for candidate in sorted(companion_dir.glob(f"*-{digest[:8]}*.md"))
+            if _companion_claims(candidate, digest)]
 
 
 def _free_companion_path(corpus: Path, stem: str, digest: str) -> str:
@@ -206,6 +226,11 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+def _sha256_bytes(data: bytes) -> str:
+    """Digest of bytes already in memory (no re-read of a path that could
+    have changed -- the TOCTOU guard in refresh_ingest's re-extract mode)."""
+    return hashlib.sha256(data).hexdigest()
 
 
 def _extract_pdf_text(path: Path) -> str:
@@ -443,8 +468,9 @@ def ingest_path(
                         extraction=extraction, sha256=digest)
 
 
-def refresh_ingest(corpus: str | Path, asset: str | Path, *, describe_image=None) -> IngestResult:
-    """Re-extract and rewrite an ALREADY-ingested artifact's companion.
+def refresh_ingest(corpus: str | Path, asset: str | Path, *, describe_image=None,
+                  re_extract: bool = False) -> IngestResult:
+    """Update an ALREADY-ingested artifact's companion.
 
     The default ingest path is a stable, content-addressed no-op BY DESIGN
     (see ingest_path's docstring): re-encountering known bytes never
@@ -455,10 +481,23 @@ def refresh_ingest(corpus: str | Path, asset: str | Path, *, describe_image=None
     is the explicit escape hatch, opt-in only, never called by ingest_path or
     a directory/glob sweep.
 
-    Refuses if the asset's bytes no longer match the sha256 the companion
-    asserts: re-extracting corrupted bytes into a companion that still claims
-    the OLD sha256 would silently launder the corruption into the record
-    that's supposed to catch it.
+    DEFAULT (re_extract=False): METADATA-ONLY. Updates only system-owned
+    provenance fields (extraction, pages, generated.at) and preserves the
+    companion BODY verbatim -- including any operator edits to it. This is
+    the safe operation the motivating use case (backfilling `pages`) needs.
+    (Red review, 2026-08-20: a loud warning is not a safeguard; the default
+    refresh must never destroy the exact state the normal ingest path
+    protects.)
+
+    re_extract=True: the destructive full regeneration. Re-runs the
+    extractor and rewrites the entire companion body. Only for cases where
+    regeneration is genuinely wanted (a better vision model, previously
+    failed extraction) -- and still loud about it.
+
+    Both modes refuse if the asset's bytes no longer match the sha256 the
+    companion asserts: re-extracting corrupted bytes into a companion that
+    still claims the OLD sha256 would silently launder the corruption into
+    the record that's supposed to catch it.
     """
     corpus = Path(corpus).expanduser()
     asset_abs = Path(asset)
@@ -474,12 +513,21 @@ def refresh_ingest(corpus: str | Path, asset: str | Path, *, describe_image=None
     # it as an unrelated, never-ingested file. Find the companion by the
     # asserted digest, then verify the CURRENT bytes still match it.
     asserted_digest = asset_abs.stem
-    companion = _find_companion(corpus, asserted_digest)
-    if companion is None:
+    companions = _find_companions(corpus, asserted_digest)
+    if not companions:
         raise ExtractionFailed(
             f"{asset_abs.name}: no companion claims these bytes -- refresh "
             f"only rewrites an EXISTING memory, it does not create one "
             f"(use `alexandria ingest` for that)")
+    if len(companions) > 1:
+        # Red review, 2026-08-20: with two companions claiming one digest,
+        # choosing either would silently fork the memory. The at-rest lint
+        # flags this state for repair; refresh refuses to operate in it.
+        raise ExtractionFailed(
+            f"{asset_abs.name}: {len(companions)} companions claim these bytes "
+            f"({', '.join(c.name for c in companions)}) -- this is a duplicate "
+            f"state the at-rest lint flags; resolve it before refreshing")
+    companion = companions[0]
 
     actual_digest = _sha256(asset_abs)
     if actual_digest != asserted_digest:
@@ -497,21 +545,51 @@ def refresh_ingest(corpus: str | Path, asset: str | Path, *, describe_image=None
     suffix = asset_abs.suffix.lower()
     if suffix in PDF_SUFFIXES:
         extraction = "pdftotext"
-        text = _extract_pdf_text(asset_abs)
     elif suffix in IMAGE_SUFFIXES:
         extraction = "vision"
-        describe = describe_image or _describe_image_via_gateway
-        text = (describe(asset_abs) or "").strip()
     else:
         raise UnsupportedArtifact(
             f"{asset_abs.name}: no extraction route for {suffix or 'files without a suffix'}")
-    if not text:
-        raise ExtractionFailed(
-            f"{asset_abs.name}: refresh produced no text; refusing to "
-            f"overwrite a memory with an empty one")
 
-    print(f"ingest: refresh is OVERWRITING the stored memory at {companion.name} "
-          f"({companion.relative_to(corpus)})")
+    if re_extract:
+        # DESTRUCTIVE MODE (explicit): full body regeneration.
+        # TOCTOU guard (Red review, 2026-08-20): the asset bytes were verified
+        # above, but the extractor re-opens a path -- if the asset mutated
+        # between verification and extraction, the extractor could consume
+        # DIFFERENT bytes than the ones verified. Snapshot the verified bytes
+        # to a private temp file, verify THAT copy, and extract from it: the
+        # extractor then reads exactly the verified bytes, immune to
+        # concurrent mutation of the original. (pdftotext needs a real file;
+        # a vision model could take bytes, but keeping ONE extractor path for
+        # both is simpler and the snapshot is equally correct for each.)
+        import tempfile as _tf
+        verified_bytes = asset_abs.read_bytes()
+        if _sha256_bytes(verified_bytes) != digest:
+            raise ExtractionFailed(
+                f"{asset_abs.name}: asset changed between verification and "
+                f"snapshot; refusing to extract from unverified bytes")
+        with _tf.NamedTemporaryFile(suffix=asset_abs.suffix, delete=False) as snap:
+            snap.write(verified_bytes)
+            snap_path = Path(snap.name)
+        try:
+            if extraction == "pdftotext":
+                text = _extract_pdf_text(snap_path)
+            else:
+                describe = describe_image or _describe_image_via_gateway
+                text = (describe(snap_path) or "").strip()
+        finally:
+            snap_path.unlink(missing_ok=True)
+        if not text:
+            raise ExtractionFailed(
+                f"{asset_abs.name}: refresh produced no text; refusing to "
+                f"overwrite a memory with an empty one")
+        print(f"ingest: refresh is OVERWRITING the stored memory at {companion.name} "
+              f"({companion.relative_to(corpus)})")
+        body = text if text.endswith("\n") else text + "\n"
+    else:
+        # METADATA-ONLY (default): preserve the body VERBATIM, including any
+        # operator edits -- only system-owned provenance fields change.
+        body = doc.body
 
     provenance = dict(ingest_fm)
     provenance["extraction"] = extraction
@@ -529,8 +607,7 @@ def refresh_ingest(corpus: str | Path, asset: str | Path, *, describe_image=None
     generated["at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     new_fm["generated"] = generated
 
-    Doc(path=doc.path, frontmatter=new_fm,
-        body=text if text.endswith("\n") else text + "\n").write(corpus)
+    Doc(path=doc.path, frontmatter=new_fm, body=body).write(corpus)
 
     asset_rel = provenance.get("asset") or asset_abs.relative_to(corpus).as_posix()
     return IngestResult(asset_path=asset_rel, doc_path=doc.path,

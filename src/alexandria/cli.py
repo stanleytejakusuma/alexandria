@@ -115,11 +115,34 @@ def cmd_ingest(args) -> int:
     config = _config_for(args)
     corpus = config.corpus_path
 
+    # Every corpus MUTATION holds WriteLock exclusively -- that is the
+    # invariant IndexReadLock (used by lint and every reader) depends on to
+    # classify "writer active" vs "at rest" (Red review, 2026-08-20). Ingest
+    # is a writer; without the lock, `alexandria lint` running concurrently
+    # could see a mid-transaction .partial or an asset-before-companion
+    # moment and report a transient state as corruption.
+    lock = write_lock(corpus)
+    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+        holder = lock.holder_pid()
+        raise SystemExit(
+            f"alexandria: ingest could not acquire the corpus write lock within "
+            f"{DEFAULT_LOCK_TIMEOUT:.0f}s (held by {holder or 'an unknown process'}). "
+            f"Refusing to run a racing ingest -- retry after the current writer finishes.")
+    try:
+        return _cmd_ingest_locked(args, config, corpus)
+    finally:
+        lock.release()
+
+
+def _cmd_ingest_locked(args, config: AppConfig, corpus: Path) -> int:
+    """The body of `ingest`, run while the corpus write lock is held."""
+    from .ingest import ExtractionFailed, UnsupportedArtifact, ingest_path, refresh_ingest
+
     if getattr(args, "refresh", False):
         refreshed = failed = 0
         for raw in args.paths:
             try:
-                result = refresh_ingest(corpus, raw)
+                result = refresh_ingest(corpus, raw, re_extract=getattr(args, "re_extract", False))
             except (UnsupportedArtifact, ExtractionFailed) as exc:
                 print(f"ingest: refresh failed for {raw}: {exc}", file=sys.stderr)
                 failed += 1
@@ -196,6 +219,22 @@ def cmd_ingest(args) -> int:
 
 def cmd_lint(args) -> int:
     corpus = _config_for(args).corpus_path
+    # Lint is a READER: take the shared read lock so a concurrent writer
+    # (index, ingest, promote) cannot produce transient false positives --
+    # a mid-write .partial or an asset-before-companion moment (Red review,
+    # 2026-08-20). IndexReadLock is non-blocking with a short bounded retry,
+    # so a busy writer yields a clear "retry" instead of a wrong report.
+    try:
+        with index_read_lock(corpus):
+            return _cmd_lint_locked(args, corpus)
+    except IndexReadUnavailable as exc:
+        print(f"alexandria: lint deferred: {exc}", file=sys.stderr)
+        return 3
+
+
+def _cmd_lint_locked(args, corpus) -> int:
+    """The body of `lint`, run while the shared read lock is held (so the
+    scan sees a stable, at-rest corpus)."""
     errors = checked = 0
     for path in sorted(corpus.rglob("*.md")):
         rel = path.relative_to(corpus)
@@ -1832,10 +1871,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="file(s), directory, or glob to ingest (or, with "
                              "--refresh, asset path(s) to re-extract)")
     ingest.add_argument("--refresh", action="store_true",
-                        help="re-extract and OVERWRITE the companion for an "
-                             "ALREADY-ingested asset (#54); paths name assets, "
-                             "not source files. Opt-in only -- the default "
-                             "ingest path never rewrites a known memory.")
+                        help="update the companion for an ALREADY-ingested "
+                             "asset (#54); paths name assets, not source "
+                             "files. Opt-in only -- the default ingest path "
+                             "never rewrites a known memory.")
+    ingest.add_argument("--re-extract", action="store_true",
+                        help="with --refresh, DESTRUCTIVELY re-run the "
+                             "extractor and rewrite the companion BODY "
+                             "(operator edits are lost). Without this flag, "
+                             "--refresh is metadata-only: it backfills "
+                             "provenance fields like page count and preserves "
+                             "the body verbatim.")
     ingest.set_defaults(func=cmd_ingest)
 
     lint = sub.add_parser("lint", help="validate every document against the schema")
