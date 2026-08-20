@@ -1317,16 +1317,21 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
     cached_page = response_cache.get(rkey)
     if cached_page is not None:
         logger = AuditLogger(corpus)
-        # #9: a cache hit never re-runs retrieval or judging -- the citation
-        # linkage for THIS answer already exists in the original, non-cached
-        # answers.jsonl row (join key: response_cache stores no query_id of
-        # its own, matching the spec's existing rationale for keeping
-        # citations OUT of ResponseCache). No new citation record here.
+        # #9, Red review 2026-08-20 (finding #3): "linkage already exists in
+        # the original row" was an ASSERTED claim with no way to check it --
+        # the original answer may predate this feature (guaranteed for the
+        # first 7 days after deploy), its logger.answer() write may have
+        # failed, or answers.jsonl may have rotated. Store a REAL back-pointer
+        # instead of asserting one: the ORIGINAL answer_id that populated this
+        # cache entry, so a future learning loop can look up that row
+        # mechanically rather than trusting a comment. Requires cached_page to
+        # carry it (see the `put()` call below, which now stores it).
         logger.answer(query=question, total_ms=0, emitted=True,
                       model=llm_model, n_claims=cached_page.get("n_claims", 0),
                       stages={}, caller=caller, user=user,
-                      trace={"cache_hit": True}, id=answer_id,
-                      query_id=None, citations=[])
+                      trace={"cache_hit": True,
+                            "source_answer_id": cached_page.get("answer_id")},
+                      id=answer_id, query_id=None, citations=[])
         return AnswerOutcome(True, cached_page["text"], cached_page.get("n_claims", 0),
                              answer_id, cached=True)
 
@@ -1379,8 +1384,12 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
                       trace={"salvaged": True}, id=answer_id,
                       # #9: no judge ran, so no claim_verdict exists to record --
                       # citations must stay empty here, never fabricated from an
-                      # unaudited draft's raw (unverified) citation claims.
-                      query_id=getattr(engine, "last_query_id", None), citations=[])
+                      # unaudited draft's raw (unverified) citation claims. The
+                      # seed query_id IS known (gather always completes before
+                      # write/judge -- see pipeline.py's salvage branch), so it
+                      # is still recorded even with zero citations.
+                      query_id=getattr(getattr(result, "gathered", None), "seed_query_id", None),
+                      citations=[])
         return AnswerOutcome(False, draft.text, len(draft.claims), answer_id,
                              error="budget exhausted: unaudited draft",
                              salvaged=True)
@@ -1393,14 +1402,14 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
     # #9/C1: citations are built even on the NOT-emitted path -- a claim that
     # failed judging is a valuable NEGATIVE signal (requirement 4), and this
     # is the only point where the verdict that judged it is still available.
-    # query_id comes from the LAST search this engine ran (the seed retrieval
-    # inside gather() uses the same engine instance) -- None if no logger was
-    # configured, which _citation_records treats as "nothing to link", never
-    # an error.
+    # Red review 2026-08-20: query_id/rank/source_round now come from
+    # gathered.chunk_provenance, captured synchronously inside gather() at
+    # each search call -- never read from ambient engine state after the
+    # fact (the original design silently joined citations to the wrong
+    # QueryLogger row; see gather.py's ChunkProvenance docstring).
     gathered = getattr(result, "gathered", None)
-    citations = _citation_records(
-        getattr(engine, "last_query_id", None), gathered, verdict,
-        generated_by_round=_chunk_source_round(gathered))
+    citations = _citation_records(gathered, verdict)
+    seed_query_id = getattr(gathered, "seed_query_id", None)
     # COST LEDGER (SPEC F5): the writer client is the primary answer-generation
     # model and the one cost worth tracking without inventing multi-model
     # attribution the pipeline doesn't expose. Logged on BOTH outcomes below --
@@ -1413,7 +1422,7 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
                       error="synthesis failed its native checks",
                       stages=getattr(result, "timings_ms", {}),
                       caller=caller, user=user, trace=trace, id=answer_id,
-                      query_id=getattr(engine, "last_query_id", None), citations=citations)
+                      query_id=seed_query_id, citations=citations)
         return AnswerOutcome(False, None, n_claims, answer_id,
                              error="synthesis failed its native checks", failed_claims=failed_ids)
     page_text = result.page_path.read_text(encoding="utf-8")
@@ -1421,8 +1430,11 @@ def run_answer(config: AppConfig, corpus: Path, question: str, *, engine, k: int
                   model=llm_model, n_claims=n_claims,
                   stages=getattr(result, "timings_ms", {}),
                   caller=caller, user=user, trace=trace, id=answer_id,
-                  query_id=getattr(engine, "last_query_id", None), citations=citations)
-    response_cache.put(rkey, {"text": page_text, "n_claims": n_claims})
+                  query_id=seed_query_id, citations=citations)
+    # #9, Red review finding #3: store the real answer_id alongside the cache
+    # payload, so a later cache-hit's audit row can carry a genuine
+    # back-pointer instead of an asserted-but-unverifiable claim.
+    response_cache.put(rkey, {"text": page_text, "n_claims": n_claims, "answer_id": answer_id})
     if not save_path:
         shutil.rmtree(emit_root, ignore_errors=True)
     return AnswerOutcome(True, page_text, n_claims, answer_id)
@@ -1517,50 +1529,38 @@ def _answer_trace(result) -> dict:
     return trace
 
 
-def _chunk_source_round(gathered) -> dict[str, str]:
-    """#9/C1 requirement 5: chunk_id -> "round_one"/"round_two"/"seed", the
-    ONE place this information exists -- GatherResult keeps round_one/
-    round_two/chunks (the deduped union) as separate tuples, and nothing
-    downstream tags a chunk with which round found it. Must be computed HERE,
-    at citation-record build time, from the GatherResult the pipeline already
-    produced -- the spec's own framing ("unrecoverable later") means this
-    cannot be reconstructed after the fact from chunks/claims/verdicts alone.
-    A chunk in round_one keeps that label even if it also reappears in
-    round_two (first-seen wins, matching how `merged` builds `gathered.chunks`
-    itself: seed_chunks then round_one then round_two, first doc_id wins)."""
-    out: dict[str, str] = {}
-    for chunk in getattr(gathered, "round_one", ()) or ():
-        out.setdefault(chunk.chunk_id, "round_one")
-    for chunk in getattr(gathered, "round_two", ()) or ():
-        out.setdefault(chunk.chunk_id, "round_two")
-    return out
-
-
-def _citation_records(query_id: str | None, gathered, verdict, *, generated_by_round: dict) -> list[dict]:
+def _citation_records(gathered, verdict, *, schema_version: str = "citation-v2") -> list[dict]:
     """#9/C1: durable (query_id, claim_id, doc_id, chunk_id, rank, claim_verdict,
     source_round) tuples -- the actual precondition for the learning loop
-    (spec §C1). Built from `judge_page`'s VERDICT (per-claim entailment,
+    (spec section C1). Built from `judge_page`'s VERDICT (per-claim entailment,
     audit.Verdict.verdict in {supported, unsupported, fabricated}), not a
     was-cited boolean -- a chunk cited for a claim that later fails judging is
     a NEGATIVE relevance signal, and collapsing to a boolean would discard
     exactly what makes this better than click-through data (requirement 4).
 
-    `rank` is derived from `gathered.round_one`/`round_two` position (the
-    trace's own "rounds" list already does this the same way -- see
-    _answer_trace above) rather than re-instrumenting retrieval.
+    query_id/rank/source_round now come from `gathered.chunk_provenance`
+    (gather.py), captured SYNCHRONOUSLY at the moment each search ran -- Red
+    review 2026-08-20 found the original design (reading
+    SearchEngine.last_query_id from run_answer, AFTER the whole pipeline
+    completed) joined most citations to the wrong QueryLogger row, and could
+    cross-link a DIFFERENT request's id under serve's shared engine instance.
 
-    Returns [] when there is nothing to link (no gathered pool, no verdict,
-    or no query_id -- e.g. no QueryLogger configured) rather than raising:
-    citation linkage is a durable SIGNAL, not a correctness gate, and must
-    never be the reason an answer fails to emit."""
-    if query_id is None or gathered is None or verdict is None:
+    A citation whose chunk_id has NO provenance entry (Red finding #4: could
+    be a genuine seed_chunk, OR a writer-fabricated chunk_id that never came
+    from any search) gets query_id=None, rank=None, source_round="unknown" --
+    never silently labeled "seed", which would misattribute a hallucination
+    to the retrieval system. schema_version lets a future learning loop
+    exclude rows written under an earlier, since-corrected linkage scheme
+    (Red finding, blocking change 2).
+
+    Returns [] when there is nothing to link (no gathered pool, no verdict)
+    rather than raising: citation linkage is a durable SIGNAL, not a
+    correctness gate, and must never be the reason an answer fails to emit."""
+    if gathered is None or verdict is None:
         return []
     audit = getattr(verdict, "audit", None)
     verdicts_by_claim_id = {v.note_id: v.verdict for v in (getattr(audit, "verdicts", None) or ())}
-    rank_by_chunk_id: dict[str, int] = {}
-    for name in ("round_one", "round_two"):
-        for i, chunk in enumerate(getattr(gathered, name, ()) or (), start=1):
-            rank_by_chunk_id.setdefault(chunk.chunk_id, i)
+    provenance = getattr(gathered, "chunk_provenance", None) or {}
 
     page = getattr(verdict, "page", None)
     claims = getattr(page, "claims", ()) or ()
@@ -1568,16 +1568,19 @@ def _citation_records(query_id: str | None, gathered, verdict, *, generated_by_r
     for claim in claims:
         claim_verdict = verdicts_by_claim_id.get(claim.id, "ungraded")
         for citation in getattr(claim, "citations", ()) or ():
+            prov = provenance.get(citation.chunk_id)
             records.append({
-                "query_id": query_id,
+                "schema_version": schema_version,
+                "query_id": prov.query_id if prov else None,
                 "claim_id": claim.id,
                 "doc_id": citation.doc_id,
                 "chunk_id": citation.chunk_id,
-                "rank": rank_by_chunk_id.get(citation.chunk_id),
+                "rank": prov.rank if prov else None,
                 "claim_verdict": claim_verdict,
-                "source_round": generated_by_round.get(citation.chunk_id, "seed"),
+                "source_round": prov.source_round if prov else "unknown",
             })
     return records
+
 
 
 def cmd_wiki_site(args) -> int:

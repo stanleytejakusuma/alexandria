@@ -623,12 +623,19 @@ def test_citation_records_built_from_a_full_pipeline_are_durably_logged(monkeypa
     result produces durable (query_id, claim_id, doc_id, chunk_id, rank,
     claim_verdict, source_round) tuples written into answers.jsonl, not
     discarded like the spec's own audit found (cli.py's response_cache.put
-    only ever stored {text, n_claims})."""
+    only ever stored {text, n_claims}).
+
+    Red review 2026-08-20 revision: query_id/rank/source_round now come from
+    GatherResult.chunk_provenance (captured synchronously inside gather() at
+    each search call), not from ambient engine state read after the fact --
+    the original design joined citations to the wrong QueryLogger row in the
+    normal multi-search case. This fixture builds a GatherResult with TWO
+    DIFFERENT round provenance entries specifically to prove that."""
     import json as _json
 
     from alexandria import cli
     from alexandria.audit import AuditResult, Verdict
-    from alexandria.synthesis.gather import GatherResult, SourceChunk
+    from alexandria.synthesis.gather import ChunkProvenance, GatherResult, SourceChunk
     from alexandria.synthesis.judge import JudgeVerdict
     from alexandria.synthesis.pipeline import PipelineResult
     from alexandria.synthesis.repair import RepairResult
@@ -636,10 +643,15 @@ def test_citation_records_built_from_a_full_pipeline_are_durably_logged(monkeypa
 
     round_one = (SourceChunk("sources/a#1", "sources/a", "Evidence A.", 0.9),)
     round_two = (SourceChunk("sources/b#1", "sources/b", "Evidence B.", 0.5),)
+    provenance = {
+        "sources/a#1": ChunkProvenance(query_id="seed-query-id", source_round="round_one", rank=1),
+        "sources/b#1": ChunkProvenance(query_id="followup-query-id", source_round="round_two", rank=1),
+    }
     gathered = GatherResult(
         topic_query="q", chunks=(*round_one, *round_two),
         round_one=round_one, round_two=round_two,
-        follow_up_queries=("follow-up q",), gap_response='{"queries": ["follow-up q"]}')
+        follow_up_queries=("follow-up q",), gap_response='{"queries": ["follow-up q"]}',
+        chunk_provenance=provenance, seed_query_id="seed-query-id")
 
     page = SynthesisPage(
         topic_query="q", text="Published page.",
@@ -675,7 +687,6 @@ def test_citation_records_built_from_a_full_pipeline_are_durably_logged(monkeypa
         reranker = type("R", (), {"model_name": "fake", "half_precision": True})()
         config = type("C", (), {"prefetch": 8, "top_k": 5, "rrf_k": 60, "wiki_boost": 1.25})()
         logger = type("L", (), {"log_usage": lambda self, **kw: None})()
-        last_query_id = "search-query-abc"
 
     cli.run_answer(
         cli.AppConfig(corpus_path=tmp_path), tmp_path, "q",
@@ -687,7 +698,8 @@ def test_citation_records_built_from_a_full_pipeline_are_durably_logged(monkeypa
            (tmp_path / ".alexandria" / "audit" / "answers.jsonl").read_text().splitlines()]
     assert len(rows) == 1
     row = rows[0]
-    assert row["query_id"] == "search-query-abc"
+    # ROW-LEVEL query_id is the SEED's id, always -- not whichever search ran last.
+    assert row["query_id"] == "seed-query-id"
     citations = {(c["claim_id"], c["chunk_id"]): c for c in row["citations"]}
     assert len(citations) == 2
 
@@ -696,39 +708,167 @@ def test_citation_records_built_from_a_full_pipeline_are_durably_logged(monkeypa
     assert c1["claim_verdict"] == "supported"
     assert c1["source_round"] == "round_one"
     assert c1["rank"] == 1
+    # PER-CITATION query_id: the round_one chunk is joined to the SEED search.
+    assert c1["query_id"] == "seed-query-id"
 
     c2 = citations[("c2", "sources/b#1")]
     assert c2["claim_verdict"] == "unsupported"  # the NEGATIVE signal (requirement 4)
     assert c2["source_round"] == "round_two"
     assert c2["rank"] == 1
+    # THE CORE FIX: the round_two chunk is joined to ITS OWN follow-up search's
+    # query_id, distinct from the seed's -- proving the join no longer collapses
+    # every citation onto whichever search happened to run last.
+    assert c2["query_id"] == "followup-query-id"
+    assert c2["query_id"] != c1["query_id"]
 
 
-def test_citation_records_stay_empty_when_no_query_id_or_no_verdict_exists():
+def test_citation_records_stay_empty_when_no_gathered_or_no_verdict_exists():
     """_citation_records must degrade to [] rather than raise -- citation
     linkage is a durable SIGNAL, never a correctness gate an answer's
     emission depends on."""
     from alexandria.cli import _citation_records
 
-    assert _citation_records(None, object(), object(), generated_by_round={}) == []
-    assert _citation_records("qid", None, object(), generated_by_round={}) == []
-    assert _citation_records("qid", object(), None, generated_by_round={}) == []
+    assert _citation_records(None, object()) == []
+    assert _citation_records(object(), None) == []
 
 
-def test_chunk_source_round_first_seen_wins_and_defaults_to_seed():
-    """#9/C1 requirement 5: round_one beats round_two on overlap (matching how
-    GatherResult.chunks itself dedupes -- seed then round_one then round_two,
-    first doc_id wins); a chunk in neither round (a seed_chunk) is 'seed'."""
-    from alexandria.cli import _chunk_source_round
-    from alexandria.synthesis.gather import GatherResult, SourceChunk
+def test_citation_missing_provenance_is_unknown_never_silently_seed(monkeypatch, tmp_path):
+    """Red review 2026-08-20 (finding #4): a citation whose chunk_id has NO
+    provenance entry (e.g. a writer-fabricated chunk_id that never came from
+    any search, the exact case that also yields a 'fabricated' claim_verdict)
+    must be labeled 'unknown', never silently 'seed' -- mislabeling a
+    hallucination as retrieval provenance would poison training data."""
+    from alexandria.audit import AuditResult, Verdict
+    from alexandria.cli import _citation_records
+    from alexandria.synthesis.gather import GatherResult
+    from alexandria.synthesis.judge import JudgeVerdict
+    from alexandria.synthesis.write import Citation, Claim, SynthesisPage
 
-    overlap = SourceChunk("sources/x#1", "sources/x", "text")
-    gathered = GatherResult(
-        topic_query="q", chunks=(overlap,),
-        round_one=(overlap,),
-        round_two=(overlap, SourceChunk("sources/y#1", "sources/y", "text2")),
-        follow_up_queries=(), gap_response="{}")
+    gathered = GatherResult(topic_query="q", chunks=(), round_one=(), round_two=(),
+                            follow_up_queries=(), gap_response="{}", chunk_provenance={})
+    page = SynthesisPage(
+        topic_query="q", text="p",
+        claims=(Claim("c1", "Fabricated claim.",
+                      (Citation("sources/ghost", "sources/ghost#99"),)),),
+        author="a", skip_log=())
+    audit = AuditResult(verdicts=[Verdict(note_id="c1", verdict="fabricated", reason="invented")])
+    verdict = JudgeVerdict(page=page, chunk_accounted=True, entailment_passed=False,
+                           coverage_passed=True, audit=audit, coverage=(),
+                           failed_claim_ids=("c1",), failing_skip_ids=(),
+                           borderline_skip_ids=(), errors=())
 
-    rounds = _chunk_source_round(gathered)
-    assert rounds["sources/x#1"] == "round_one"  # first-seen wins
-    assert rounds["sources/y#1"] == "round_two"
-    assert rounds.get("sources/never-retrieved#1", "seed") == "seed"
+    records = _citation_records(gathered, verdict)
+    assert len(records) == 1
+    assert records[0]["source_round"] == "unknown"
+    assert records[0]["query_id"] is None
+    assert records[0]["rank"] is None
+    assert records[0]["claim_verdict"] == "fabricated"
+
+
+def test_gather_captures_provenance_synchronously_per_search_not_after_the_fact():
+    """Red review 2026-08-20 (findings #1/#2, the blocking ones): gather()
+    itself must read engine.last_query_id RIGHT AFTER each search() call,
+    proven by an engine whose last_query_id CHANGES between calls -- a fake
+    engine that increments a counter on every search() call, so if gather()
+    read the id only once (or late), round_one and round_two chunks would
+    share the same wrong id instead of each getting their own."""
+    from alexandria.llm import ScriptedClient
+    from alexandria.synthesis.gather import gather
+
+    class ChangingIdEngine:
+        def __init__(self):
+            self.calls = 0
+            self.last_query_id = None
+
+        def search(self, query, *, k=None):
+            self.calls += 1
+            self.last_query_id = f"query-id-{self.calls}"
+            return [type("R", (), {"chunk_id": f"sources/{query}#1", "doc_id": f"sources/{query}",
+                                   "text": f"text for {query}", "score": 1.0})()]
+
+    engine = ChangingIdEngine()
+    llm = ScriptedClient([json.dumps({"queries": ["follow-up"]})])
+    gathered = gather(engine, "seed-topic", llm=llm, seed_k=5, max_follow_up_queries=1)
+
+    assert gathered.seed_query_id == "query-id-1"
+    seed_chunk_id = "sources/seed-topic#1"
+    followup_chunk_id = "sources/follow-up#1"
+    assert gathered.chunk_provenance[seed_chunk_id].query_id == "query-id-1"
+    assert gathered.chunk_provenance[followup_chunk_id].query_id == "query-id-2"
+    # THE decisive proof: the two chunks got DIFFERENT query_ids, which is
+    # only possible if the id was read immediately after each search() call,
+    # not once at the end when last_query_id would hold only "query-id-2".
+    assert (gathered.chunk_provenance[seed_chunk_id].query_id
+           != gathered.chunk_provenance[followup_chunk_id].query_id)
+
+
+def test_gather_rank_is_per_search_not_a_running_index_across_follow_ups():
+    """Red review 2026-08-20 (finding #5): round_two can span MULTIPLE
+    follow-up queries; rank must be 1-based WITHIN each individual search's
+    own result list, never a running index across all of round_two
+    concatenated (which would mint a fake, non-comparable rank for every
+    chunk after the first follow-up query)."""
+    from alexandria.llm import ScriptedClient
+    from alexandria.synthesis.gather import gather
+
+    class TwoResultsPerQueryEngine:
+        def __init__(self):
+            self.last_query_id = None
+            self.n = 0
+
+        def search(self, query, *, k=None):
+            self.n += 1
+            self.last_query_id = f"qid-{self.n}"
+            return [
+                type("R", (), {"chunk_id": f"sources/{query}-{i}#1", "doc_id": f"sources/{query}-{i}",
+                              "text": "t", "score": 1.0})()
+                for i in range(2)
+            ]
+
+    engine = TwoResultsPerQueryEngine()
+    # gap detector asks for TWO follow-ups, each returning 2 results.
+    llm = ScriptedClient([json.dumps({"queries": ["fu1", "fu2"]})])
+    gathered = gather(engine, "seed", llm=llm, seed_k=5, max_follow_up_queries=2)
+
+    # fu2's results must be rank 1,2 -- NOT rank 3,4 (which a running index
+    # across fu1+fu2 concatenated would have produced).
+    assert gathered.chunk_provenance["sources/fu2-0#1"].rank == 1
+    assert gathered.chunk_provenance["sources/fu2-1#1"].rank == 2
+    assert gathered.chunk_provenance["sources/fu1-0#1"].rank == 1
+    # And each follow-up query got its OWN query_id, not a shared one.
+    assert (gathered.chunk_provenance["sources/fu1-0#1"].query_id
+           != gathered.chunk_provenance["sources/fu2-0#1"].query_id)
+
+
+def test_cache_hit_answer_row_carries_a_real_back_pointer_not_an_assertion(monkeypatch, tmp_path):
+    """Red review 2026-08-20 (finding #3): "linkage already exists in the
+    original row" was previously an unenforced, unverifiable comment. Now the
+    response cache stores the original answer_id, and a cache-hit's audit row
+    carries it as a real, mechanically-followable back-pointer."""
+    from alexandria import cli
+    from alexandria.cache import ResponseCache
+
+    corpus = tmp_path
+    response_cache = ResponseCache(corpus)
+    fake_key = "fake-rkey-123"
+    response_cache.put(fake_key, {"text": "Cached answer.", "n_claims": 1,
+                                  "answer_id": "original-answer-id-xyz"})
+
+    monkeypatch.setattr(cli.ResponseCache, "key", lambda self, *a, **k: fake_key)
+
+    class FakeEngine:
+        embedder = type("E", (), {"name": "hash-24"})()
+        reranker = type("R", (), {"model_name": "fake", "half_precision": True})()
+        config = type("C", (), {"prefetch": 8, "top_k": 5, "rrf_k": 60, "wiki_boost": 1.25})()
+        logger = type("L", (), {"log_usage": lambda self, **kw: None})()
+
+    outcome = cli.run_answer(
+        cli.AppConfig(corpus_path=corpus), corpus, "q",
+        engine=FakeEngine(), k=5, llm_model="m",
+        grader_a_model="a", grader_b_model="b",
+        base_url=None, api_key_env=None, prompt_version="v1")
+    assert outcome.cached is True
+
+    rows = [json.loads(l) for l in
+           (corpus / ".alexandria" / "audit" / "answers.jsonl").read_text().splitlines()]
+    assert rows[-1]["trace"]["source_answer_id"] == "original-answer-id-xyz"
