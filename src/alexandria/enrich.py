@@ -162,19 +162,32 @@ def enrich_docs_for_index(records: list[dict], *, llm, embedder, store: Enrichme
     - workers > 1 fans the LLM calls out across threads (the gateway is
       the bottleneck, not the local machine); store writes stay on the
       main thread -- sqlite is a single writer
+    - #6 erasure-core, Red review 2026-08-21 (finding #3): a tombstoned
+      document (record["deleted"] is True) is never enriched. This is the
+      POINT-OF-USE guard the invariant actually needs -- cmd_delete's
+      EnrichmentStore.invalidate() call is cleanup for a payload that
+      already existed, but does nothing to stop THIS run from creating a
+      fresh one for a document tombstoned moments before (or concurrently
+      with) this call. Skipped documents are counted, not silently dropped,
+      so `alexandria index --enrich`'s own report is honest about why a doc
+      it walked past never got a payload.
     """
+    stats = {"enriched": 0, "reattached": 0, "failed": 0, "synthetic": 0,
+             "suspicious": 0, "skipped_deleted": 0}  # #5/F3e: count of
+             # hypotheticals dropped as instruction-shaped, so a monitoring
+             # loop observes injection ATTEMPTS, not only whatever survived
+             # filtering. skipped_deleted (#6): tombstoned docs never enriched.
     by_doc: dict[str, list[dict]] = {}
     order: list[str] = []
     for record in records:
+        if record.get("deleted") is True:
+            stats["skipped_deleted"] += 1
+            continue
         doc_id = record["doc_id"]
         if doc_id not in by_doc:
             by_doc[doc_id] = []
             order.append(doc_id)
         by_doc[doc_id].append(record)
-    stats = {"enriched": 0, "reattached": 0, "failed": 0, "synthetic": 0,
-             "suspicious": 0}  # #5/F3e: count of hypotheticals dropped as
-             # instruction-shaped, so a monitoring loop observes injection
-             # ATTEMPTS, not only whatever survived filtering
     next_progress = progress_every
     def _progress() -> None:
         nonlocal next_progress

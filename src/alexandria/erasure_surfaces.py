@@ -122,3 +122,30 @@ ERASURE_SURFACES = (
              "a cache entry with no live referent is inert.",
     ),
 )
+
+# Red review 2026-08-21 (finding #5): backup.py's STATE_PATHS is ALREADY an
+# authoritative "what this engine persists beyond the rebuildable indexes"
+# list -- two of its entries reference doc-derived content and were not
+# separately classified here. Reconciled explicitly (not folded into
+# ERASURE_SURFACES itself, since these are FILE paths, not classes, and the
+# discovery scan above is class-shaped) so tests/test_erasure_surfaces.py
+# can assert every STATE_PATHS entry maps to either a real ERASURE_SURFACES
+# entry or one of these:
+STATE_PATH_CLASSIFICATIONS = {
+    ".alexandria/queries.sqlite": "QueryLogger (queries.sqlite)",
+    ".alexandria/audit": "AuditLogger (answers.jsonl, incl. #9 citation tuples)",
+    ".alexandria/eval_runs.jsonl": "eval history -- classified separately, "
+        "below (references corpus doc_ids via retrieved_ids, but never full "
+        "document text; the golden-set query text is operator-authored, not "
+        "corpus-derived)",
+    ".alexandria/eval_runs.invalid.jsonl": "same classification as "
+        "eval_runs.jsonl -- malformed/rejected eval rows, same content shape",
+    ".alexandria/pending": "zero-length marker files named by entry id -- "
+        "no document content whatsoever, not a persistence surface for "
+        "erasure purposes",
+    ".alexandria/liveness.json": "freshness/health signal only -- no "
+        "document-derived content",
+    ".alexandria/index/generation.json": "a bare integer counter -- covered "
+        "by the restore-safety fix (backup.py's restore_state), not a "
+        "content-persistence surface",
+}

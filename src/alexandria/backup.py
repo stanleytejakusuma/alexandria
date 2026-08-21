@@ -59,16 +59,18 @@ class RestoreResult:
     skipped: list[str] = field(default_factory=list)
     dry_run: bool = False
     # #6 erasure-core item 4: non-None only when the archive's generation.json
-    # is OLDER than the corpus's current live generation -- restoring it would
-    # let ResponseCache/QueryCache entries keyed to the intervening
-    # generations look valid again once that generation number is reused by
-    # write_index_generation() (the exact "stale answers resurface" failure
-    # class cache.py's own read_index_generation docstring already names for
-    # file corruption, now shown to apply to a restore too). None means
-    # either the archive has no generation.json, the corpus has none yet
-    # (nothing to be stale relative to), or the archive's generation is
-    # current or newer (a normal forward restore).
+    # is OLDER than the corpus's current live generation. Red review
+    # 2026-08-21 (finding #1): the counter is cache-key-freshness ONLY, never
+    # an identity/ordering fact anything else depends on, so restore_state()
+    # structurally REFUSES to write a regressing value (see
+    # generation_preserved below) rather than warning after the fact. This
+    # field remains as an operator-visible record of what would have
+    # happened, not as the enforcement mechanism.
     generation_regression: tuple[int, int] | None = None  # (archive_gen, corpus_gen)
+    # True when a regressing generation.json member was present in the
+    # archive but deliberately NOT written, so the corpus's own current
+    # (newer) generation value was left untouched instead.
+    generation_preserved: bool = False
 
 
 def backup_state(corpus: Path, archive_path: Path) -> BackupResult:
@@ -112,22 +114,38 @@ def _is_allowed_member(name: str, allowed_prefixes: tuple[str, ...]) -> bool:
                for prefix in allowed_prefixes)
 
 
+# #6 erasure-core, Red review 2026-08-21 (finding #6): a hostile/malformed
+# generation.json member must not be able to blow up memory or CPU before
+# any real extraction happens -- the peek below reads untrusted bytes BEFORE
+# the existing allowlist/filter="data" extraction path would ever touch this
+# member. A real generation.json is a few dozen bytes; anything past a
+# generous margin is not a file this code needs to understand, it is
+# refused the same as a parse failure.
+_MAX_GENERATION_PEEK_BYTES = 4096
+
+
 def _archive_generation(tar: tarfile.TarFile) -> int | None:
     """Peek the archive's generation.json WITHOUT extracting it, so this
     check works identically in dry-run and real-restore mode. None if the
-    archive has no such member or it fails to parse (fails open here -- a
-    corrupt/absent generation in the ARCHIVE is not this function's failure
-    to diagnose; restore's own per-member handling covers that separately)."""
+    archive has no such member, the member is implausibly large, or it
+    fails to parse (fails open here -- a corrupt/absent generation in the
+    ARCHIVE is not this function's failure to diagnose; restore's own
+    per-member handling covers that separately). Broad except: a crafted
+    member (e.g. deeply nested JSON raising RecursionError) must degrade to
+    "no generation info," never abort restore with a traceback the
+    unpeeked extraction path would not have raised."""
     try:
         member = tar.getmember(_GENERATION_MEMBER)
     except KeyError:
+        return None
+    if member.size > _MAX_GENERATION_PEEK_BYTES:
         return None
     try:
         fh = tar.extractfile(member)
         if fh is None:
             return None
         return int(json.loads(fh.read())["generation"])
-    except (json.JSONDecodeError, KeyError, ValueError, OSError):
+    except Exception:  # noqa: BLE001 -- fail open to "no generation info", never crash restore
         return None
 
 
@@ -158,18 +176,23 @@ def restore_state(corpus: Path, archive_path: Path, *, dry_run: bool = False) ->
     `.alexandria/{queries.sqlite,audit,eval_runs*.jsonl,pending,
     liveness.json,index/generation.json}` can ever be written.
 
-    #6 erasure-core item 4: BEFORE writing anything, compares the archive's
-    generation.json against the corpus's current one. Restoring an OLDER
-    generation number lets query/response cache entries keyed to the
-    intervening generations look valid again once that number is reused --
-    the exact "stale answers resurface" class cache.py's own docstring
-    already names for file corruption, shown here to apply to an ordinary
-    restore too (e.g. restoring a backup taken before a tombstone was
-    applied and several reindexes ran). Detected, not prevented: a restore
-    with a real, deliberate reason to go backward (disaster recovery from a
-    corrupted corpus) must still be possible -- this surfaces the regression
-    as an explicit, named fact on RestoreResult rather than silently
-    allowing or silently blocking it.
+    #6 erasure-core item 4, Red review 2026-08-21 (finding #1, the
+    load-bearing one): the generation counter is used ONLY as a cache-key
+    freshness stamp (verified live: read_index_generation appears nowhere
+    outside cache.py and search.py's cache-key path) -- it carries no
+    identity or ordering meaning a real disaster-recovery restore could
+    ever need to go "backward" to. The correct fix is therefore structural,
+    not a warning: generation.json is EXCLUDED from extraction whenever the
+    archive's value is not strictly newer than the corpus's live value, and
+    the live value is preserved as-is (never regressed, never silently
+    bumped past what the corpus actually knows). This eliminates the "stale
+    cache entries become valid again" failure class outright -- there is no
+    detect-vs-block tradeoff to make, because the counter can no longer
+    regress at all. Every OTHER restored path (queries.sqlite, audit,
+    eval_runs, pending, liveness) still restores normally; this is scoped
+    to exactly the one member whose value has ordering meaning.
+    `generation_regression` on the result records what would have happened,
+    for operator visibility, without ever letting it happen.
     """
     corpus = Path(corpus)
     result = RestoreResult(dry_run=dry_run)
@@ -177,7 +200,9 @@ def restore_state(corpus: Path, archive_path: Path, *, dry_run: bool = False) ->
     with tarfile.open(archive_path, "r:gz") as tar:
         archive_gen = _archive_generation(tar)
         corpus_gen = _corpus_generation(corpus)
-        if archive_gen is not None and corpus_gen is not None and archive_gen < corpus_gen:
+        regresses = (archive_gen is not None and corpus_gen is not None
+                    and archive_gen < corpus_gen)
+        if regresses:
             result.generation_regression = (archive_gen, corpus_gen)
         for member in tar.getmembers():
             if not _is_allowed_member(member.name, allowed_prefixes):
@@ -186,6 +211,15 @@ def restore_state(corpus: Path, archive_path: Path, *, dry_run: bool = False) ->
                 # paths" as a clean one, so the operator could not tell a good
                 # backup from a tampered or truncated one.
                 result.skipped.append(member.name)
+                continue
+            if regresses and posixpath.normpath(member.name) == _GENERATION_MEMBER:
+                # Structural fix: never write a regressing generation value.
+                # Reported separately from `skipped` (that list means "outside
+                # the allowlist, untrusted"; this member IS trusted, it is
+                # simply not applied, which is a different fact worth a
+                # different bucket so an operator scanning `skipped` for
+                # tampering evidence does not see an unrelated, benign entry).
+                result.generation_preserved = True
                 continue
             result.restored.append(member.name)
             if not dry_run:

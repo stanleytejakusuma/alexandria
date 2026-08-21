@@ -513,3 +513,25 @@ def test_rejected_hypothetical_is_not_replayed_from_the_store():
     assert stats2["reattached"] == 1
     assert stats2["synthetic"] == 0
     assert not any(r.get("kind") == "synthetic" for r in records2)
+
+
+def test_enrich_docs_for_index_skips_tombstoned_documents():
+    """#6 erasure-core, Red review 2026-08-21 (finding #3): a document with
+    deleted=True must never be enriched -- this is the point-of-use guard,
+    distinct from (and more important than) cmd_delete's cleanup-only
+    invalidate() call, which does nothing to stop a LATER --enrich run from
+    creating a fresh payload for an already-tombstoned document."""
+    store = EnrichmentStore(__import__("tempfile").mkdtemp())
+    records = _records("alive body", doc_id="sources/alive")
+    deleted_records = [{**r, "deleted": True} for r in _records("dead body", doc_id="sources/dead")]
+    llm = ScriptedClient([GOOD])  # only ONE call expected -- for the alive doc
+
+    stats = enrich_docs_for_index(
+        records + deleted_records, llm=llm, embedder=ScriptedEmbedder(),
+        store=store, recipe=recipe_signature("m", "v1"))
+
+    assert stats["enriched"] == 1
+    assert stats["skipped_deleted"] == 1
+    assert len(llm.calls) == 1  # never called for the tombstoned doc
+    assert store.count() == 1
+    assert store.get("sources/dead", doc_fingerprint(deleted_records), recipe_signature("m", "v1")) is None

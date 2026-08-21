@@ -187,3 +187,14 @@ the fact.
    explicit confirmation, matching the confirmation-gate pattern already
    used elsewhere in this codebase (`--enrich-invalidate`, the real-corpus
    `remember` write guard).
+
+   **Sequencing invariant within `erase` itself** (Red review 2026-08-21,
+   pinned now for a deliverable not yet built): the CachedEmbedder
+   embedding cache is content-addressed (`sha256(model_name + text)`), so
+   it can only be purged of a document's rows while the document's TEXT
+   still exists to recompute the key from. `erase` must therefore clean
+   caches (embedding cache, and anything else content-addressed the
+   erasure-surfaces enumeration later finds) BEFORE scrubbing git history
+   -- destroying the last copy of the text first would make those cache
+   rows permanently unaddressable (findable only by full-cache scan, not
+   by key), defeating the purpose of a deliberate erasure operation.

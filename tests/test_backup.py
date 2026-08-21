@@ -6,6 +6,7 @@ from __future__ import annotations
 import sqlite3
 
 from alexandria.backup import backup_state, restore_state
+from alexandria.cache import read_index_generation
 from alexandria.cli import app
 from alexandria.liveness import check as liveness_check
 
@@ -234,11 +235,13 @@ def test_b1_a_legitimate_nested_state_path_still_restores(tmp_path):
     assert (corpus / ".alexandria" / "audit" / "answers.jsonl").exists()
 
 
-def test_b1_restore_detects_a_generation_regression(tmp_path, monkeypatch):
-    """#6 erasure-core item 4: restoring an OLDER generation.json than the
-    corpus currently has must be surfaced explicitly on RestoreResult --
-    otherwise a query/response cache entry keyed to an intervening
-    generation could look valid again once that number is reused."""
+def test_b1_restore_never_regresses_the_generation_counter(tmp_path, monkeypatch):
+    """#6 erasure-core item 4, Red review 2026-08-21 (finding #1): the
+    generation counter is cache-key-freshness ONLY (verified: used nowhere
+    but cache.py/search.py's cache-key path) -- a real restore must not be
+    ABLE to regress it, not merely be warned that it did. This is the
+    load-bearing assertion: the generation on disk after a real (non-dry-
+    run) restore must be the corpus's own, unregressed value."""
     monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
     corpus = tmp_path / "corpus"
     doc = corpus / "sources" / "note.md"
@@ -254,16 +257,25 @@ def test_b1_restore_detects_a_generation_regression(tmp_path, monkeypatch):
     # a delete, a reindex -- happening after the backup was taken)
     assert app(["--corpus", str(corpus), "delete", "sources/note"]) == 0  # bumps generation
     assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0       # bumps again
+    live_gen_before_restore = read_index_generation(corpus)
 
-    restore_result = restore_state(corpus, old_backup, dry_run=True)
+    restore_result = restore_state(corpus, old_backup, dry_run=False)
     assert restore_result.generation_regression is not None
     archive_gen, corpus_gen = restore_result.generation_regression
     assert archive_gen < corpus_gen
+    assert restore_result.generation_preserved is True
+    # generation.json is NOT in `restored` -- it was deliberately skipped
+    assert ".alexandria/index/generation.json" not in restore_result.restored
+
+    # THE load-bearing check: the actual generation on disk is unchanged,
+    # never regressed to the archive's older value.
+    assert read_index_generation(corpus) == live_gen_before_restore
 
 
 def test_b1_restore_reports_no_regression_for_a_forward_or_equal_restore(tmp_path, monkeypatch):
     """The check must not false-positive on the normal case: restoring a
-    backup that is current or newer than the corpus's live generation."""
+    backup that is current or newer than the corpus's live generation --
+    and in that normal case, generation.json restores exactly as before."""
     monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
     corpus = tmp_path / "corpus"
     doc = corpus / "sources" / "note.md"
@@ -274,8 +286,10 @@ def test_b1_restore_reports_no_regression_for_a_forward_or_equal_restore(tmp_pat
     backup_path = tmp_path / "current.tar.gz"
     backup_state(corpus, backup_path)
 
-    restore_result = restore_state(corpus, backup_path, dry_run=True)
+    restore_result = restore_state(corpus, backup_path, dry_run=False)
     assert restore_result.generation_regression is None
+    assert restore_result.generation_preserved is False
+    assert ".alexandria/index/generation.json" in restore_result.restored
 
 
 def test_b1_restore_generation_check_handles_a_missing_generation_gracefully(tmp_path, monkeypatch):
@@ -295,10 +309,11 @@ def test_b1_restore_generation_check_handles_a_missing_generation_gracefully(tmp
     assert restore_result.generation_regression is None
 
 
-def test_b1_cli_restore_prints_a_loud_warning_on_generation_regression(tmp_path, monkeypatch, capsys):
-    """End-to-end through the real CLI: the warning must actually be
-    visible to an operator running `alexandria restore`, not just present
-    on the internal RestoreResult object."""
+def test_b1_cli_restore_reports_the_preserved_generation_and_keeps_it_unregressed(
+        tmp_path, monkeypatch, capsys):
+    """End-to-end through the real CLI: the message must be visible AND the
+    on-disk generation after restore must genuinely be unregressed -- not
+    just a warning printed while the bad value is written anyway."""
     monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
     corpus = tmp_path / "corpus"
     doc = corpus / "sources" / "note.md"
@@ -313,8 +328,10 @@ def test_b1_cli_restore_prints_a_loud_warning_on_generation_regression(tmp_path,
     assert app(["--corpus", str(corpus), "delete", "sources/note"]) == 0
     assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
     capsys.readouterr()
+    live_gen = read_index_generation(corpus)
 
     assert app(["--corpus", str(corpus), "restore", str(old_backup)]) == 0
     err = capsys.readouterr().err
-    assert "WARNING" in err
+    assert "kept the current" in err
     assert "generation" in err.lower()
+    assert read_index_generation(corpus) == live_gen  # genuinely unregressed

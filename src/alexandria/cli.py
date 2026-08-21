@@ -729,19 +729,6 @@ def cmd_delete(args) -> int:
         lexical_n = lexical.mark_deleted(doc.doc_id, want_deleted)
         updated = max(dense_n, lexical_n)
         write_index_generation(corpus)
-        # #6 erasure-core: a stale enrichment payload for a tombstoned
-        # document is a "poisoned-and-forgotten" edge case -- invalidate()
-        # runs AFTER the tombstone is durable (this is the LAST step in the
-        # try block, matching the failure-frame analysis: if the process
-        # crashes between the tombstone and this call, the document is
-        # already unretrievable, so a stale-but-inert cached enrichment
-        # payload is a harmless inconsistency, not a leak). Delete only --
-        # an --undelete must NOT touch enrichment, since the document's
-        # content and its recipe fingerprint are unchanged and the cached
-        # payload is still valid.
-        if want_deleted:
-            from .enrich import EnrichmentStore
-            EnrichmentStore(index_dir).invalidate(doc.doc_id)
     except Exception as exc:
         # SOL-03: the two stores are separate databases; there is no shared
         # transaction. If the dense flip committed before the lexical flip
@@ -758,6 +745,27 @@ def cmd_delete(args) -> int:
         return 1
     finally:
         lock.release()
+
+    # #6 erasure-core, Red review 2026-08-21 (finding #3): a tombstoned
+    # document's cached enrichment payload is invalidated as CLEANUP here
+    # (best-effort, deliberately outside the lock and the tombstone's own
+    # try/except so an invalidation failure gets its OWN diagnosis, never
+    # conflated with the SOL-03 dense/lexical-projection narrative above).
+    # The load-bearing guard is now at the point of USE
+    # (enrich_docs_for_index skips deleted=True records outright), so a
+    # failure here is a missed cleanup opportunity, not a correctness gap --
+    # the document cannot be re-enriched regardless of whether this
+    # succeeds. Delete only; --undelete leaves a still-valid payload alone.
+    if want_deleted:
+        try:
+            from .enrich import EnrichmentStore
+            EnrichmentStore(index_dir).invalidate(doc.doc_id)
+        except Exception as exc:
+            print(f"alexandria: {args.doc_id} {verb}, but could not invalidate its "
+                  f"cached enrichment payload ({exc}) -- harmless: "
+                  f"enrich_docs_for_index refuses to re-enrich a tombstoned "
+                  f"document regardless, so this is a missed cache cleanup, "
+                  f"not a correctness issue.", file=sys.stderr)
 
     note = ", 0 chunk(s) not yet indexed (will apply on the next `index`)" if updated == 0 else ""
     if already == want_deleted:
@@ -794,19 +802,18 @@ def cmd_restore(args) -> int:
         print(f"restore: refused {args.archive}: {exc}", file=sys.stderr)
         return 1
     verb = "would restore" if args.dry_run else "restored"
-    # #6 erasure-core item 4: a generation regression is detected, not
-    # blocked -- print loudly so the operator can act (re-run any deletes
-    # made since the backup, or accept the exposure knowingly) rather than
-    # silently replay stale cache-eligible state.
-    if result.generation_regression:
+    # #6 erasure-core item 4, Red review 2026-08-21 (finding #1): the
+    # generation counter can no longer regress at all -- restore_state()
+    # structurally skips a regressing generation.json member rather than
+    # writing it (see backup.py's restore_state docstring). This is
+    # informational, not a warning about exposure: nothing is at risk.
+    if result.generation_preserved:
         archive_gen, corpus_gen = result.generation_regression
-        print(f"restore: WARNING -- this archive's generation ({archive_gen}) is "
-              f"OLDER than the corpus's current generation ({corpus_gen}). Any "
-              f"document deleted or reindexed since this backup was taken may "
-              f"have its old cached answers become reachable again once a "
-              f"future reindex reuses generation numbers past {archive_gen}. "
-              f"Re-apply any `alexandria delete` calls made after this backup, "
-              f"or run `alexandria cache --clear` after restoring.",
+        print(f"restore: this archive's saved generation ({archive_gen}) is older "
+              f"than the corpus's current generation ({corpus_gen}) -- kept the "
+              f"current, newer generation instead of restoring the older one, so "
+              f"no cache entry from before this backup can become reachable "
+              f"again. Every other backed-up path was restored normally.",
               file=sys.stderr)
     print(f"restore: {verb} {len(result.restored)} paths from {args.archive}")
     if result.skipped:
