@@ -667,3 +667,59 @@ def test_dense_leg_survives_an_old_schema_without_deleted(tmp_path: Path):
         assert "index --rebuild" in str(exc)
     else:
         raise AssertionError("mark_deleted on an old schema must fail loudly")
+
+
+def test_cmd_delete_invalidates_a_stale_enrichment_payload(tmp_path: Path, monkeypatch, capsys):
+    """#6 erasure-core item 2: a document's cached enrichment payload (which
+    could carry a since-judged-bad hypothetical, or simply be stale) must
+    not survive a tombstone -- otherwise a future --enrich run reattaches it
+    from the store with no re-validation, even though the document itself
+    is already unretrievable. Verified end to end through the real CLI."""
+    from alexandria.enrich import EnrichmentStore
+    from alexandria.index.releases import resolve_active_index_dir
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    _write_note(corpus, "sources/a.md", "a")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    index_dir = resolve_active_index_dir(corpus)
+    store = EnrichmentStore(index_dir)
+    store.put("sources/a", "somesha", "m@v1", {"summary": "s"})
+    assert store.count() == 1
+
+    assert app(["--corpus", str(corpus), "delete", "sources/a"]) == 0
+    capsys.readouterr()
+
+    # re-open (the CLI's store instance is separate from this test's)
+    assert EnrichmentStore(index_dir).count() == 0
+
+
+def test_cmd_delete_undelete_does_not_touch_enrichment(tmp_path: Path, monkeypatch, capsys):
+    """--undelete must NOT invalidate enrichment -- the document's content
+    and recipe fingerprint are unchanged, so the cached payload is still
+    valid and forcing a re-enrichment call would be pure waste."""
+    from alexandria.enrich import EnrichmentStore
+    from alexandria.index.releases import resolve_active_index_dir
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    _write_note(corpus, "sources/a.md", "a")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    index_dir = resolve_active_index_dir(corpus)
+    store = EnrichmentStore(index_dir)
+    store.put("sources/a", "somesha", "m@v1", {"summary": "s"})
+
+    assert app(["--corpus", str(corpus), "delete", "sources/a"]) == 0
+    capsys.readouterr()
+    assert EnrichmentStore(index_dir).count() == 0  # deleted -- invalidated
+
+    # re-add for the undelete half of this test (delete already consumed it)
+    store2 = EnrichmentStore(index_dir)
+    store2.put("sources/a", "somesha", "m@v1", {"summary": "s2"})
+    assert app(["--corpus", str(corpus), "delete", "sources/a", "--undelete"]) == 0
+    capsys.readouterr()
+    assert EnrichmentStore(index_dir).count() == 1  # undelete: untouched

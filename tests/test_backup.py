@@ -232,3 +232,89 @@ def test_b1_a_legitimate_nested_state_path_still_restores(tmp_path):
         ".alexandria/liveness.json",
     ]
     assert (corpus / ".alexandria" / "audit" / "answers.jsonl").exists()
+
+
+def test_b1_restore_detects_a_generation_regression(tmp_path, monkeypatch):
+    """#6 erasure-core item 4: restoring an OLDER generation.json than the
+    corpus currently has must be surfaced explicitly on RestoreResult --
+    otherwise a query/response cache entry keyed to an intervening
+    generation could look valid again once that number is reused."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    doc = corpus / "sources" / "note.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("---\nsource: test\n---\n\nRegression fixture.\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0  # generation 1
+
+    old_backup = tmp_path / "old.tar.gz"
+    result = backup_state(corpus, old_backup)
+    assert ".alexandria/index/generation.json" in result.included
+
+    # advance the corpus's generation further (simulates real activity --
+    # a delete, a reindex -- happening after the backup was taken)
+    assert app(["--corpus", str(corpus), "delete", "sources/note"]) == 0  # bumps generation
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0       # bumps again
+
+    restore_result = restore_state(corpus, old_backup, dry_run=True)
+    assert restore_result.generation_regression is not None
+    archive_gen, corpus_gen = restore_result.generation_regression
+    assert archive_gen < corpus_gen
+
+
+def test_b1_restore_reports_no_regression_for_a_forward_or_equal_restore(tmp_path, monkeypatch):
+    """The check must not false-positive on the normal case: restoring a
+    backup that is current or newer than the corpus's live generation."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    doc = corpus / "sources" / "note.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("---\nsource: test\n---\n\nForward fixture.\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    backup_path = tmp_path / "current.tar.gz"
+    backup_state(corpus, backup_path)
+
+    restore_result = restore_state(corpus, backup_path, dry_run=True)
+    assert restore_result.generation_regression is None
+
+
+def test_b1_restore_generation_check_handles_a_missing_generation_gracefully(tmp_path, monkeypatch):
+    """No generation.json in the archive, or none yet on the corpus -- both
+    are normal (a fresh corpus, or a backup taken before any index run),
+    not a regression."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir(parents=True)
+    (corpus / ".alexandria").mkdir()
+    (corpus / ".alexandria" / "queries.sqlite").touch()
+
+    backup_path = tmp_path / "empty-gen.tar.gz"
+    backup_state(corpus, backup_path)  # no generation.json exists yet
+
+    restore_result = restore_state(corpus, backup_path, dry_run=True)
+    assert restore_result.generation_regression is None
+
+
+def test_b1_cli_restore_prints_a_loud_warning_on_generation_regression(tmp_path, monkeypatch, capsys):
+    """End-to-end through the real CLI: the warning must actually be
+    visible to an operator running `alexandria restore`, not just present
+    on the internal RestoreResult object."""
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    doc = corpus / "sources" / "note.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("---\nsource: test\n---\n\nCLI regression fixture.\n")
+    assert app(["--corpus", str(corpus), "index"]) == 0
+
+    old_backup = tmp_path / "old.tar.gz"
+    assert app(["--corpus", str(corpus), "backup", str(old_backup)]) == 0
+    capsys.readouterr()
+
+    assert app(["--corpus", str(corpus), "delete", "sources/note"]) == 0
+    assert app(["--corpus", str(corpus), "index", "--rebuild"]) == 0
+    capsys.readouterr()
+
+    assert app(["--corpus", str(corpus), "restore", str(old_backup)]) == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "generation" in err.lower()

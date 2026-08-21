@@ -729,6 +729,19 @@ def cmd_delete(args) -> int:
         lexical_n = lexical.mark_deleted(doc.doc_id, want_deleted)
         updated = max(dense_n, lexical_n)
         write_index_generation(corpus)
+        # #6 erasure-core: a stale enrichment payload for a tombstoned
+        # document is a "poisoned-and-forgotten" edge case -- invalidate()
+        # runs AFTER the tombstone is durable (this is the LAST step in the
+        # try block, matching the failure-frame analysis: if the process
+        # crashes between the tombstone and this call, the document is
+        # already unretrievable, so a stale-but-inert cached enrichment
+        # payload is a harmless inconsistency, not a leak). Delete only --
+        # an --undelete must NOT touch enrichment, since the document's
+        # content and its recipe fingerprint are unchanged and the cached
+        # payload is still valid.
+        if want_deleted:
+            from .enrich import EnrichmentStore
+            EnrichmentStore(index_dir).invalidate(doc.doc_id)
     except Exception as exc:
         # SOL-03: the two stores are separate databases; there is no shared
         # transaction. If the dense flip committed before the lexical flip
@@ -781,6 +794,20 @@ def cmd_restore(args) -> int:
         print(f"restore: refused {args.archive}: {exc}", file=sys.stderr)
         return 1
     verb = "would restore" if args.dry_run else "restored"
+    # #6 erasure-core item 4: a generation regression is detected, not
+    # blocked -- print loudly so the operator can act (re-run any deletes
+    # made since the backup, or accept the exposure knowingly) rather than
+    # silently replay stale cache-eligible state.
+    if result.generation_regression:
+        archive_gen, corpus_gen = result.generation_regression
+        print(f"restore: WARNING -- this archive's generation ({archive_gen}) is "
+              f"OLDER than the corpus's current generation ({corpus_gen}). Any "
+              f"document deleted or reindexed since this backup was taken may "
+              f"have its old cached answers become reachable again once a "
+              f"future reindex reuses generation numbers past {archive_gen}. "
+              f"Re-apply any `alexandria delete` calls made after this backup, "
+              f"or run `alexandria cache --clear` after restoring.",
+              file=sys.stderr)
     print(f"restore: {verb} {len(result.restored)} paths from {args.archive}")
     if result.skipped:
         # Every one, not a preview: this list is the evidence that an archive
