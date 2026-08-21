@@ -516,6 +516,46 @@ class CachedEmbedder:
             f"{mode}\\n{text}".encode("utf-8")
         ).hexdigest()
 
+
+    def purge(self, texts: list[str], *, mode: str = "d") -> int:
+        """#6 erasure: remove the cache rows for `texts` (this content's own
+        key, not a doc_id -- the cache is content-addressed, per this
+        class's own docstring). Returns the number of rows actually
+        deleted (0 for a text that was never cached is a normal outcome,
+        not an error -- matches EnrichmentStore.invalidate()'s contract).
+
+        Called by the `alexandria erase` command BEFORE any git history
+        rewrite, per docs/DECISION-erasure-scope-q1.md's pinned sequencing
+        invariant: a content-addressed key can only be computed while the
+        source text still exists to hash, so purging after history is
+        rewritten would leave these rows permanently unaddressable
+        (findable only by a full-table scan, never by key) instead of
+        actually removed.
+
+        No-op (returns 0) in read_only mode -- an evaluation-only cache
+        instance has no business mutating the durable cache regardless of
+        what a caller asks it to purge, matching this class's existing
+        read_only contract elsewhere in this file."""
+        if not texts or self.read_only or self._connection is None:
+            return 0
+        keys = {self._key(text, mode) for text in texts}
+        with self._lock:
+            _lock_exclusive(self._write_lock, self.lock_timeout, "purging a cache batch")
+            try:
+                self._connection.execute("BEGIN")
+                cur = self._connection.executemany(
+                    "DELETE FROM embeddings WHERE cache_key = ?",
+                    [(key,) for key in keys],
+                )
+                deleted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+                self._connection.commit()
+                return deleted
+            except Exception:
+                self._connection.rollback()
+                raise
+            finally:
+                fcntl.flock(self._write_lock, fcntl.LOCK_UN)
+
     def close(self) -> None:
         """Release the SQLite connection and any cooperative cache lock.
 

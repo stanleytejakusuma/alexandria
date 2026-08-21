@@ -22,6 +22,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from .auditlog import AuditLogger, audit_summary
 from .cache import (
@@ -648,7 +649,7 @@ def _cmd_list_deleted(corpus: Path) -> int:
     return 0
 
 
-def cmd_delete(args) -> int:
+def cmd_delete(args, *, _held_lock: "WriteLock | None" = None) -> int:
     """Soft-delete (or --undelete) one document, and reproject the flag into
     both indexes immediately -- never return 0 having only touched
     frontmatter. SPEC §D4a's blocker is exactly a frontmatter-only tombstone:
@@ -667,6 +668,16 @@ def cmd_delete(args) -> int:
     the same `deleted: true` fresh from disk. The index write below is purely
     an optimization so the effect is immediate instead of waiting on the next
     `alexandria index`.
+
+    `_held_lock`: internal-only. `cmd_erase` (#6 tail) must hold the corpus
+    write lock across its WHOLE operation (tombstone + cache purge + git
+    history rewrite), not just the tombstone half -- a concurrent index/
+    promote/second-erase racing against a git history rewrite must never be
+    possible. Passing an already-acquired lock here skips this function's
+    own acquire/release so the caller keeps holding it for the duration of
+    everything that follows. Ordinary `alexandria delete` callers never pass
+    this; the default (None) preserves this function's own acquire-then-
+    release-immediately behavior exactly as before.
     """
     config = _config_for(args)
     corpus = config.corpus_path
@@ -703,14 +714,17 @@ def cmd_delete(args) -> int:
     # edit (SOL-02) and never yields enrichment synthetic rows at all (SOL-01).
     # mark_deleted updates rows in place, so no re-embedding is needed -- the
     # flag change never touches chunk text.
-    lock = write_lock(corpus)
-    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
-        holder = lock.holder_pid()
-        print(f"alexandria: frontmatter updated ({args.doc_id} is now {verb}) but could "
-              f"not acquire the corpus write lock within {DEFAULT_LOCK_TIMEOUT:.0f}s "
-              f"(held by {holder or 'an unknown process'}) -- the index still reflects "
-              f"the OLD state until the next `alexandria index` run.", file=sys.stderr)
-        return 1
+    if _held_lock is not None:
+        lock = _held_lock  # caller already holds it; we never acquire or release
+    else:
+        lock = write_lock(corpus)
+        if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+            holder = lock.holder_pid()
+            print(f"alexandria: frontmatter updated ({args.doc_id} is now {verb}) but could "
+                  f"not acquire the corpus write lock within {DEFAULT_LOCK_TIMEOUT:.0f}s "
+                  f"(held by {holder or 'an unknown process'}) -- the index still reflects "
+                  f"the OLD state until the next `alexandria index` run.", file=sys.stderr)
+            return 1
     updated = 0
     try:
         # #30 P2a: same active-index resolution as promote/index -- a
@@ -744,7 +758,8 @@ def cmd_delete(args) -> int:
               f"{args.doc_id}` or `alexandria index` to converge.", file=sys.stderr)
         return 1
     finally:
-        lock.release()
+        if _held_lock is None:
+            lock.release()
 
     # #6 erasure-core, Red review 2026-08-21 (finding #3): a tombstoned
     # document's cached enrichment payload is invalidated as CLEANUP here
@@ -773,6 +788,142 @@ def cmd_delete(args) -> int:
     else:
         print(f"delete: {args.doc_id} {verb} -- {updated} chunk(s) updated{note}")
     return 0
+
+
+def cmd_erase(args) -> int:
+    """#6 erasure-core, tail: remove a document's raw text from the corpus
+    git repository's history, not just from the retrievable surface.
+
+    Per docs/DECISION-erasure-scope-q1.md's ratified answer: the audit
+    trail and backups are NOT touched by this command -- only git history
+    and the content-addressed embedding cache (purged FIRST, per the
+    pinned sequencing invariant: the cache key can only be recomputed
+    while the source text still exists to hash).
+
+    A deliberate, separate, confirmation-gated operation -- never bundled
+    into `alexandria delete`, matching the exact instruction that shaped
+    this design. Irreversible in the sense that the ORIGINAL git objects
+    are gone from the corpus's live .git after this succeeds (the pre-erase
+    .git is kept alongside as `.git.pre-erase-<path>`, for the same
+    "never silently delete the rollback path" reason #30 P2a's staged
+    releases never delete a prior release either -- but that backup is a
+    manual recovery path, not something this command manages long-term).
+
+    Holds the corpus write lock across the WHOLE operation (tombstone +
+    cache purge + git history rewrite), not just the tombstone half --
+    per this item's own pre-code failure-frame note: a concurrent index/
+    promote/second-erase racing against a git history rewrite must never
+    be possible. `cmd_delete` is called with the already-acquired lock so
+    it does not release it partway through.
+
+    OUT OF SCOPE (named explicitly, not silently skipped, per this item's
+    own failure-frame note): a dangling wikilink or cross-reference from
+    ANOTHER, non-erased document pointing at this one is NOT this
+    command's job to detect or fix. `impact_report()` above only surfaces
+    citations recorded in the #9 audit trail (a read-only informational
+    warning), not a scan of every other document's body text.
+    """
+    from .erasure import GitEraseError, erase_from_git_history, impact_report
+
+    config = _config_for(args)
+    corpus = config.corpus_path
+    try:
+        path = _doc_path_for(corpus, args.doc_id)
+    except ValueError as exc:
+        print(f"alexandria: {exc}", file=sys.stderr)
+        return 1
+    if not path.is_file():
+        print(f"alexandria: no such document: {args.doc_id}", file=sys.stderr)
+        return 1
+    rel_path = str(path.relative_to(corpus))
+
+    # Impact report FIRST -- an operator sees what this document has been
+    # cited in before committing to an irreversible action, per #9's
+    # citation tuples (audit trail; NOT touched by this command).
+    citing_answers = impact_report(corpus, args.doc_id)
+
+    # #6 sequencing invariant: compute the document's CURRENT chunk texts
+    # and purge their cache rows BEFORE the file (and its history) is
+    # touched at all -- the cache is content-addressed, so the key can
+    # only be recomputed while the text still exists.
+    records, chunk_error = chunk_doc_records(path, corpus, config)
+    if chunk_error:
+        print(f"alexandria: could not read {args.doc_id} to compute its cache "
+              f"keys before erasing ({chunk_error}); refusing to proceed -- "
+              f"the cache would be left with orphaned rows this command "
+              f"cannot address afterward.", file=sys.stderr)
+        return 1
+    texts = [searchable_text(record) for record in records]
+
+    commits_touched = _erase_commit_count(corpus, rel_path)
+    if not args.yes:
+        print(f"alexandria: about to permanently erase {args.doc_id!r} from git "
+              f"history ({rel_path}, {commits_touched} commit(s) affected) and "
+              f"purge its {len(texts)} chunk(s) from the embedding cache. "
+              f"THIS CANNOT BE UNDONE from within this tool.")
+        if citing_answers:
+            print(f"alexandria: WARNING -- this document was cited in "
+                  f"{len(citing_answers)} past answer(s) (audit trail is NOT "
+                  f"erased, per the ratified decision -- those records stay, "
+                  f"but the cited document's own history will be gone).")
+        print("alexandria: re-run with --yes to proceed.", file=sys.stderr)
+        return 3
+
+    # Acquire the corpus write lock ONCE, for the whole operation. Passed
+    # into cmd_delete below so it holds through tombstone + cache purge +
+    # git rewrite as a single critical section, not three separate windows
+    # a concurrent index/promote/second-erase could interleave with.
+    lock = write_lock(corpus)
+    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+        holder = lock.holder_pid()
+        print(f"alexandria: could not acquire the corpus write lock within "
+              f"{DEFAULT_LOCK_TIMEOUT:.0f}s (held by {holder or 'an unknown process'}) "
+              f"-- nothing was touched; retry once it is free.", file=sys.stderr)
+        return 1
+    try:
+        # Tombstone first (reuses cmd_delete's own logic -- a document must
+        # be unretrievable before its history is scrubbed, not after).
+        tombstone_args = SimpleNamespace(list=False, undelete=False, doc_id=args.doc_id,
+                                         corpus=args.corpus)
+        tombstone_rc = cmd_delete(tombstone_args, _held_lock=lock)
+        if tombstone_rc != 0:
+            print(f"alexandria: erase aborted -- tombstoning {args.doc_id} failed "
+                  f"(exit {tombstone_rc}); nothing else was touched.", file=sys.stderr)
+            return 1
+
+        embedder = _cached_embedder(config, corpus)
+        purged = embedder.purge(texts)
+        embedder.close()
+
+        try:
+            commits_rewritten = erase_from_git_history(corpus, rel_path)
+        except GitEraseError as exc:
+            print(f"alexandria: {args.doc_id} is tombstoned and its cache rows are "
+                  f"purged, but the git-history rewrite failed: {exc}. The corpus "
+                  f"repo's history is UNCHANGED (this command never mutates it "
+                  f"until every prior step succeeds) -- re-run `alexandria erase "
+                  f"{args.doc_id} --yes` to retry just the history step.",
+                  file=sys.stderr)
+            return 1
+    finally:
+        lock.release()
+
+    print(f"erase: {args.doc_id} tombstoned, {purged} cache row(s) purged, "
+          f"{commits_rewritten} commit(s) rewritten in git history. "
+          f"Pre-erase history preserved at .git.pre-erase-{rel_path.replace('/', '_')} "
+          f"for manual recovery if needed.")
+    return 0
+
+
+def _erase_commit_count(corpus: Path, rel_path: str) -> int:
+    """How many commits currently touch rel_path -- printed to the operator
+    BEFORE asking for confirmation, so the blast radius is visible up
+    front, not discovered mid-operation."""
+    from .erasure import _commit_count_for_path
+    try:
+        return _commit_count_for_path(corpus, rel_path)
+    except Exception:
+        return -1  # unknown; the confirmation prompt still proceeds, just without a count
 
 
 def cmd_backup(args) -> int:
@@ -2074,6 +2225,18 @@ def build_parser() -> argparse.ArgumentParser:
     delete.add_argument("--undelete", action="store_true", help="clear the deleted flag instead of setting it")
     delete.add_argument("--list", action="store_true", help="list every document currently flagged deleted")
     delete.set_defaults(func=cmd_delete)
+
+    erase = sub.add_parser("erase",
+                           help="IRREVERSIBLE: scrub a document from git history "
+                                "(tombstone + cache purge + history rewrite); "
+                                "audit trail and backups are NOT touched -- see "
+                                "docs/DECISION-erasure-scope-q1.md")
+    erase.add_argument("doc_id", help="corpus-relative doc id, e.g. sources/pi/note")
+    erase.add_argument("--yes", action="store_true",
+                       help="confirm the irreversible history rewrite (otherwise "
+                            "this prints the blast radius and exits 3 without "
+                            "touching anything)")
+    erase.set_defaults(func=cmd_erase)
 
     backup = sub.add_parser("backup", help="back up .alexandria state (never the rebuildable indexes)")
     backup.add_argument("dest", help="path to write the .tar.gz archive")

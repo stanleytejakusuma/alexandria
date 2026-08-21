@@ -198,3 +198,97 @@ the fact.
    -- destroying the last copy of the text first would make those cache
    rows permanently unaddressable (findable only by full-cache scan, not
    by key), defeating the purpose of a deliberate erasure operation.
+
+
+## `alexandria erase` -- SHIPPED (2026-08-21)
+
+Built per the sequencing above, on `feat/erase-verb`, with a full pre-code
+failure-frame note written first (what breaks under `serve`'s shared
+instance -- N/A, `erase` has no HTTP route; what breaks at a second call
+site -- the corpus write lock must be held for the WHOLE operation, not
+just the tombstone half; the cheapest operator-error move -- erasing the
+wrong doc_id, mitigated by a `--yes` confirmation gate that prints the
+exact blast radius first; what a mid-operation crash leaves behind -- the
+critical case, since `git filter-repo` deletes the original history
+immediately on success with no separate commit step).
+
+**Shape delivered**: `src/alexandria/erasure.py` (`erase_from_git_history`,
+`impact_report`, `GitEraseError`) + `cmd_erase` in `cli.py` + `tests/
+test_erasure.py` (12 tests) + CLI integration tests in `test_soft_delete.py`
+(6 tests, including a dedicated regression test for a real bug found live
+during development, see below).
+
+**Safety design, verified live via three deliberate failure-injection
+tests, not just asserted in prose**:
+1. Never operates on the corpus repo directly -- always clones
+   (`git clone --no-local`) to a disposable tmp dir, rewrites the CLONE,
+   validates the rewrite (`git log --all -- <path>` returns zero commits
+   in the clone), and only then atomically swaps the corpus's `.git`
+   directory for the clone's rewritten one.
+2. A failure at any point BEFORE the swap leaves the corpus's `.git`
+   completely untouched -- proven by monkeypatching `filter-repo` to fail
+   and asserting the corpus's HEAD/log are byte-identical before and after.
+3. A crash DURING the swap (the narrowest window: renaming the original
+   `.git` aside, then renaming the rewritten one into place) is recovered
+   from immediately -- proven by monkeypatching the second `rename` call to
+   raise and asserting the original `.git` is restored, not left absent.
+4. The pre-erase `.git` is never deleted, only renamed aside to
+   `.git.pre-erase-<path>` (mirrors #30 P2a's "never delete the previous
+   release" retention idiom) -- a manual recovery path, not something the
+   command manages long-term.
+5. The write lock is held across the WHOLE operation (tombstone + cache
+   purge + git rewrite) as a single critical section -- `cmd_delete`
+   gained an internal `_held_lock` parameter so `cmd_erase` can pass its
+   own already-acquired lock through instead of `cmd_delete` acquiring and
+   releasing its own partway through. Proven by a dedicated test that
+   spies on the git-rewrite step and asserts a second, independent lock
+   acquisition attempt is refused for the full duration.
+
+**A real bug found and fixed during development, not just in review**: the
+first working version synced the corpus's working tree to the rewritten
+history using `git reset --hard HEAD && git clean -fd` at the corpus root.
+`git clean -fd` removes ALL untracked content -- and `.alexandria/` (the
+index, embedding cache, and audit trail) is DELIBERATELY untracked corpus
+state, exactly like this repo's own "corpus is not this repo" doctrine.
+An end-to-end test caught this directly: after erasing one document, the
+corpus's entire search index and embedding cache were gone, not just the
+erased document. Fixed by never running a repo-root-wide clean at all --
+the working-tree sync now targets ONLY the one known erased path directly
+(checks whether it is still git-tracked; if not, removes just that file),
+plus a `git checkout HEAD -- .` for ordinarily-tracked paths. A dedicated
+regression test (`test_cli_erase_never_touches_the_untracked_alexandria_
+state_directory`) pins this permanently, vacuity-checked against the
+original buggy code (fails on it, passes on the fix).
+
+**A second real edge case found live**: if the erased document was the
+ONLY content in the ONLY commit, `filter-repo` correctly prunes that
+now-empty commit entirely, leaving the rewritten history with ZERO commits
+and no resolvable `HEAD`. `git reset`/`checkout HEAD` then fail (nothing to
+reset to), not because anything went wrong. Detected via `git rev-parse
+--verify HEAD` first, handled distinctly (skips the checkout/reset step
+entirely in that case; a dedicated test, `test_erasing_the_only_document_
+leaves_a_valid_empty_but_functional_repo`, covers it and confirms a fresh
+commit works fine against the now-empty history afterward).
+
+**External dependency**: `git-filter-repo` (already installed on this
+machine per the original decision doc; also available via `pip install
+git-filter-repo` or `brew install git-filter-repo`). Treated exactly like
+`pdftotext` for PDF ingest -- an optional external binary, absent →
+clean, actionable refusal naming both install paths (verified live:
+without it, `erase_from_git_history` raises `GitEraseError` with the
+install instructions, not an opaque subprocess error). Tests that exercise
+the real binary are `pytest.mark.skipif`-gated on `shutil.which
+("git-filter-repo")`, matching `test_ingest_refresh.py`'s
+`requires_pdftotext` precedent exactly; tests that only need
+`subprocess.run` mocked (rollback-safety tests) do not require the real
+binary and always run.
+
+**Free citation-linkage integration**: `impact_report()` reuses #9's
+durable citation tuples (`answers.jsonl`) to show an operator which past
+answers cited the document before they confirm the erase -- read-only,
+informational, since the audit trail itself is explicitly NOT touched by
+this command per the ratified decision above.
+
+Full suite: 1063 → 1085 (dev), 1005+31 → 1045+40 (CI-like restricted PATH,
+the +9 skip delta being the git-filter-repo-gated tests). `precommit-scan.py
+--all` clean.

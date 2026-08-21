@@ -25,8 +25,11 @@ Design recap (see index/filtering.py for the authoritative comments):
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from alexandria.cli import app
 from alexandria.corpus import Doc, render
@@ -38,6 +41,11 @@ from alexandria.index.filtering import deleted_flag, not_deleted_clause
 from alexandria.index.store import SCALAR_FIELDS, VectorStore
 from alexandria.retrieval.rerank import IdentityReranker
 from alexandria.retrieval.search import SearchConfig, SearchEngine
+
+requires_git_filter_repo = pytest.mark.skipif(
+    shutil.which("git-filter-repo") is None,
+    reason="git-filter-repo not installed -- required for `alexandria erase`'s "
+           "actual history rewrite")
 
 
 # ---------------------------------------------------------------------------
@@ -723,3 +731,230 @@ def test_cmd_delete_undelete_does_not_touch_enrichment(tmp_path: Path, monkeypat
     assert app(["--corpus", str(corpus), "delete", "sources/a", "--undelete"]) == 0
     capsys.readouterr()
     assert EnrichmentStore(index_dir).count() == 1  # undelete: untouched
+
+
+@requires_git_filter_repo
+def test_cli_erase_end_to_end_removes_from_git_history_and_cache(tmp_path: Path, monkeypatch, capsys):
+    """End to end through the real CLI: index, delete via --yes, confirm the
+    document is gone from search AND from git history AND from the
+    embedding cache -- the full #6 tail contract in one flow."""
+    import subprocess
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+
+    note = _write_note(corpus, "sources/erase-me.md", "erase-me")
+    subprocess.run(["git", "add", "-A"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add erase-me"], cwd=str(corpus), check=True)
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+    assert app(["--corpus", str(corpus), "search", "erase-me"]) == 0
+    assert "sources/erase-me" in capsys.readouterr().out
+
+    # Without --yes: prints the blast radius, touches nothing, exits 3.
+    rc = app(["--corpus", str(corpus), "erase", "sources/erase-me"])
+    assert rc == 3
+    capsys.readouterr()
+    assert note.exists()  # untouched
+
+    # With --yes: actually erases.
+    rc = app(["--corpus", str(corpus), "erase", "sources/erase-me", "--yes"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "erase:" in out
+    assert not note.exists()
+
+    log = subprocess.run(["git", "log", "--oneline", "--all", "--", "sources/erase-me.md"],
+                         cwd=str(corpus), capture_output=True, text=True)
+    assert log.stdout.strip() == ""
+
+    assert app(["--corpus", str(corpus), "search", "erase-me"]) == 0
+    assert "sources/erase-me" not in capsys.readouterr().out
+
+
+@requires_git_filter_repo
+def test_cli_erase_purges_the_embedding_cache(tmp_path: Path, monkeypatch, capsys):
+    """The cache-before-history sequencing invariant, proven through the
+    real CLI: after erase, the document's chunk text is no longer a cache
+    hit (a re-embed of identical text would be a fresh provider call)."""
+    import subprocess
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+
+    _write_note(corpus, "sources/cached.md", "cached")
+    subprocess.run(["git", "add", "-A"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add cached"], cwd=str(corpus), check=True)
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    cache_path = corpus / ".alexandria" / "cache" / "embeddings.sqlite"
+    assert cache_path.exists()
+    import sqlite3
+    conn = sqlite3.connect(str(cache_path))
+    rows_before = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    conn.close()
+    assert rows_before > 0
+
+    assert app(["--corpus", str(corpus), "erase", "sources/cached", "--yes"]) == 0
+    capsys.readouterr()
+
+    conn = sqlite3.connect(str(cache_path))
+    rows_after = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    conn.close()
+    assert rows_after < rows_before
+
+
+def test_cli_erase_refuses_an_unknown_doc_id(tmp_path: Path, monkeypatch, capsys):
+    import subprocess
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+
+    rc = app(["--corpus", str(corpus), "erase", "sources/never-existed", "--yes"])
+    assert rc == 1
+
+
+@requires_git_filter_repo
+def test_cli_erase_leaves_a_recoverable_pre_erase_git_backup(tmp_path: Path, monkeypatch, capsys):
+    import subprocess
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+    _write_note(corpus, "sources/x.md", "x")
+    subprocess.run(["git", "add", "-A"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add x"], cwd=str(corpus), check=True)
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+    assert app(["--corpus", str(corpus), "erase", "sources/x", "--yes"]) == 0
+    capsys.readouterr()
+
+    backup_dir = corpus / ".git.pre-erase-sources_x.md"
+    assert backup_dir.is_dir()
+
+
+@requires_git_filter_repo
+def test_cli_erase_never_touches_the_untracked_alexandria_state_directory(
+        tmp_path: Path, monkeypatch, capsys):
+    """Regression test for a real bug found live during development: an
+    early implementation's working-tree sync used `git clean -fd` at the
+    corpus root, which -- because .alexandria/ (index, embedding cache,
+    audit trail) is deliberately UNTRACKED corpus state -- deleted the
+    entire index and cache alongside the one erased document. This proves
+    a SECOND, unrelated document's index entry and the cache database
+    itself both survive an erase of a completely different document."""
+    import subprocess
+    import sqlite3
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+
+    _write_note(corpus, "sources/keep.md", "keep")
+    _write_note(corpus, "sources/erase-me.md", "erase-me")
+    subprocess.run(["git", "add", "-A"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add both"], cwd=str(corpus), check=True)
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    cache_path = corpus / ".alexandria" / "cache" / "embeddings.sqlite"
+    assert cache_path.exists()
+    audit_dir = corpus / ".alexandria" / "audit"
+
+    assert app(["--corpus", str(corpus), "erase", "sources/erase-me", "--yes"]) == 0
+    capsys.readouterr()
+
+    # The whole .alexandria/ tree must still be present and functional.
+    assert cache_path.exists()
+    conn = sqlite3.connect(str(cache_path))
+    conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()
+    conn.close()
+
+    # The OTHER document must still be fully searchable -- its index entry
+    # was never touched by the erase.
+    assert app(["--corpus", str(corpus), "search", "keep"]) == 0
+    assert "sources/keep" in capsys.readouterr().out
+
+
+@requires_git_filter_repo
+def test_cli_erase_holds_the_corpus_write_lock_across_the_whole_operation(
+        tmp_path: Path, monkeypatch, capsys):
+    """The load-bearing structural fix from this item's own pre-code
+    failure-frame note: cmd_erase must hold the corpus write lock across
+    tombstone + cache purge + git rewrite as ONE critical section, not
+    three separate windows a concurrent index/promote/second-erase could
+    interleave with. Proven by attempting a SECOND, independent
+    (non-blocking) lock acquisition from mid-way through the git-rewrite
+    step and confirming it is refused as busy."""
+    import subprocess
+
+    from alexandria.writelock import WriteLock
+    import alexandria.erasure as erasure_mod
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+    _write_note(corpus, "sources/locked.md", "locked")
+    subprocess.run(["git", "add", "-A"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add locked"], cwd=str(corpus), check=True)
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    observed = {}
+    real_erase = erasure_mod.erase_from_git_history
+
+    def spying_erase(corpus_arg, rel_path, **kwargs):
+        # mid-operation: a fresh, independent lock handle must find the
+        # corpus write lock already held (non-blocking acquire must fail).
+        probe = WriteLock(corpus_arg)
+        observed["acquired_while_erase_running"] = probe.acquire(blocking=False)
+        if observed["acquired_while_erase_running"]:
+            probe.release()  # avoid leaving a stray lock if the assertion below fails
+        return real_erase(corpus_arg, rel_path, **kwargs)
+
+    monkeypatch.setattr(erasure_mod, "erase_from_git_history", spying_erase)
+    # cmd_erase does `from .erasure import ... erase_from_git_history` INSIDE the
+    # function body, so patching the module attribute is sufficient (no bound
+    # copy exists yet at monkeypatch time).
+
+    rc = app(["--corpus", str(corpus), "erase", "sources/locked", "--yes"])
+    assert rc == 0
+    capsys.readouterr()
+
+    assert "acquired_while_erase_running" in observed
+    assert observed["acquired_while_erase_running"] is False, (
+        "a second, independent lock acquisition succeeded WHILE erase was "
+        "still running its git-rewrite step -- the write lock is not held "
+        "across the whole operation")
+
+    # sanity: the lock must be free again immediately after erase returns.
+    probe2 = WriteLock(corpus)
+    assert probe2.acquire(blocking=False) is True
+    probe2.release()

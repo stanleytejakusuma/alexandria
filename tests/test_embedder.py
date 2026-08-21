@@ -782,3 +782,63 @@ def test_local_embedder_does_not_retry_the_full_timeout_on_a_second_call(monkeyp
         f"the underlying SentenceTransformer constructor was invoked "
         f"{len(load_calls)} times for two calls on one instance -- only the "
         f"FIRST should ever attempt the network")
+
+
+def test_purge_removes_a_cached_row_so_it_recomputes_on_next_embed(tmp_path: Path):
+    """#6 erasure: purge() must actually delete the row, not just mark it --
+    the next embed() call for the same text should hit the provider again,
+    not silently reattach a purged vector from some soft-delete flag."""
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, tmp_path / "embeddings.sqlite")
+
+    embedder.embed(["erase me", "keep me"])
+    assert len(provider.calls) == 1
+
+    deleted = embedder.purge(["erase me"])
+    assert deleted == 1
+
+    embedder.embed(["erase me", "keep me"])
+    # "erase me" recomputed (a real provider call), "keep me" still cached
+    assert provider.calls == [["erase me", "keep me"], ["erase me"]]
+
+
+def test_purge_of_never_cached_text_returns_zero_not_an_error(tmp_path: Path):
+    """Matches EnrichmentStore.invalidate()'s contract: purging something
+    that was never there is a normal outcome, honestly reported as zero."""
+    embedder = CachedEmbedder(CountingEmbedder(), tmp_path / "embeddings.sqlite")
+    assert embedder.purge(["never embedded"]) == 0
+
+
+def test_purge_respects_the_mode_distinction(tmp_path: Path):
+    """Document-space and query-space embeddings of the same text are
+    DIFFERENT cache rows (mode is part of the key) -- purging the document
+    mode must not touch the query-mode row for identical text."""
+    embedder = CachedEmbedder(CountingEmbedder(), tmp_path / "embeddings.sqlite")
+    embedder.embed(["shared text"], mode="d")
+    embedder.embed(["shared text"], mode="q")
+
+    deleted = embedder.purge(["shared text"], mode="d")
+    assert deleted == 1
+
+    row = embedder._connection.execute(
+        "SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    assert row == 1  # the query-mode row survives
+
+
+def test_purge_is_a_noop_in_read_only_mode(tmp_path: Path):
+    """A read-only (evaluation-only) cache instance must never mutate the
+    durable cache, regardless of what a caller asks it to purge -- matches
+    this class's existing read_only contract for embed() itself."""
+    cache_path = tmp_path / "embeddings.sqlite"
+    writer = CachedEmbedder(CountingEmbedder(), cache_path)
+    writer.embed(["persisted"])
+    writer.close()
+
+    reader = CachedEmbedder(CountingEmbedder(), cache_path, read_only=True)
+    assert reader.purge(["persisted"]) == 0
+    reader.close()  # release the shared lock before reopening normally below
+
+    # confirm it genuinely was not touched
+    writer2 = CachedEmbedder(CountingEmbedder(), cache_path)
+    assert writer2.embed(["persisted"])[0] is not None
+    assert writer2.last_cache_stats["hits"] == 1  # still cached
