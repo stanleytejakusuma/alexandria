@@ -140,18 +140,24 @@ restore-from-backup-then-rebuild (`alexandria restore` + `--rebuild`), which add
 includes backup-archive retrieval/extraction time; that combined number is not yet measured
 either and would need its own entry once it is.
 
-**Target**: < 30 minutes (the phase-1 design gate, `README.md`).
+**Measured 2026-08-21**: **33.1 minutes** (1,989s wall-clock, external `time`) for a full
+`alexandria index --rebuild` against the real, live corpus -- 55,223 chunks from 33,520
+documents, local embed provider, embedding cache 47,220 hits / 8,003 real misses. Verified
+post-rebuild: search returns correct results, the staged release activated cleanly (backlog
+#30 P2a).
 
-**Last known measurement**: ~80 minutes, per `docs/SPEC-multi-tenant-and-learning-loop.md`
-section G1 -- an unsourced historical note (no stated corpus size, embed provider, or hardware
-at measurement time), not a documented methodology. Backlog item **#11** (see
-`docs/BACKLOG.md`) tracks running a real, methodology-documented remeasurement against the
-current live corpus (33.5k documents, ~13GB as of 2026-08-20) -- **this requires an explicit
-operator go-ahead before running, since a full `--rebuild` on the real corpus is a genuine
-live operation**, even though it is now atomic/staged and safe to run (backlog #30 P2a: the
-prior active index keeps serving until the new one validates and atomically replaces it).
-This document will be updated with the real number, methodology, and date once that
-measurement runs.
+**Honest caveat**: this run overlapped with unrelated system memory pressure on the host for
+part of its duration (per-batch throughput visibly degraded partway through, from ~3,600
+chunks/min down to ~1,600-1,700 chunks/min, before stabilizing) -- the number above is real
+and not fabricated, but is likely a conservative (slower than best-case) figure rather than a
+clean-conditions baseline. Re-measure under quiet conditions before treating 33.1min as a
+tight bound.
+
+**Target**: < 30 minutes (the phase-1 design gate, `README.md`) -- the measured figure is
+close to, not comfortably under, this target. **Prior unsourced figure retired**: an earlier
+"~80 minutes" note in `docs/SPEC-multi-tenant-and-learning-loop.md` section G1 had no stated
+corpus size, embed provider, or hardware -- not a documented methodology, now superseded by
+the measurement above. Backlog item #55 (the live RTO remeasurement, spun out of #10 during Red review) is closed by this measurement.
 
 ## Reporting practice for this document
 

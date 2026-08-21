@@ -113,7 +113,7 @@ Everything is markdown with YAML frontmatter — readable in Obsidian, greppable
 | Phase | Deliverable | Gate (evidence, not vibes) |
 |---|---|---|
 | **0** | Corpus scaffold · schema validator · migration · session connector | Counts reconcile exactly · schema lint clean · 50-note body-identical spot check |
-| **1** | Chunker · embeddings · LanceDB · hybrid + rerank · search API | **Golden query set passes** · full rebuild < 30 min target — [re-measurement against the current corpus pending, last known figure ~80 min unsourced](SECURITY.md#recovery-time-objective-rto) · p50 < 500 ms |
+| **1** | Chunker · embeddings · LanceDB · hybrid + rerank · search API | **Golden query set passes** · full rebuild [measured 33.1 min](SECURITY.md#recovery-time-objective-rto) (target < 30 min, close but not yet under) · p50 < 500 ms |
 | **2** | Synthesis sweep · adjudication · full lint · document ingest | Faithfulness ≥ 95% · **entailment audit ≥ 95%, zero contradicted** · **golden fact recall ≥ 90% (dual-grader)** · 2 weeks of clean reviewed diffs |
 | **3** | Harness extensions (Pi, others) | **Blinded side-by-side** vs the incumbent memory tool — must win recall@5 before anything switches |
 | **4** | Answer endpoint · static wiki site · demo corpus · docs | **Fresh-clone test:** end-to-end on demo data, zero private content in history |
