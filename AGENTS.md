@@ -268,3 +268,21 @@ serve, index, search, eval, answer, wiki-site, audit, cache, decay`.
   inferred from `git log --graph`/ahead-behind counts, not confirmed from a
   written policy doc. Whatever you do, don't force-push over another
   branch's history without checking `git log <branch>..main` first.
+
+
+## Agent skills
+
+### Issue tracker
+
+Work for **alexandria engine development** is tracked in this repo's GitHub
+Issues (already enabled) via the `gh` CLI. Scope is deliberately narrow:
+only alexandria-dev tasks go to GitHub; private, credential-bearing, and
+capital/infra operational items are tracked separately, outside GitHub, per
+operator policy (the internal full-context backlog stays in
+`docs/BACKLOG.md`). See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context layout: one `CONTEXT.md` + `docs/adr/` at the repo root,
+created lazily by `/domain-modeling` when terms or decisions get resolved;
+skills read silently when absent. See `docs/agents/domain.md`.
