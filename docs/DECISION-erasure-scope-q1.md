@@ -1,8 +1,13 @@
 # Decision brief: erasure scope (Q1) — core/tail decomposition
 
 **Date:** 2026-08-21
-**Status:** awaiting Stanley's decision on the TAIL only (see below) — the CORE
-does not require Q1's answer and is proposed for immediate build.
+**Status:** DECIDED 2026-08-21. Stanley's answer, verbatim in substance: keep
+the retrievable-surface tombstone as the default (matches "the rest is fine"
+below), AND also erase the raw document text from git history -- explicitly
+NOT the audit trail, NOT backups beyond their existing retention, source body
+text specifically. Sequencing: the CORE below ships FIRST; git-history
+erasure ships as its own separate, deliberate operation afterward (Stanley's
+explicit instruction), not bundled into `alexandria delete`.
 **Corrects:** `docs/SPEC-data-model-and-ambient-capture.md` section 7's claim
 that Q1 was "ratified 2026-08-13: tombstone-first." That claim was written by
 a prior session's own inference from conversation, not an actual instruction
@@ -12,7 +17,7 @@ its own header says it supersedes all earlier versions) explicitly flags this:
 (this session) that no later document walks that warning back. Q1 is treated
 as genuinely open until Stanley answers it here, not assumed either way.
 
-## The question, restated precisely
+## The question, restated precisely (now answered — see "What was decided" below)
 
 `docs/SPEC-data-model-and-ambient-capture.md` section 9, Q1: does erasure
 stop at the retrievable surface (tombstone — gone from search and synthesis,
@@ -122,29 +127,29 @@ independent of Q1's answer)
    without forcing a rebuild first. No action needed here — listed to show
    the question was checked, not assumed.
 
-## What is GENUINELY THE TAIL — this is Stanley's actual decision
+## What was decided (formerly "the tail") — RATIFIED 2026-08-21
 
-Everything above is proposed to ship regardless of the answer below. What
-remains open, and does branch on Stanley's answer:
+Stanley's answer, recorded here so no future session has to re-derive it or
+risk a second false-ratification incident like the one this document opened
+by correcting:
 
-- **Does erasure need to reach the audit trail** (`queries.sqlite`,
-  `answers.jsonl`) — i.e., can a citation tuple naming a since-deleted
-  document's `doc_id` remain in the durable, no-TTL audit log forever, or
-  must it eventually be purged/redacted too?
-- **Does erasure need to reach git history** — i.e., can a deleted
-  document's full prior content remain recoverable via `git log`/`git show`
-  on old commits forever, or must history be rewritten?
-- **Does erasure need to reach `sources/*.md` itself** beyond the
-  frontmatter flag — i.e., is `deleted: true` with the body still physically
-  present on disk (current behavior) acceptable, or must the body content
-  itself be scrubbed/overwritten?
-- **Does erasure need to reach backup archives** (`.alexandria/`, per
-  `backup.py`) — old backups taken before a deletion currently retain the
-  pre-deletion state indefinitely.
+- **Audit trail** (`queries.sqlite`, `answers.jsonl`): **stays**. A citation
+  tuple naming a since-deleted document's `doc_id` remains in the durable,
+  no-TTL audit log. Not erased.
+- **Backups**: **stays**, no change to existing retention behavior beyond
+  what the CORE items below already require (restore-replay safety).
+- **Git history**: **erase**. The raw document body text must actually be
+  removed from every commit that ever carried it, not just the current
+  working-tree state. This is the one item that branches from "tombstone
+  only" and needs its own deliberate operation (see "Sequencing" below).
+- **Source body on disk (working tree)**: covered by "git history" above --
+  once history is rewritten, the working tree naturally reflects that too.
+  No separate handling needed.
 
-## The real cost of the "reaches everything" tail option, named honestly
+## The real cost of the git-history-erasure decision, named honestly (accepted, not a warning against it)
 
-If Stanley's answer requires history rewriting or crypto-shredding: this
+Stanley has accepted this cost as part of the decision. Recorded here for
+the erasure implementation's own awareness, not as an open objection: this
 repo's own verification discipline is built on SHA-anchored references —
 every commit message in this session's arc, every backlog row citing a
 specific commit, `docs/THREAT-MODEL.md`'s own "verified against live code at
@@ -155,19 +160,30 @@ rewritten. That is not a reason to rule out the tail option; it is a real,
 concrete cost that should be weighed explicitly rather than discovered after
 the fact.
 
-## Recommended sequencing
+## Sequencing — RATIFIED, execution order
 
-1. Stanley answers the TAIL question above (audit trail / git history /
-   source body / backups — any subset, does not need to be all-or-nothing).
-2. The CORE (items 1-4 above -- item 5 needed no action, verified clean)
-   proceeds now, independent of that answer,
-   test-first, with an explicit pre-code failure-frame note per item (what
-   breaks under `serve`'s shared engine instance, what breaks at a second
-   call site, the cheapest attacker move, what a mid-operation crash leaves
-   behind) handed to the independent review alongside the diff — this
-   session's own pattern of first-pass gaps (three separate items this
-   session broke under `serve`'s shared-instance shape specifically) is
-   treated as a known, preventable failure class going into this work, not
-   repeated by default.
-3. Once Stanley's tail answer is known, the remaining scope (if any) is
-   built as its own follow-up, sized by what was actually decided.
+1. **The CORE (items 1-4 above -- item 5 needed no action, verified clean)
+   ships first.** Test-first, with an explicit pre-code failure-frame note
+   per item (what breaks under `serve`'s shared engine instance, what
+   breaks at a second call site, the cheapest attacker move, what a
+   mid-operation crash leaves behind) handed to independent review
+   alongside the diff -- this session's own pattern of first-pass gaps
+   (three separate items this session broke under `serve`'s shared-instance
+   shape specifically) is treated as a known, preventable failure class
+   going into this work, not repeated by default.
+2. **Git-history erasure ships as its OWN separate, deliberate operation
+   afterward** -- Stanley's explicit instruction. Not bundled into
+   `alexandria delete`, not automatic. Proposed shape (not yet built,
+   scoped as its own follow-up item once the core lands): a new
+   `alexandria erase <doc_id>` verb, distinct from `delete` -- `delete`
+   stays instant/safe/reversible (undelete exists today); `erase` is the
+   rare, deliberate, genuinely-irreversible action. It reuses the tombstone
+   `delete` already does, then rewrites the corpus git repo's history for
+   that file's path only (via `git-filter-repo`, already installed on this
+   machine, the modern maintained tool -- not BFG, which is unmaintained),
+   then purges whatever the CORE's erasure-surfaces enumeration says needs
+   handling beyond the tombstone. Must refuse to run silently: print the
+   exact file path and the number of commits it will rewrite, require
+   explicit confirmation, matching the confirmation-gate pattern already
+   used elsewhere in this codebase (`--enrich-invalidate`, the real-corpus
+   `remember` write guard).
