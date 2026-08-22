@@ -846,10 +846,19 @@ def test_cli_erase_leaves_a_recoverable_pre_erase_git_backup(tmp_path: Path, mon
     assert app(["--corpus", str(corpus), "index"]) == 0
     capsys.readouterr()
     assert app(["--corpus", str(corpus), "erase", "sources/x", "--yes"]) == 0
-    capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "erase:" in out
+    assert "pre-erase git history retained" in out
 
-    backup_dir = corpus / ".git.pre-erase-sources_x.md"
+    # The pre-erase .git is retained under the verified-untracked durable
+    # state root, never under a tracked-worktree name.
+    backups = sorted((corpus / ".alexandria" / "erase-backups").iterdir())
+    assert len(backups) == 1
+    backup_dir = backups[0] / "git"
     assert backup_dir.is_dir()
+    log = subprocess.run(["git", "--git-dir", str(backup_dir), "log", "--oneline"],
+                         cwd=str(corpus), capture_output=True, text=True, timeout=10)
+    assert "add x" in log.stdout
 
 
 @requires_git_filter_repo
@@ -897,6 +906,44 @@ def test_cli_erase_never_touches_the_untracked_alexandria_state_directory(
     # was never touched by the erase.
     assert app(["--corpus", str(corpus), "search", "keep"]) == 0
     assert "sources/keep" in capsys.readouterr().out
+
+
+@requires_git_filter_repo
+def test_cli_erase_reports_when_rewritten_history_is_already_active(
+        tmp_path: Path, monkeypatch, capsys):
+    """#77: a post-swap GitEraseError (history_changed=True) must be reported
+    as ALREADY ACTIVE with a recovery/retry instruction -- never as
+    'history is UNCHANGED', which would be a false promise after the
+    rewritten .git landed."""
+    import subprocess
+
+    import alexandria.erasure as erasure_mod
+    from alexandria.erasure import GitEraseError
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+    _write_note(corpus, "sources/boom.md", "boom")
+    subprocess.run(["git", "add", "-A"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add boom"], cwd=str(corpus), check=True)
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    def post_swap_failure(corpus_arg, rel_path, **kwargs):
+        raise GitEraseError("simulated failure after the rewritten .git landed",
+                            history_changed=True)
+
+    monkeypatch.setattr(erasure_mod, "erase_from_git_history", post_swap_failure)
+    rc = app(["--corpus", str(corpus), "erase", "sources/boom", "--yes"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ALREADY ACTIVE" in err
+    assert "UNCHANGED" not in err
+    assert "recover" in err.lower()
 
 
 @requires_git_filter_repo
@@ -958,3 +1005,111 @@ def test_cli_erase_holds_the_corpus_write_lock_across_the_whole_operation(
     probe2 = WriteLock(corpus)
     assert probe2.acquire(blocking=False) is True
     probe2.release()
+
+
+# --- Red round 2, finding 2: a pre-swap rewrite failure must roll the
+# tombstone back so a retry can pass the clean-state preflight.
+
+
+@requires_git_filter_repo
+def test_cli_erase_pre_swap_failure_rolls_back_the_tombstone_for_retry(
+        tmp_path: Path, monkeypatch, capsys):
+    """If the git rewrite fails BEFORE rewritten history becomes active, the
+    erased document's tombstone must be undone (file bytes restored from HEAD,
+    index rows un-flagged) so the corpus is unchanged and `--yes` retries."""
+    import subprocess
+
+    import alexandria.erasure as erasure_mod
+    from alexandria.erasure import GitEraseError
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+    _write_note(corpus, "sources/retry.md", "retry me")
+    subprocess.run(["git", "add", "-A"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add retry"], cwd=str(corpus), check=True)
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    real_erase = erasure_mod.erase_from_git_history
+    calls = [0]
+
+    def pre_swap_failure(corpus_arg, rel_path, **kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise GitEraseError("simulated pre-swap rewrite failure", history_changed=False)
+        return real_erase(corpus_arg, rel_path, **kwargs)
+
+    monkeypatch.setattr(erasure_mod, "erase_from_git_history", pre_swap_failure)
+    rc = app(["--corpus", str(corpus), "erase", "sources/retry", "--yes"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "rolled back" in err
+    assert "UNCHANGED" in err
+
+    # The file is back and searchable again...
+    note = corpus / "sources" / "retry.md"
+    assert note.exists()
+    assert "retry me" in note.read_text()
+    assert app(["--corpus", str(corpus), "search", "retry"]) == 0
+    assert "sources/retry" in capsys.readouterr().out
+
+    # ...and a retry with a CLEAN preflight can pass (no tracked changes left)
+    # and completes the real rewrite.
+    assert app(["--corpus", str(corpus), "erase", "sources/retry", "--yes"]) == 0
+    assert not note.exists()
+
+
+# --- Red round 2, finding 3: cmd_erase must fail closed (and roll the
+# tombstone back) when whole-cache invalidation does not actually clear.
+
+
+@requires_git_filter_repo
+def test_cli_erase_fails_closed_when_cache_invalidation_does_not_clear(
+        tmp_path: Path, monkeypatch, capsys):
+    """If purge_all leaves durable rows, cmd_erase must abort BEFORE rewriting
+    history and roll the tombstone back so the corpus is unchanged."""
+    import subprocess
+
+    from alexandria.index import embedder as embedder_mod
+
+    monkeypatch.setenv("ALEXANDRIA_EMBED_PROVIDER", "hash")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(corpus), check=True)
+    _write_note(corpus, "sources/c.md", "c")
+    subprocess.run(["git", "add", "-A"], cwd=str(corpus), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add c"], cwd=str(corpus), check=True)
+
+    assert app(["--corpus", str(corpus), "index"]) == 0
+    capsys.readouterr()
+
+    def broken_purge_all(self):
+        return 0  # leaves every row in place
+
+    monkeypatch.setattr(embedder_mod.CachedEmbedder, "purge_all", broken_purge_all)
+    rc = app(["--corpus", str(corpus), "erase", "sources/c", "--yes"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "could not be invalidated" in err
+    assert "UNCHANGED" in err
+
+    # History was NOT rewritten and the file is back (tombstone rolled back).
+    log = subprocess.run(["git", "log", "--oneline", "--all", "--", "sources/c.md"],
+                         cwd=str(corpus), capture_output=True, text=True)
+    assert log.stdout.strip() != ""
+    note = corpus / "sources" / "c.md"
+    assert note.exists()
+    assert "c" in note.read_text()
+
+    # And the cache rows are still there (purge_all was the sabotage, not a fix).
+    import sqlite3
+    conn = sqlite3.connect(str(corpus / ".alexandria" / "cache" / "embeddings.sqlite"))
+    assert conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] > 0
+    conn.close()

@@ -35,6 +35,17 @@ jobs:
       - name: Install (pinned via uv.lock)
         run: uv sync --locked --extra dev
 
+      # #6 erase tail, Red review 2026-08-22: the history-rewrite tests are
+      # REAL-binary tests (git filter-repo).  They must never silently skip
+      # in CI, so this lane installs the tool into the pinned venv (whose
+      # bin/ is on PATH for the pytest step below) and then proves it is
+      # actually callable before the suite runs.
+      - name: Install git-filter-repo (mandatory for real erasure tests)
+        run: uv run --no-sync python -m pip install git-filter-repo
+
+      - name: Prove git-filter-repo is on PATH (no silent skips)
+        run: git filter-repo --version
+
       - name: Offline test suite
         # HF_HUB_OFFLINE=1 makes this job genuinely offline (Red review,
         # 2026-08-20): without it, a job NAMED "offline" still performs real

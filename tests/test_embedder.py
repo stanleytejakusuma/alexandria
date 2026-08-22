@@ -842,3 +842,158 @@ def test_purge_is_a_noop_in_read_only_mode(tmp_path: Path):
     writer2 = CachedEmbedder(CountingEmbedder(), cache_path)
     assert writer2.embed(["persisted"])[0] is not None
     assert writer2.last_cache_stats["hits"] == 1  # still cached
+
+
+# ---------------------------------------------------------------------------
+# #76 (Red-remediation): purge()/purge_all() acceptance -- whole-cache erase,
+# closed-cache failure, exact rowcounts, rollback, lock timeout.
+# ---------------------------------------------------------------------------
+
+
+def test_purge_all_clears_every_row_across_modes(tmp_path: Path):
+    """The erasure-safe operation: purge_all() clears the WHOLE cache --
+    document-mode AND query-mode rows -- because the cache is content-
+    addressed with no doc_id column, so a targeted key list computed from
+    the CURRENT text cannot prove it covers historical revisions,
+    transformed text, or prior chunking."""
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, tmp_path / "embeddings.sqlite")
+    embedder.embed(["alpha", "beta"])          # document-mode rows
+    embedder.embed(["alpha"], mode="q")        # query-mode row for same text
+    embedder.close()
+
+    writer = CachedEmbedder(CountingEmbedder(), tmp_path / "embeddings.sqlite")
+    before = writer._connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    assert before == 3
+    deleted = writer.purge_all()
+    assert deleted == 3
+    after = writer._connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    assert after == 0
+    writer.close()
+
+
+def test_purge_all_is_a_noop_in_read_only_mode(tmp_path: Path):
+    """A read-only (evaluation-only) cache instance must never mutate the
+    durable cache, matching purge()'s existing read_only contract."""
+    cache_path = tmp_path / "embeddings.sqlite"
+    writer = CachedEmbedder(CountingEmbedder(), cache_path)
+    writer.embed(["persisted"])
+    writer.close()
+
+    reader = CachedEmbedder(CountingEmbedder(), cache_path, read_only=True)
+    assert reader.purge_all() == 0
+    reader.close()
+
+    writer2 = CachedEmbedder(CountingEmbedder(), cache_path)
+    assert writer2.embed(["persisted"])[0] is not None
+    assert writer2.last_cache_stats["hits"] == 1  # still cached
+
+
+def test_purge_and_purge_all_raise_on_a_closed_writable_cache(tmp_path: Path):
+    """Silently returning 0 from a closed cache would falsely claim durable
+    rows had been erased; the only honest answer is a loud failure."""
+    embedder = CachedEmbedder(CountingEmbedder(), tmp_path / "embeddings.sqlite")
+    embedder.embed(["seed"])
+    embedder.close()
+    with pytest.raises(RuntimeError, match="cannot purge a closed embedding cache"):
+        embedder.purge(["seed"])
+    with pytest.raises(RuntimeError, match="cannot purge a closed embedding cache"):
+        embedder.purge_all()
+
+
+class _FailDelete(_FailCacheCommit):
+    """Fault-injection proxy that raises on DELETE statements only."""
+
+    @property
+    def total_changes(self):
+        return self.connection.total_changes
+
+    def execute(self, *args, **kwargs):
+        if self.fail and args and args[0].strip().upper().startswith("DELETE"):
+            raise sqlite3.OperationalError("injected delete failure")
+        return self.connection.execute(*args, **kwargs)
+
+    def executemany(self, sql, seq):
+        if self.fail and sql.strip().upper().startswith("DELETE"):
+            raise sqlite3.OperationalError("injected delete failure")
+        return self.connection.executemany(sql, seq)
+
+
+def test_purge_rolls_back_when_the_delete_fails(tmp_path: Path):
+    """A failed DELETE must roll the transaction back so a later retry can
+    still see (and purge) the rows -- never a half-purged cache."""
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, tmp_path / "embeddings.sqlite")
+    embedder.embed(["alpha", "beta"])
+    raw_connection = embedder._connection
+    faulty = _FailDelete(raw_connection)
+    embedder._connection = faulty
+
+    with pytest.raises(sqlite3.OperationalError, match="injected delete"):
+        embedder.purge(["alpha"])
+    assert not raw_connection.in_transaction
+    assert raw_connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 2
+
+    faulty.fail = False
+    assert embedder.purge(["alpha"]) == 1
+    assert raw_connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 1
+
+
+def test_purge_all_rolls_back_when_the_delete_fails(tmp_path: Path):
+    """The whole-cache DELETE must roll back on failure: an erase must never
+    leave a partially-cleared cache it then claims was invalidated."""
+    provider = CountingEmbedder()
+    embedder = CachedEmbedder(provider, tmp_path / "embeddings.sqlite")
+    embedder.embed(["alpha", "beta"])
+    raw_connection = embedder._connection
+    faulty = _FailDelete(raw_connection)
+    embedder._connection = faulty
+
+    with pytest.raises(sqlite3.OperationalError, match="injected delete"):
+        embedder.purge_all()
+    assert not raw_connection.in_transaction
+    assert raw_connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 2
+
+    faulty.fail = False
+    assert embedder.purge_all() == 2
+    assert raw_connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 0
+
+
+def test_purge_reports_exact_rowcounts_not_statement_rowcounts(tmp_path: Path):
+    """total_changes-based counting: purging 2 distinct rows returns 2, and a
+    re-purge of the same keys returns 0 -- never a stale rowcount."""
+    embedder = CachedEmbedder(CountingEmbedder(), tmp_path / "embeddings.sqlite")
+    embedder.embed(["one", "two", "three"])
+    assert embedder.purge(["one", "two"]) == 2
+    assert embedder.purge(["one", "two"]) == 0
+    assert embedder.purge(["three"]) == 1
+    assert embedder.purge(["three"]) == 0
+    embedder.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock contract is POSIX-only")
+def test_purge_fails_loudly_when_a_concurrent_holder_owns_the_write_lock(tmp_path: Path):
+    """A purge that cannot take the cache write lock within its bound must
+    raise EmbeddingCacheBusy, never silently skip the erasure."""
+    import fcntl
+
+    from alexandria.index import embedder as embedder_mod
+
+    cache_path = tmp_path / "embeddings.sqlite"
+    embedder = CachedEmbedder(CountingEmbedder(), cache_path, lock_timeout=0.2)
+    embedder.embed(["seed"])
+
+    holder = open(f"{cache_path}.lock", "r")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(embedder_mod.EmbeddingCacheBusy, match="purging"):
+            embedder.purge(["seed"])
+        with pytest.raises(embedder_mod.EmbeddingCacheBusy, match="invalidating"):
+            embedder.purge_all()
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+
+    # Once free, the same embedder purges normally.
+    assert embedder.purge(["seed"]) == 1
+    embedder.close()

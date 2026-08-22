@@ -200,7 +200,20 @@ the fact.
    by key), defeating the purpose of a deliberate erasure operation.
 
 
-## `alexandria erase` -- SHIPPED (2026-08-21)
+## `alexandria erase` -- SHIPPED (2026-08-21), RED-REMEDIATED (2026-08-22)
+
+> **Correction note (2026-08-22, Red review REJECT/BLOCK on `39d5b39`,
+> remediation on `feat/erase-verb`)**: the design paragraphs below were
+> written before the review and contain claims the remediation explicitly
+> reverses.  Read the corrected contract in
+> `docs/FAILURE-FRAME-erase-git-history.md` and `src/alexandria/erasure.py`
+> (phases, marker, same-device checks) -- in particular: the directory
+> cutover is TWO RENAMES, not a crash-atomic swap; retained backups live at
+> `.alexandria/erase-backups/<generation>/git` (never a tracked-worktree
+> `.git.pre-erase-*` name); the embedding cache is invalidated WHOLE
+> (`CachedEmbedder.purge_all()`), never by a targeted key purge; and the
+> lock-held tombstone is a shared `_apply_delete()` domain primitive, not a
+> `_held_lock` parameter.
 
 Built per the sequencing above, on `feat/erase-verb`, with a full pre-code
 failure-frame note written first (what breaks under `serve`'s shared
@@ -223,8 +236,14 @@ tests, not just asserted in prose**:
 1. Never operates on the corpus repo directly -- always clones
    (`git clone --no-local`) to a disposable tmp dir, rewrites the CLONE,
    validates the rewrite (`git log --all -- <path>` returns zero commits
-   in the clone), and only then atomically swaps the corpus's `.git`
-   directory for the clone's rewritten one.
+   in the clone), and only then performs the cutover: the original `.git`
+   is renamed to a retained backup and the rewritten directory renamed
+   into place.  Each individual rename is atomic; the PAIR is not
+   crash-atomic, so a durable fsynced transaction marker
+   (`.alexandria/erase-txn.json`, phases ``prepared`` ->
+   ``original-moved`` -> ``swapped`` ->
+   ``new_git_installed_needs_target_reconcile``) is written before the
+   first rename and drives recovery on the next invocation.
 2. A failure at any point BEFORE the swap leaves the corpus's `.git`
    completely untouched -- proven by monkeypatching `filter-repo` to fail
    and asserting the corpus's HEAD/log are byte-identical before and after.
@@ -232,17 +251,23 @@ tests, not just asserted in prose**:
    `.git` aside, then renaming the rewritten one into place) is recovered
    from immediately -- proven by monkeypatching the second `rename` call to
    raise and asserting the original `.git` is restored, not left absent.
-4. The pre-erase `.git` is never deleted, only renamed aside to
-   `.git.pre-erase-<path>` (mirrors #30 P2a's "never delete the previous
-   release" retention idiom) -- a manual recovery path, not something the
-   command manages long-term.
+4. The pre-erase `.git` is never deleted, only renamed aside to a
+   UUID-named generation under the verified-untracked
+   `.alexandria/erase-backups/<generation>/git` (mirrors #30 P2a's "never
+   delete the previous release" retention idiom) -- a manual recovery path,
+   not something the command manages long-term.  Staging mirrors and the
+   marker live under `.alexandria/erase-staging/<uuid>/` and
+   `.alexandria/erase-txn.json` respectively, all proven on the same
+   filesystem (`st_dev`) as the live `.git`.
 5. The write lock is held across the WHOLE operation (tombstone + cache
-   purge + git rewrite) as a single critical section -- `cmd_delete`
-   gained an internal `_held_lock` parameter so `cmd_erase` can pass its
-   own already-acquired lock through instead of `cmd_delete` acquiring and
-   releasing its own partway through. Proven by a dedicated test that
-   spies on the git-rewrite step and asserts a second, independent lock
-   acquisition attempt is refused for the full duration.
+   invalidation + git rewrite + target reconciliation) as a single
+   critical section -- the tombstone is a shared lock-held domain
+   primitive `_apply_delete()` used by both `cmd_delete` and `cmd_erase`
+   (no `_held_lock` parameter, no `SimpleNamespace` fabrication), and the
+   erase command acquires the lock BEFORE authoritative document
+   resolution and preflight. Proven by a dedicated test that spies on the
+   git-rewrite step and asserts a second, independent lock acquisition
+   attempt is refused for the full duration.
 
 **A real bug found and fixed during development, not just in review**: the
 first working version synced the corpus's working tree to the rewritten
@@ -258,7 +283,10 @@ the working-tree sync now targets ONLY the one known erased path directly
 plus a `git checkout HEAD -- .` for ordinarily-tracked paths. A dedicated
 regression test (`test_cli_erase_never_touches_the_untracked_alexandria_
 state_directory`) pins this permanently, vacuity-checked against the
-original buggy code (fails on it, passes on the fix).
+original buggy code (fails on it, passes on the fix).  The remediation
+sync is even narrower: `git read-tree HEAD` rebuilds only the replacement
+index (skipped for a zero-commit rewritten repo), and exactly the erased
+target is unlinked; no repository-wide checkout or clean runs anywhere.
 
 **A second real edge case found live**: if the erased document was the
 ONLY content in the ONLY commit, `filter-repo` correctly prunes that
@@ -276,12 +304,12 @@ git-filter-repo` or `brew install git-filter-repo`). Treated exactly like
 `pdftotext` for PDF ingest -- an optional external binary, absent →
 clean, actionable refusal naming both install paths (verified live:
 without it, `erase_from_git_history` raises `GitEraseError` with the
-install instructions, not an opaque subprocess error). Tests that exercise
-the real binary are `pytest.mark.skipif`-gated on `shutil.which
-("git-filter-repo")`, matching `test_ingest_refresh.py`'s
-`requires_pdftotext` precedent exactly; tests that only need
-`subprocess.run` mocked (rollback-safety tests) do not require the real
-binary and always run.
+install instructions, not an opaque subprocess error). Local tests that
+exercise the real binary are `pytest.mark.skipif`-gated on `shutil.which
+("git-filter-repo")` so the suite still runs on machines without it; CI
+is NOT allowed to skip: the mandatory lane installs `git-filter-repo` and
+proves it is on PATH before the suite, so the real-binary rewrite tests
+always execute in CI.
 
 **Free citation-linkage integration**: `impact_report()` reuses #9's
 durable citation tuples (`answers.jsonl`) to show an operator which past
@@ -289,6 +317,8 @@ answers cited the document before they confirm the erase -- read-only,
 informational, since the audit trail itself is explicitly NOT touched by
 this command per the ratified decision above.
 
-Full suite: 1063 → 1085 (dev), 1005+31 → 1045+40 (CI-like restricted PATH,
-the +9 skip delta being the git-filter-repo-gated tests). `precommit-scan.py
---all` clean.
+Full suite (post-remediation, 2026-08-22): 1114 passed, 0 skipped (dev,
+real-binary filter-repo tests running); 1069 passed, 45 skipped (CI-like
+restricted PATH -- locally the 45 skips are the filter-repo-gated tests; the
+mandatory CI lane installs the binary so they run there). `precommit-scan.py
+--all` clean, `git diff --check` clean.

@@ -517,41 +517,95 @@ class CachedEmbedder:
         ).hexdigest()
 
 
+    def _mutable_connection_for_purge(self) -> sqlite3.Connection | None:
+        """Return a live writable cache connection while ``self._lock`` is held.
+
+        A read-only evaluator intentionally treats purge requests as a no-op.
+        A normal embedder that has been closed must fail loudly rather than
+        claiming an erase cleared durable rows it can no longer reach.
+        """
+        if self.read_only:
+            return None
+        if self._connection is None or self._write_lock is None:
+            raise RuntimeError("cannot purge a closed embedding cache")
+        return self._connection
+
     def purge(self, texts: list[str], *, mode: str = "d") -> int:
-        """#6 erasure: remove the cache rows for `texts` (this content's own
-        key, not a doc_id -- the cache is content-addressed, per this
-        class's own docstring). Returns the number of rows actually
-        deleted (0 for a text that was never cached is a normal outcome,
-        not an error -- matches EnrichmentStore.invalidate()'s contract).
+        """Remove cache rows for exact content-addressed ``texts``.
 
-        Called by the `alexandria erase` command BEFORE any git history
-        rewrite, per docs/DECISION-erasure-scope-q1.md's pinned sequencing
-        invariant: a content-addressed key can only be computed while the
-        source text still exists to hash, so purging after history is
-        rewritten would leave these rows permanently unaddressable
-        (findable only by a full-table scan, never by key) instead of
-        actually removed.
+        This narrow maintenance primitive is deliberately *not* the erasure
+        implementation: a document may have historical versions or generated
+        forms whose source text is no longer known.  ``alexandria erase`` uses
+        :meth:`purge_all` instead, because the cache is rebuildable.
 
-        No-op (returns 0) in read_only mode -- an evaluation-only cache
-        instance has no business mutating the durable cache regardless of
-        what a caller asks it to purge, matching this class's existing
-        read_only contract elsewhere in this file."""
-        if not texts or self.read_only or self._connection is None:
+        Read-only evaluators return 0 without mutation.  A closed writable
+        cache raises: silently returning 0 could falsely claim that durable
+        rows had been erased.
+        """
+        if self.read_only:
             return 0
         keys = {self._key(text, mode) for text in texts}
         with self._lock:
+            connection = self._mutable_connection_for_purge()
+            assert connection is not None  # read_only returned above
+            if not keys:
+                return 0
             _lock_exclusive(self._write_lock, self.lock_timeout, "purging a cache batch")
             try:
-                self._connection.execute("BEGIN")
-                cur = self._connection.executemany(
+                before = connection.total_changes
+                connection.execute("BEGIN")
+                connection.executemany(
                     "DELETE FROM embeddings WHERE cache_key = ?",
                     [(key,) for key in keys],
                 )
-                deleted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
-                self._connection.commit()
+                deleted = connection.total_changes - before
+                connection.commit()
                 return deleted
             except Exception:
-                self._connection.rollback()
+                connection.rollback()
+                raise
+            finally:
+                fcntl.flock(self._write_lock, fcntl.LOCK_UN)
+
+    def cache_row_count(self) -> int:
+        """Number of durable embedding-cache rows (0 when none exist).
+
+        Used by ``cmd_erase`` to PROVE the whole-cache invalidation took
+        effect before history is rewritten, rather than trusting a return
+        value from a cache that might have been read-only or unavailable.
+        """
+        if self._connection is None:
+            return 0
+        try:
+            row = self._connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()
+        except sqlite3.Error:
+            return 0
+        return int(row[0]) if row else 0
+
+    def purge_all(self) -> int:
+        """Invalidate every durable embedding-cache row.
+
+        This is the erasure-safe operation.  Cache rows carry only a content
+        hash, not a document identity, so no targeted key list can prove it
+        covers prior document revisions, chunk recipes, summaries, or query
+        modes.  The cache is explicitly rebuildable; a deliberate ``erase``
+        therefore clears it entirely before rewriting source history.
+        """
+        if self.read_only:
+            return 0
+        with self._lock:
+            connection = self._mutable_connection_for_purge()
+            assert connection is not None
+            _lock_exclusive(self._write_lock, self.lock_timeout, "invalidating the embedding cache")
+            try:
+                before = connection.total_changes
+                connection.execute("BEGIN")
+                connection.execute("DELETE FROM embeddings")
+                deleted = connection.total_changes - before
+                connection.commit()
+                return deleted
+            except Exception:
+                connection.rollback()
                 raise
             finally:
                 fcntl.flock(self._write_lock, fcntl.LOCK_UN)
