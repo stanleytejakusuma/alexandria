@@ -37,10 +37,6 @@ get a GitHub issue.
 Infer the repo from `git remote -v`; `gh` does this automatically when run
 inside a clone.
 
-## Pull requests as a triage surface
-
-**PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
-
 ## When a skill says "publish to the issue tracker"
 
 Create a GitHub issue **only if** the task is in scope per the rules above.
