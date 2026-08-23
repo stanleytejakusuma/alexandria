@@ -309,69 +309,86 @@ def cmd_sync(args) -> int:
             print(f"  {item.source_id}  {len(item.content):>7,}ch")
         return 0
 
-    # Distillation is network-bound (pi-sessions), so a small pool turns hours
-    # into minutes; no-LLM connectors are trivially fast under the same loop.
-    # normalize() is pure (call + parse); writes and state stay on the main thread
-    # because StateStore is not thread-safe and correctness beats a few more workers.
-    # `empty` and `failed` are counted apart on purpose. A burst that yields no
-    # note is the COMMON, CORRECT outcome -- most sessions contain nothing worth
-    # keeping -- while a burst that raised is a real failure. Reporting them as
-    # one number hid a 3% error rate inside an apparent 33% "failure" rate.
-    written = done = empty = failed = 0
-    total = len(items)
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = {pool.submit(conn.normalize, item): item for item in items}
-        for future in as_completed(futures):
-            item = futures[future]
-            done += 1
-            raised = False
-            try:
-                docs = future.result()
-            except Exception as exc:                     # never lose the batch to one item
-                conn.errors.append(f"{item.source_id}: {type(exc).__name__}: {exc}")
-                docs = []
-                raised = True
-            for doc in docs:
-                doc.write(corpus)
-                written += 1
-            # A connector may RECORD a failure instead of raising -- pi-sessions
-            # catches its own LLM/JSON errors so one bad burst cannot kill the
-            # batch. "No exception" therefore does not mean "succeeded", and
-            # treating it that way would consume genuinely failed bursts and
-            # destroy the retry. conn.errors holds only failures, so this scan is
-            # proportional to the error count, not the item count.
-            errored = raised or any(e.startswith(f"{item.source_id}:") for e in conn.errors)
-            # Commit unless the item failed. Committing only when docs were
-            # produced left every legitimately-empty burst permanently
-            # unconsumed, so each weekly run re-distilled every session that had
-            # nothing to say -- forever, at ~33% of the corpus.
-            if not errored:
-                conn.commit([item])
-            if errored:
-                failed += 1
-            elif not docs:
-                empty += 1
-            if done % 10 == 0 or done == total:
-                rate = done / max(time.time() - t0, 1e-6)
-                eta = (total - done) / rate if rate else 0
-                print(f"  {done}/{total}  notes={written}  empty={empty}  failed={failed}  "
-                      f"{rate*60:.1f}/min  eta={eta/60:.1f}m", flush=True)
+    # #30 cross-writer integrity (2026-08-23): sync WRITES corpus source
+    # documents (doc.write) and connector state (commit), which index reads,
+    # erase's clean-tree preflight assumes immutable, and the drain consumes.
+    # Hold the corpus write lock for the whole mutation phase, bounded and
+    # fail-loudly like index/ingest. normalize() stays off-lock (pure), but
+    # writes and state are main-thread under the lock.
+    lock = write_lock(corpus)
+    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+        holder = lock.holder_pid()
+        print(f"alexandria: sync could not acquire the corpus write lock within "
+              f"{DEFAULT_LOCK_TIMEOUT:.0f}s (held by {holder or 'an unknown process'}); "
+              f"nothing was written -- wait for the current writer and retry.",
+              file=sys.stderr)
+        return 1
+    try:
+        # Distillation is network-bound (pi-sessions), so a small pool turns hours
+        # into minutes; no-LLM connectors are trivially fast under the same loop.
+        # normalize() is pure (call + parse); writes and state stay on the main thread
+        # because StateStore is not thread-safe and correctness beats a few more workers.
+        # `empty` and `failed` are counted apart on purpose. A burst that yields no
+        # note is the COMMON, CORRECT outcome -- most sessions contain nothing worth
+        # keeping -- while a burst that raised is a real failure. Reporting them as
+        # one number hid a 3% error rate inside an apparent 33% "failure" rate.
+        written = done = empty = failed = 0
+        total = len(items)
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = {pool.submit(conn.normalize, item): item for item in items}
+            for future in as_completed(futures):
+                item = futures[future]
+                done += 1
+                raised = False
+                try:
+                    docs = future.result()
+                except Exception as exc:                     # never lose the batch to one item
+                    conn.errors.append(f"{item.source_id}: {type(exc).__name__}: {exc}")
+                    docs = []
+                    raised = True
+                for doc in docs:
+                    doc.write(corpus)
+                    written += 1
+                # A connector may RECORD a failure instead of raising -- pi-sessions
+                # catches its own LLM/JSON errors so one bad burst cannot kill the
+                # batch. "No exception" therefore does not mean "succeeded", and
+                # treating it that way would consume genuinely failed bursts and
+                # destroy the retry. conn.errors holds only failures, so this scan is
+                # proportional to the error count, not the item count.
+                errored = raised or any(e.startswith(f"{item.source_id}:") for e in conn.errors)
+                # Commit unless the item failed. Committing only when docs were
+                # produced left every legitimately-empty burst permanently
+                # unconsumed, so each weekly run re-distilled every session that had
+                # nothing to say -- forever, at ~33% of the corpus.
+                if not errored:
+                    conn.commit([item])
+                if errored:
+                    failed += 1
+                elif not docs:
+                    empty += 1
+                if done % 10 == 0 or done == total:
+                    rate = done / max(time.time() - t0, 1e-6)
+                    eta = (total - done) / rate if rate else 0
+                    print(f"  {done}/{total}  notes={written}  empty={empty}  failed={failed}  "
+                          f"{rate*60:.1f}/min  eta={eta/60:.1f}m", flush=True)
 
-    print(f"wrote {written} note(s) from {total} burst(s); "
-          f"{empty} had nothing durable, {failed} failed")
-    for err in conn.errors[:10]:
-        print(f"  error: {err}", file=sys.stderr)
-    if len(conn.errors) > 10:
-        print(f"  ... and {len(conn.errors)-10} more", file=sys.stderr)
+        print(f"wrote {written} note(s) from {total} burst(s); "
+              f"{empty} had nothing durable, {failed} failed")
+        for err in conn.errors[:10]:
+            print(f"  error: {err}", file=sys.stderr)
+        if len(conn.errors) > 10:
+            print(f"  ... and {len(conn.errors)-10} more", file=sys.stderr)
     # #8 residual, found while fixing the CLI attribution gap: --caller has
     # existed on this verb's argparse but was never actually read here --
     # a silently dead flag, not a security gap, but wrong all the same.
-    logger.sync(connector=conn.name, duration_ms=int((time.time() - t0) * 1000),
-                discovered=total, normalized=total - failed,
-                committed=written, skipped=len(skipped), errors=conn.errors[:20],
-                caller=caller_label(getattr(args, "caller", "cli")), user=cli_identity())
-    return 0
+        logger.sync(connector=conn.name, duration_ms=int((time.time() - t0) * 1000),
+                    discovered=total, normalized=total - failed,
+                    committed=written, skipped=len(skipped), errors=conn.errors[:20],
+                    caller=caller_label(getattr(args, "caller", "cli")), user=cli_identity())
+        return 0
+    finally:
+        lock.release()
 
 
 @dataclass
@@ -402,7 +419,6 @@ class RememberResult:
 # an ordinary `<!-- TODO -->` stays legal, only a metadata-shaped comment is
 # refused.
 _META_FIELD_RE = re.compile(r"^[\w.-]+$")
-
 
 def _reject_inbox_injection(text: str, *, from_: str | None, session: str | None,
                             corrects: str | None) -> str | None:
@@ -2001,7 +2017,23 @@ def cmd_cache(args) -> int:
         else:
             print("embedding cache: not built yet")
         return 0
-    total = QueryCache(corpus).clear() + ResponseCache(corpus).clear()
+    # #30 cross-writer integrity (2026-08-23): cache --clear mutates the
+    # query/response tables serve reads and writes on every request.  Hold
+    # the corpus write lock so a clear can never interleave with a serving
+    # entry write (the semantic race; SQLite WAL+busy_timeout already makes
+    # the DELETE itself DB-safe).
+    lock = write_lock(corpus)
+    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+        holder = lock.holder_pid()
+        print(f"alexandria: cache --clear could not acquire the corpus write lock "
+              f"within {DEFAULT_LOCK_TIMEOUT:.0f}s (held by {holder or 'an unknown process'}); "
+              f"nothing was cleared -- wait for the current writer and retry.",
+              file=sys.stderr)
+        return 1
+    try:
+        total = QueryCache(corpus).clear() + ResponseCache(corpus).clear()
+    finally:
+        lock.release()
     print(f"cache --clear: removed {total} row(s) (embedding cache kept; "
           "it is content-hash keyed and self-invalidating)")
     return 0

@@ -28,6 +28,8 @@ import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .writelock import DEFAULT_LOCK_TIMEOUT, write_lock
+
 __all__ = ["BackupResult", "RestoreResult", "backup_state", "restore_state", "STATE_PATHS"]
 
 _GENERATION_MEMBER = ".alexandria/index/generation.json"
@@ -197,34 +199,50 @@ def restore_state(corpus: Path, archive_path: Path, *, dry_run: bool = False) ->
     corpus = Path(corpus)
     result = RestoreResult(dry_run=dry_run)
     allowed_prefixes = tuple(STATE_PATHS)
-    with tarfile.open(archive_path, "r:gz") as tar:
-        archive_gen = _archive_generation(tar)
-        corpus_gen = _corpus_generation(corpus)
-        regresses = (archive_gen is not None and corpus_gen is not None
-                    and archive_gen < corpus_gen)
-        if regresses:
-            result.generation_regression = (archive_gen, corpus_gen)
-        for member in tar.getmembers():
-            if not _is_allowed_member(member.name, allowed_prefixes):
-                # Trimming is deliberate (see docstring), but silence is not:
-                # a restore that dropped members reported the same "restored N
-                # paths" as a clean one, so the operator could not tell a good
-                # backup from a tampered or truncated one.
-                result.skipped.append(member.name)
-                continue
-            if regresses and posixpath.normpath(member.name) == _GENERATION_MEMBER:
-                # Structural fix: never write a regressing generation value.
-                # Reported separately from `skipped` (that list means "outside
-                # the allowlist, untrusted"; this member IS trusted, it is
-                # simply not applied, which is a different fact worth a
-                # different bucket so an operator scanning `skipped` for
-                # tampering evidence does not see an unrelated, benign entry).
-                result.generation_preserved = True
-                continue
-            result.restored.append(member.name)
-            if not dry_run:
-                # filter="data" is a second, independent line of defence
-                # (symlink/hardlink/absolute-path escapes); the allowlist above
-                # is the first and must stand on its own.
-                tar.extract(member, path=corpus, filter="data")
+    # #30 cross-writer integrity (2026-08-23): restore overwrites live
+    # `.alexandria` state (queries, audit, pending, liveness, generation)
+    # that index/promote/erase/serve also read and write.  It must hold the
+    # corpus write lock -- bounded, fail loudly, like every other state
+    # writer -- or a restore racing a weekly index/promote could clobber
+    # generation.json or pending state mid-write.
+    lock = write_lock(corpus)
+    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+        holder = lock.holder_pid()
+        raise RuntimeError(
+            f"restore could not acquire the corpus write lock within "
+            f"{DEFAULT_LOCK_TIMEOUT:.0f}s (held by {holder or 'an unknown process'}); "
+            f"nothing was restored -- wait for the current writer to finish and retry")
+    try:
+        with tarfile.open(archive_path, "r:gz") as tar:
+            archive_gen = _archive_generation(tar)
+            corpus_gen = _corpus_generation(corpus)
+            regresses = (archive_gen is not None and corpus_gen is not None
+                        and archive_gen < corpus_gen)
+            if regresses:
+                result.generation_regression = (archive_gen, corpus_gen)
+            for member in tar.getmembers():
+                if not _is_allowed_member(member.name, allowed_prefixes):
+                    # Trimming is deliberate (see docstring), but silence is not:
+                    # a restore that dropped members reported the same "restored N
+                    # paths" as a clean one, so the operator could not tell a good
+                    # backup from a tampered or truncated one.
+                    result.skipped.append(member.name)
+                    continue
+                if regresses and posixpath.normpath(member.name) == _GENERATION_MEMBER:
+                    # Structural fix: never write a regressing generation value.
+                    # Reported separately from `skipped` (that list means "outside
+                    # the allowlist, untrusted"; this member IS trusted, it is
+                    # simply not applied, which is a different fact worth a
+                    # different bucket so an operator scanning `skipped` for
+                    # tampering evidence does not see an unrelated, benign entry).
+                    result.generation_preserved = True
+                    continue
+                result.restored.append(member.name)
+                if not dry_run:
+                    # filter="data" is a second, independent line of defence
+                    # (symlink/hardlink/absolute-path escapes); the allowlist above
+                    # is the first and must stand on its own.
+                    tar.extract(member, path=corpus, filter="data")
+    finally:
+        lock.release()
     return result

@@ -50,6 +50,7 @@ from .connectors.base import RawItem
 from .connectors.inbox import InboxConnector, read_inbox_file_strict
 from .liveness import DEFAULT_DRAIN_INTERVAL_SECONDS, WARN_MULTIPLE
 from .pending import create_pending, pending_age
+from .writelock import DEFAULT_LOCK_TIMEOUT, write_lock
 
 __all__ = ["ReconcileReport", "STALE_MARKER_SECONDS", "reconcile_inbox"]
 
@@ -83,6 +84,25 @@ def reconcile_inbox(corpus: str | Path, *, requeue: bool = True) -> ReconcileRep
     if not inbox_dir.is_dir():
         return report
 
+    # #30 cross-writer integrity (2026-08-23): reconcile writes pending
+    # markers (create_pending) -- the exact state promote_pending consumes
+    # under its own write lock.  Hold the same lock, bounded and loud, so a
+    # reconcile can never interleave with a drain mid-discover.
+    lock = write_lock(corpus)
+    if not lock.acquire(blocking=True, timeout=DEFAULT_LOCK_TIMEOUT):
+        holder = lock.holder_pid()
+        raise RuntimeError(
+            f"reconcile could not acquire the corpus write lock within "
+            f"{DEFAULT_LOCK_TIMEOUT:.0f}s (held by {holder or 'an unknown process'}); "
+            f"nothing was requeued -- wait for the current writer and retry")
+    try:
+        return _reconcile_inbox_locked(corpus, inbox_dir, report, requeue=requeue)
+    finally:
+        lock.release()
+
+
+def _reconcile_inbox_locked(corpus: Path, inbox_dir: Path, report, *, requeue: bool) -> ReconcileReport:
+    """Reconcile body, run with the corpus write lock held (see above)."""
     conn = InboxConnector(inbox_dir=inbox_dir)
     for path in sorted(inbox_dir.glob("*.md")):
         report.total_files += 1
