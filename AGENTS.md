@@ -162,7 +162,7 @@ scanner.**
   bar in that decision doc.
 - **`sync` alone does not make anything retrievable.** `sync` (verb list:
   `migrate, sync, remember, promote, reconcile, backup, restore, lint, serve,
-  index, search, eval, answer, wiki-site, audit, cache, decay` — confirmed via
+  index, search, eval, answer, wiki-site, audit, cache, decay, staleness` — confirmed via
   `alexandria --help`) only pulls/distils from a connector into the corpus.
   Nothing is queryable until `index` runs afterward.
 - **Never run a corpus index build on the second host** (per STATE-OF-PLAY:
@@ -230,7 +230,7 @@ it as available, not enforced.
 `alexandria` is on `PATH` (`~/.local/bin/alexandria`, symlinked to this repo's
 `.venv/bin/alexandria`; entry point `alexandria.cli:app` per `pyproject.toml`).
 Verbs: `migrate, sync, remember, promote, reconcile, backup, restore, lint,
-serve, index, search, eval, answer, wiki-site, audit, cache, decay`.
+serve, index, search, eval, answer, wiki-site, audit, cache, decay, staleness`.
 
 - `index` flags confirmed: `--rebuild` (recreate index tables, retain
   embedding cache), `--backfill-manifest` (one-time fix for pre-manifest

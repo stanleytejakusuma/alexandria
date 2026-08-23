@@ -1894,6 +1894,49 @@ def _citation_records(gathered, verdict, *, schema_version: str = "citation-v2")
 
 
 
+
+def cmd_staleness(args) -> int:
+    """C5 freshness check: the age of the newest corpus content and newest
+    index finish, failing loudly past a threshold (default two weeks).
+
+    Quality gates cannot detect liveness failures (spec C5): recall@k on a
+    fixed golden set stays green forever on a frozen corpus. This verb makes
+    a silent freeze visible -- a nonzero exit and a loud, actionable message
+    naming the stale signal -- so the weekly loop and an operator both see it.
+    """
+    from .staleness import FRESHNESS_DEFAULT_MAX_AGE_DAYS, check
+
+    corpus = _config_for(args).corpus_path
+    max_age = (args.max_age_days if args.max_age_days is not None
+               else FRESHNESS_DEFAULT_MAX_AGE_DAYS)
+    report = check(corpus, max_age_seconds=max_age * 24 * 3600)
+    if report.ok:
+        print(f"staleness: fresh (max age {_human_age_arg(max_age)})")
+        if report.content_age_seconds is not None:
+            print(f"  newest document: {_human_age_arg(report.content_age_seconds / 86400)} old")
+        if report.index_age_seconds is not None:
+            print(f"  index last finished: {_human_age_arg(report.index_age_seconds / 86400)} ago")
+        for reason in report.reasons:
+            print(f"  note: {reason}")
+        return 0
+    print(f"alexandria: STALE corpus -- {report.reasons[0]}", file=sys.stderr)
+    for reason in report.reasons[1:]:
+        print(f"alexandria: {reason}", file=sys.stderr)
+    print(f"alexandria: staleness threshold is {_human_age_arg(max_age)}; "
+          f"re-run the weekly loop / sync to resume ingestion.",
+          file=sys.stderr)
+    return 1
+
+
+def _human_age_arg(days: float) -> str:
+    if days >= 1:
+        return f"{days:.1f} days"
+    hours = days * 24
+    if hours >= 1:
+        return f"{hours:.1f} hours"
+    return f"{hours * 60:.0f} minutes"
+
+
 def cmd_wiki_site(args) -> int:
     """Render a wiki dir (the shape run_pipeline emits) into a static site."""
     from .wiki_site import render_site
@@ -2519,6 +2562,12 @@ def build_parser() -> argparse.ArgumentParser:
     au = sub.add_parser("audit", help="summarize the pipeline audit logs")
     au.add_argument("--last", type=int, default=200)
     au.set_defaults(func=lambda a: print(audit_summary(_config_for(a).corpus_path, a.last)) or 0)
+
+
+    st = sub.add_parser("staleness", help="C5 freshness check: age of the newest content/index, fails loudly past a threshold")
+    st.add_argument("--max-age-days", type=float, default=None,
+                    help="staleness threshold in days (default 14, twice the weekly loop cadence)")
+    st.set_defaults(func=cmd_staleness)
 
     c = sub.add_parser("cache", help="cache stats and maintenance")
     c.add_argument("--clear", action="store_true")

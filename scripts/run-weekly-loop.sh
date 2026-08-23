@@ -117,6 +117,13 @@ VERIFY_STATUS=0
   --docs-before "$DOCS_BEFORE" --generation-before "$GEN_BEFORE" \
   >> "$DIGEST" 2>&1 || VERIFY_STATUS=1
 
+# C5 freshness (2026-08-23): quality gates cannot detect liveness failures --
+# recall stays green on a frozen corpus (the 2026-08-11 incident). A corpus
+# that has gone quiet must fail the loop loudly, not just report.
+echo "### staleness (did the corpus go quiet?)" >> "$DIGEST"
+"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" staleness \
+  >> "$DIGEST" 2>&1 || { echo "staleness FAILED: corpus is stale" >> "$DIGEST"; VERIFY_STATUS=1; }
+
 # A non-zero exit is recorded by launchd and read by nobody. The whole point of
 # the self-check is that a silent failure becomes visible, so push it somewhere
 # with a human on the other end. Best-effort: never let notification failure

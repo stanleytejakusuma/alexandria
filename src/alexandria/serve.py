@@ -37,6 +37,7 @@ from .index.store import SCALAR_FIELDS
 from .pending import oldest_pending_age
 from .promote import promote_pending
 from .writelock import IndexReadUnavailable, index_read_lock
+from .staleness import FRESHNESS_DEFAULT_MAX_AGE_DAYS, check as staleness_check
 
 MAX_BODY_BYTES = 65536
 MAX_TEXT_CHARS = 4000
@@ -268,6 +269,19 @@ def _source_document_count(corpus: Path) -> int:
     return count
 
 
+
+def _staleness_payload(corpus: Path) -> dict:
+    """C5 freshness fields for /health; read-only, never blocks serving."""
+    report = staleness_check(corpus)
+    return {
+        "ok": report.ok,
+        "max_age_days": FRESHNESS_DEFAULT_MAX_AGE_DAYS,
+        "content_age_seconds": report.content_age_seconds,
+        "index_age_seconds": report.index_age_seconds,
+        "reasons": list(report.reasons),
+    }
+
+
 def _health_payload(ctx: ServeContext) -> dict:
     """S1: the reported chunk count is cross-checked against TWO
     independent sources -- FTS5's row count, and a walk of sources/+wiki/ on
@@ -299,6 +313,11 @@ def _health_payload(ctx: ServeContext) -> dict:
         "source_documents_agree": source_doc_count == distinct_docs_indexed,
         "uptime_seconds": round(time.monotonic() - ctx.started_monotonic, 1),
         "liveness_stale": live.stale,
+        # C5 freshness (2026-08-23): age of the newest corpus content and the
+        # newest index finish, so an operator probing /health sees a frozen
+        # corpus or a silently-stopped index even when recall gates stay green.
+        "freshness": _staleness_payload(ctx.corpus),
+
         "liveness_reason": live.reason,
         "oldest_pending_age_seconds": live.oldest_pending_age_seconds,
         # The asynchronous half, made observable: seconds since the drain last

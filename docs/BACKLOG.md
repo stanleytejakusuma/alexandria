@@ -41,7 +41,7 @@ Audit sources: `/tmp/alx/audit/FINAL-GAP-PASS.md` (pass 1, 29 findings),
 |---|---|---|
 | 11 | **Verify the weekly loop actually runs** | `mkdir` fixed in `315418b` but **unverified in the wild** — the loop has never once completed. Do not trust it until one real run produces a digest |
 | 12 | **Re-sync the frozen corpus** | Ingestion stopped ~Aug 8; the catch-up is still explicit work |
-| 13 | **Staleness metric** (spec C5) | Age of newest indexed doc, failing loudly past a threshold. The gate that would have caught #12 on day one |
+| 13 | **[FIXED 2026-08-23]** **Staleness metric** (spec C5) | Age of newest indexed doc, failing loudly past a threshold. The gate that would have caught #12 on day one. Implemented: `src/alexandria/staleness.py` + `alexandria staleness` verb (default threshold 14d, configurable via `--max-age-days`), measuring BOTH content freshness (newest indexable source mtime, `is_indexable_source` predicate) and index freshness (generation.json `finished_at`); wired into `scripts/run-weekly-loop.sh` (a stale corpus fails the loop) and serve `/health` (read-only freshness fields); gate C5 pinned by 9 tests incl. the frozen-corpus gate, vacuity-verified against an inverted comparison |
 | 14 | **Measurement preconditions** (spec C6) | Three instances in one day of a correct metric measuring an unintended state. An eval invoked mid-index must refuse to report, not emit a delta |
 | 15 | **Non-atomic rebuild** (N10) | A crashed rebuild serves stale answers silently; `--rebuild` appears in zero tests (N26), with no resume marker |
 | 16 | **Hardcoded `~/alexandria-corpus`** (N6) in two signatures bypasses config; **owner-machine paths as CLI defaults** (N7) risk ingesting personal agent data |
