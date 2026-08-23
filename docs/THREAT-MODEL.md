@@ -40,9 +40,11 @@ file permissions correctly; it does not reimplement that).
   poisoned enrichment payload) — the actual live threat given ambient/agent-driven capture
   is part of this engine's design intent. See "Prompt injection / retrieval poisoning" below.
 - **A remote network attacker**: out of scope for the default configuration (`serve` binds
-  loopback-only), in scope only if an operator has explicitly opted into
-  `ALEXANDRIA_SERVE_ALLOW_REMOTE=1` — which this document treats as "the operator has taken
-  on TLS/auth responsibility themselves; not provided here."
+  loopback-only). In scope when an operator opts into `ALEXANDRIA_SERVE_ALLOW_REMOTE=1`:
+  since 2026-08-23 (`feat/serve-auth`) a remote caller without a valid bearer token is 401
+  — the token is the auth boundary (TLS still terminates at a proxy/ALB; this server is
+  stdlib HTTP only). An attacker WITH a valid token is an authorized user, not a threat
+  model entry.
 
 ## STRIDE walk-through
 
@@ -53,15 +55,17 @@ file permissions correctly; it does not reimplement that).
   that point (`cli.py:cli_identity`).
 - **`serve` caller identity**: derived from the connecting socket. A Unix socket path IS the
   identity (one socket per identity); any TCP connection gets the fixed label
-  `local-anonymous` regardless of claimed identity — no request body field can override this
-  (`serve.py`, `LOCAL_ANONYMOUS`). **Verified caveat**: the Unix socket file's permissions
+  `local-anonymous` unless a valid bearer token upgrades it — no request body field can
+  override identity (`serve.py`, `_resolve_tcp_identity`; `WORK-ORDER-serve-auth.md`).
+  **Verified caveat**: the Unix socket file's permissions
   are NOT explicitly set by this code (no `os.chmod` call found) -- protection currently
   relies on the process umask at socket-creation time and the containing directory's
   permissions, not an explicit, verified mode. **Second caveat**: if
   `ALEXANDRIA_SERVE_ALLOW_REMOTE=1` is set, a genuinely remote TCP peer is stamped with the
   SAME `local-anonymous` label a same-host anonymous caller would get — the label name
-  becomes misleading in that (opt-in, non-default) configuration. Treat `local-anonymous` as
-  "unauthenticated," not literally "on this machine," once remote binding is enabled.
+  was the pre-auth behavior; since 2026-08-23 a remote peer without a token is 401, so the
+  label only appears for loopback (or tokenless loopback under `--require-token`, which is
+  itself 401). Treat `local-anonymous` as "unauthenticated local," never remote.
 - **`--caller` (a tool label, not an identity)**: free text, cannot be verified on the CLI
   path (no trust boundary exists there to check against). Mitigated to "honest, not
   verified": a small known set of documented values (the CLI default, and the one external

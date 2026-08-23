@@ -571,7 +571,15 @@ def cmd_promote(args) -> int:
 
 def cmd_serve(args) -> int:
     """§5: run the warm HTTP server. Blocks until interrupted; the CLI itself
-    stays fully functional whether this is running or not (S6)."""
+    stays fully functional whether this is running or not (S6).
+
+    Auth (WORK-ORDER-serve-auth): a token file of ``user:sha256(token)``
+    lines (hashed at rest) plus per-request ``Authorization: Bearer``
+    verification. Remote callers without a valid token are 401; loopback
+    stays ``local-anonymous`` unless ``--require-token`` (proxy-fronted
+    cloud/VPS deployments). ``--add-token NAME`` mints a token, persists
+    only its hash, prints the token once, and exits without serving.
+    """
     from .serve import NonLoopbackRefused, serve as serve_forever
 
     config = _config_for(args)
@@ -582,9 +590,37 @@ def cmd_serve(args) -> int:
             return 2
         identity, sock_path = spec.split("=", 1)
         unix_sockets[identity] = sock_path
+
+    if args.add_token:
+        from .serve_auth import TOKEN_FILE_DEFAULT, hash_token, mint_token
+
+        token_file = args.token_file or os.environ.get("ALEXANDRIA_SERVE_TOKENS", "")
+        path = Path(token_file).expanduser() if token_file else config.corpus_path / TOKEN_FILE_DEFAULT
+        # Never echo the token into the audit trail or logs beyond this one
+        # print: the token is shown once to the operator, then only its hash
+        # exists on disk.
+        existing = {}
+        if path.exists():
+            from .serve_auth import load_token_file
+            existing = load_token_file(path)
+        if args.add_token in existing:
+            print(f"serve: a token for {args.add_token!r} already exists; "
+                  f"minting again would replace it -- remove the line from "
+                  f"{path} first to rotate.", file=sys.stderr)
+            return 1
+        token = mint_token()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{args.add_token}:{hash_token(token)}\n")
+        os.chmod(path, 0o600)
+        print(f"serve: token for {args.add_token!r} written to {path} (hash only, 0600)")
+        print(f"serve: YOUR TOKEN (shown once): {token}")
+        return 0
+
     try:
         serve_forever(config.corpus_path, config=config, host=args.host, port=args.port,
-                      unix_sockets=unix_sockets)
+                      unix_sockets=unix_sockets, token_file=args.token_file or None,
+                      require_token=args.require_token)
     except NonLoopbackRefused as exc:
         print(f"serve: {exc}", file=sys.stderr)
         return 2
@@ -2460,6 +2496,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--unix-socket", action="append", default=[],
                        metavar="IDENTITY=PATH",
                        help="one Unix socket per client identity (§5.3); repeatable")
+    serve.add_argument("--token-file", default="",
+                       help="file of user:sha256(token) lines (hashed at rest); "
+                            "default $ALEXANDRIA_SERVE_TOKENS or corpus/.alexandria/serve-tokens.txt")
+    serve.add_argument("--require-token", action="store_true",
+                       help="require a valid bearer token for ALL TCP requests "
+                            "(loopback included) -- proxy-fronted cloud/VPS deployments")
+    serve.add_argument("--add-token", metavar="NAME", default=None,
+                       help="mint a token for NAME, persist only its sha256, print it "
+                            "once, then exit without serving")
     serve.set_defaults(func=cmd_serve)
 
     index = sub.add_parser("index", help="chunk, embed, and index the corpus")

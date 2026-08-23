@@ -12,13 +12,33 @@ then bound to that socket). Non-loopback serving requires
 
 **Body limit:** 65536 bytes. **Text fields:** max 4000 chars. **k:** integer 1..50, default 5.
 
-## Identity (read this first)
+## Identity and authentication (read this first)
 
-- TCP callers are always `local-anonymous`. A `caller`/`user` field in the body
-  is deliberately **ignored** -- identity is never forgeable over HTTP.
+- **Precedence per request:** unix-socket binding > valid bearer token >
+  `local-anonymous` (loopback only) / 401.
 - A unix socket binds identity at bind time: `--unix-socket prime-agent=...`
-  attributes every request on that socket as `prime-agent`.
-- Attribution appears in the audit trail; it is not an authorization boundary.
+  attributes every request on that socket as `prime-agent` (never needs a token).
+- **Bearer tokens** (`serve --token-file PATH`, or `$ALEXANDRIA_SERVE_TOKENS`,
+  default `corpus/.alexandria/serve-tokens.txt`): the file holds
+  `user:sha256(token)` lines -- **hashed at rest**, so the file is not the
+  credential. Present a token as `Authorization: Bearer <token>`; the matched
+  user becomes the request identity (attributed in the audit trail).
+- A `caller`/`user` field in the body is deliberately **ignored** -- identity
+  is never forgeable over HTTP or a spoofed body.
+- **Enforcement:** a remote (non-loopback) caller without a valid token is
+  **401**. Loopback callers stay tokenless (`local-anonymous`) by default;
+  `serve --require-token` (or `$ALEXANDRIA_SERVE_REQUIRE_TOKEN=1`) forces a
+  valid token for ALL TCP requests, loopback included -- use it when serving
+  behind a TLS-terminating reverse proxy (cloud/VPS deployments), where the
+  proxy forwards to loopback and every proxied request would otherwise look
+  local. Explicitly-bound unix sockets remain tokenless.
+- **Mint tokens** with `alexandria serve --add-token NAME --token-file PATH`
+  (prints the token once, persists only its hash, 0600). The file is read at
+  startup; a new token takes effect on the next serve start.
+- **TLS is not built** (stdlib HTTP server): bearer tokens are only
+  meaningful over loopback/LAN/VPN or behind a TLS-terminating proxy.
+- Attribution appears in the audit trail; a token is an identity boundary,
+  not an RBAC/ACL mechanism (no per-route scoping).
 
 ## GET /health
 

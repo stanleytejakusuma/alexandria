@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ from .config import AppConfig
 from .index.store import SCALAR_FIELDS
 from .pending import oldest_pending_age
 from .promote import promote_pending
+from .serve_auth import load_token_file
 from .writelock import IndexReadUnavailable, index_read_lock
 from .staleness import FRESHNESS_DEFAULT_MAX_AGE_DAYS, check as staleness_check
 
@@ -94,6 +95,8 @@ class ServeContext:
     engine_lock: threading.Lock
     started_monotonic: float
     llm_defaults: dict[str, str]
+    token_store: dict[str, str] = field(default_factory=dict)  # user -> sha256hex
+    require_token: bool = False
 
 
 def _validated_answer_timeout() -> str:
@@ -113,7 +116,30 @@ def _validated_answer_timeout() -> str:
     return raw
 
 
-def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
+TOKENS_ENV = "ALEXANDRIA_SERVE_TOKENS"
+REQUIRE_TOKEN_ENV = "ALEXANDRIA_SERVE_REQUIRE_TOKEN"
+_TOKEN_FILE_DEFAULT = ".alexandria/serve-tokens.txt"
+
+
+def _load_token_store(token_file: str | Path | None, corpus: Path) -> dict[str, str]:
+    """Load the token store from the explicit path, the env var, or the
+    corpus-local default. A missing file is an EMPTY store (auth simply
+    falls back to local-anonymous / 401 per request); a malformed file
+    refuses loudly at startup -- a silently-dropped token line would make a
+    token stop working with no diagnosis."""
+    path = token_file
+    if path is None:
+        env = os.environ.get(TOKENS_ENV, "").strip()
+        path = env or corpus / _TOKEN_FILE_DEFAULT
+    path = Path(path).expanduser()
+    if not path.is_file():
+        return {}
+    return load_token_file(path)
+
+
+def build_serve_context(config: AppConfig, corpus: Path, *,
+                         token_file: str | Path | None = None,
+                         require_token: bool = False) -> ServeContext:
     """Build once at startup, reused by every request. Delegates the
     index-exists and manifest checks to `_build_search_engine` (S9: refuses
     to start with a named error on a provider/manifest mismatch) instead of
@@ -130,6 +156,8 @@ def build_serve_context(config: AppConfig, corpus: Path) -> ServeContext:
         locked_engine=_LockedEngine(engine, lock),
         embedder=engine.embedder, store=engine.store, lexical=engine.bm25,
         engine_lock=lock, started_monotonic=time.monotonic(),
+        token_store=_load_token_store(token_file, corpus),
+        require_token=require_token,
         llm_defaults={
             "base_url": os.environ.get("ALEXANDRIA_LLM_BASE_URL", "http://127.0.0.1:20128/v1"),
             "api_key_env": os.environ.get("ALEXANDRIA_LLM_KEY_ENV", "ALEXANDRIA_LLM_KEY"),
@@ -519,7 +547,38 @@ def dispatch(ctx: ServeContext, identity: str, method: str, path: str, body: byt
         return _json_error(503, str(exc))
 
 
-def _make_handler_class(ctx: ServeContext, identity: str) -> type[BaseHTTPRequestHandler]:
+def _make_handler_class(ctx: ServeContext, identity: str | None) -> type[BaseHTTPRequestHandler]:
+    """Build a handler class for one listener.
+
+    ``identity`` is fixed for unix sockets (the socket binds identity at bind
+    time, §5.3). TCP passes ``None``: identity is resolved PER REQUEST from a
+    valid bearer token, else ``local-anonymous`` on loopback, else 401 (remote
+    without a token, or ``--require-token`` mode). Precedence per request:
+    socket binding > valid token > local-anonymous / 401."""
+    local_peer = ("127.0.0.1", "::1", "localhost")
+    return _make_handler_class_impl(ctx, identity, local_peer)
+
+
+def _resolve_tcp_identity(authorization: str | None, token_store: dict[str, str],
+                          require_token: bool, peer: str) -> str | None:
+    """Per-request TCP identity: valid token > loopback-anonymous > 401.
+
+    Extracted so the remote branch (a non-loopback peer) is unit-testable
+    without binding a real non-loopback interface in CI."""
+    from .serve_auth import verify_bearer
+
+    user = verify_bearer(authorization, token_store)
+    if user is not None:
+        return user
+    if require_token:
+        return None
+    if peer in ("127.0.0.1", "::1", "localhost"):
+        return LOCAL_ANONYMOUS
+    return None
+
+
+def _make_handler_class_impl(ctx: ServeContext, identity: str | None,
+                             local_peer: tuple[str, ...]) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -556,14 +615,34 @@ def _make_handler_class(ctx: ServeContext, identity: str) -> type[BaseHTTPReques
             body = self.rfile.read(length) if length else b""
             self._dispatch_safely("POST", body)
 
+        def _resolve_identity(self) -> str | None:
+            """Identity for this request, or None when it must be rejected."""
+            if identity is not None:
+                return identity  # unix socket binds identity at bind time
+            peer = self.client_address[0] if isinstance(self.client_address, tuple) else ""
+            return _resolve_tcp_identity(
+                self.headers.get("Authorization", ""), ctx.token_store,
+                ctx.require_token, peer)
+
         def _dispatch_safely(self, method: str, body: bytes) -> None:
-            # An unhandled exception inside dispatch() must never abort the
-            # connection silently (BaseHTTPRequestHandler's default behavior
-            # on an uncaught exception is to close the socket with no
+            # Auth gate first: a rejected identity is a 401 response, never a
+            # dispatch. An unhandled exception inside dispatch() must never
+            # abort the connection silently (BaseHTTPRequestHandler's default
+            # behavior on an uncaught exception is to close the socket with no
             # response, which looks identical to a network failure from the
             # caller's side -- undiagnosable). Always write SOME response.
+            resolved = self._resolve_identity()
+            if resolved is None:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Bearer")
+                self.send_header("Content-Type", "application/json")
+                body_out = json.dumps({"error": "unauthorized"}).encode()
+                self.send_header("Content-Length", str(len(body_out)))
+                self.end_headers()
+                self.wfile.write(body_out)
+                return
             try:
-                status, resp_body, ctype = dispatch(ctx, identity, method, self.path, body)
+                status, resp_body, ctype = dispatch(ctx, resolved, method, self.path, body)
             except Exception:
                 traceback.print_exc()
                 status = 500
@@ -592,7 +671,8 @@ class TCPHTTPServer(ThreadingHTTPServer):
 
 def bind(corpus: str | Path, *, config: AppConfig | None = None, host: str = "127.0.0.1",
         port: int = 8420, unix_sockets: dict[str, str] | None = None,
-        allow_remote: bool | None = None) -> tuple[ServeContext, TCPHTTPServer, list[UnixHTTPServer]]:
+        allow_remote: bool | None = None, token_file: str | Path | None = None,
+        require_token: bool | None = None) -> tuple[ServeContext, TCPHTTPServer, list[UnixHTTPServer]]:
     """Build the context and bind every listener without blocking. Split out
     of `serve()` so tests (and any future process supervisor) can control
     the serve_forever lifecycle explicitly -- start each server in its own
@@ -607,17 +687,19 @@ def bind(corpus: str | Path, *, config: AppConfig | None = None, host: str = "12
     cfg = config or load_config(corpus_override=corpus)
     if allow_remote is None:
         allow_remote = os.environ.get(REMOTE_ENV) == "1"
+    if require_token is None:
+        require_token = os.environ.get(REQUIRE_TOKEN_ENV) == "1"
     if host not in ("127.0.0.1", "localhost", "::1") and not allow_remote:
         raise NonLoopbackRefused(
             f"refusing to bind {host}: set {REMOTE_ENV}=1 to allow a non-loopback bind")
 
-    ctx = build_serve_context(cfg, corpus)
+    ctx = build_serve_context(cfg, corpus, token_file=token_file, require_token=require_token)
     # Started here, not in serve(), because bind() is the single chokepoint
     # both the blocking entry point and every test go through -- a drain wired
     # only into serve() would be exercised by nothing.
     start_drain(ctx)
 
-    tcp_handler = _make_handler_class(ctx, LOCAL_ANONYMOUS)
+    tcp_handler = _make_handler_class(ctx, None)  # TCP: identity resolved per request
     tcp_server = TCPHTTPServer((host, port), tcp_handler)
 
     uds_servers: list[UnixHTTPServer] = []
@@ -633,11 +715,13 @@ def bind(corpus: str | Path, *, config: AppConfig | None = None, host: str = "12
 
 def serve(corpus: str | Path, *, config: AppConfig | None = None, host: str = "127.0.0.1",
          port: int = 8420, unix_sockets: dict[str, str] | None = None,
-         allow_remote: bool | None = None) -> None:
+         allow_remote: bool | None = None, token_file: str | Path | None = None,
+         require_token: bool | None = None) -> None:
     """Blocking entry point: bind every configured listener and run until
     interrupted."""
     _ctx, tcp_server, uds_servers = bind(corpus, config=config, host=host, port=port,
-                                         unix_sockets=unix_sockets, allow_remote=allow_remote)
+                                         unix_sockets=unix_sockets, allow_remote=allow_remote,
+                                         token_file=token_file, require_token=require_token)
     servers: list[socketserver.BaseServer] = [tcp_server, *uds_servers]
     threads: list[threading.Thread] = []
 

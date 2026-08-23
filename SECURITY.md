@@ -41,11 +41,21 @@ deploy this today as a shared service for mutually-untrusted users.
    passthrough (`--caller`) is explicitly labeled unverified in its own `--help` text and
    in the audit trail (values outside a small known set are prefixed `unverified:`) -- see
    backlog #8's full note for the reasoning.
-2. **`serve` binds loopback-only by default.** `bind()` in `serve.py` refuses a non-loopback
-   host unless `ALEXANDRIA_SERVE_ALLOW_REMOTE=1` is explicitly set (`NonLoopbackRefused`).
-   There is no TLS and no auth beyond filesystem/socket identity -- this is documented in
-   `serve.py`'s own module docstring as **deliberately not built**. Binding this server to a
-   non-loopback interface without a reverse proxy providing TLS+auth is not supported.
+2. **`serve` binds loopback-only by default, and remote callers require a bearer token.**
+   `bind()` in `serve.py` refuses a non-loopback host unless
+   `ALEXANDRIA_SERVE_ALLOW_REMOTE=1` is explicitly set (`NonLoopbackRefused`). Since
+   2026-08-23 (`feat/serve-auth`) a remote (non-loopback) TCP caller WITHOUT a valid
+   bearer token is **401** -- the old default-open behavior (every network caller stamped
+   `local-anonymous` with full access) is gone. Tokens come from a
+   `user:sha256(token)` file (`serve --token-file` / `$ALEXANDRIA_SERVE_TOKENS`, default
+   `corpus/.alexandria/serve-tokens.txt`, hashed at rest, 0600; mint with
+   `serve --add-token NAME`). Loopback stays tokenless (`local-anonymous`) by default;
+   `serve --require-token` (`$ALEXANDRIA_SERVE_REQUIRE_TOKEN=1`) forces a valid token for
+   ALL TCP requests, loopback included -- the proxy-fronted cloud/VPS deployment shape,
+   where a TLS-terminating proxy (ALB/nginx) forwards to loopback. Explicitly-bound unix
+   sockets remain tokenless. There is still **no TLS in this server** (stdlib HTTP):
+   tokens are only meaningful over loopback/LAN/VPN or behind a TLS-terminating proxy;
+   TLS remains out of scope per §10.
 3. **No secrets are read from argv, printed, or committed.** LLM/vision gateway
    credentials are read from environment variables only (`ALEXANDRIA_LLM_KEY`,
    `ALEXANDRIA_VISION_KEY`), with an optional macOS Keychain fallback the operator
@@ -59,8 +69,10 @@ deploy this today as a shared service for mutually-untrusted users.
    all branches at the time of that run) found zero leaks. History cleanliness is
    point-in-time verified, not continuously re-checked -- a future scan may find a different
    result if the enforcement in (a) is ever bypassed.
-4. **The corpus write surface is narrow and validated at the sink.** The only unauthenticated
-   write path (`serve`'s `/remember`, and the CLI's `remember` verb) appends to an inbox file,
+4. **The corpus write surface is narrow and validated at the sink.** `/remember` over TCP
+   requires a valid bearer token once the caller is remote or `--require-token` is set
+   (loopback without `--require-token` remains tokenless, matching the CLI's local trust);
+   the CLI's `remember` verb is local. The write appends to an inbox file,
    never edits an existing document. Every field that could forge the inbox's own parsing
    structure (a line that looks like the entry separator, an embedded metadata comment, a
    `from`/`session`/`corrects` value containing characters outside `[\w.-]`) is rejected using
