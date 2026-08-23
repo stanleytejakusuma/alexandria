@@ -12,8 +12,12 @@
 set -u
 CORPUS="${ALEXANDRIA_CORPUS:-$HOME/alexandria-corpus}"
 REPO="$HOME/codebase/alexandria"
-BASE_URL="${ALEXANDRIA_BASE_URL:?set in LaunchAgent}"
-KEYCHAIN_SERVICE="${ALEXANDRIA_KEYCHAIN_SERVICE:?set in LaunchAgent}"
+BASE_URL="${ALEXANDRIA_BASE_URL:?set in the supervisor}"
+# Key source is deployment-dependent: the Mac supervisor supplies the
+# keychain service name; a Linux/NAS supervisor supplies ALEXANDRIA_LLM_KEY
+# directly (its fleet-gateway key, e.g. from an EnvironmentFile). Required
+# only when ALEXANDRIA_LLM_KEY is absent.
+KEYCHAIN_SERVICE="${ALEXANDRIA_KEYCHAIN_SERVICE:-}"
 DIGEST="$CORPUS/.alexandria/loop/weekly-digest.md"
 # Every line below appends to $DIGEST. Bash resolves redirects BEFORE running
 # the command, so a missing parent dir does not just lose the log -- it stops
@@ -26,7 +30,13 @@ DOCS_BEFORE=$(find "$CORPUS/sources" "$CORPUS/wiki" -name '*.md' 2>/dev/null | w
 GEN_BEFORE=$(python3 -c "import json;print(json.load(open('$CORPUS/.alexandria/index/generation.json')).get('generation',0))" 2>/dev/null || echo 0)
 
 STAMP="$(date '+%Y-%m-%d %H:%M %Z')"
-KEY="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"
+if [ -n "${ALEXANDRIA_LLM_KEY:-}" ]; then
+  KEY="$ALEXANDRIA_LLM_KEY"
+elif [ -n "$KEYCHAIN_SERVICE" ]; then
+  KEY="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"
+else
+  KEY=""
+fi
 
 {
   echo ""
@@ -34,7 +44,7 @@ KEY="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"
 } >> "$DIGEST"
 
 if [ -z "$KEY" ]; then
-  echo "keychain lookup failed — sync skipped" >> "$DIGEST"
+  echo "LLM key lookup failed — sync skipped" >> "$DIGEST"
   exit 0
 fi
 
