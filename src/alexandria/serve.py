@@ -709,6 +709,13 @@ def bind(corpus: str | Path, *, config: AppConfig | None = None, host: str = "12
             os.unlink(sock_path)
         handler = _make_handler_class(ctx, identity)
         uds_servers.append(UnixHTTPServer(sock_path, handler))
+        # Red review 2026-08-23 (productionalization, auth condition): a
+        # tokenless identity socket must not be reachable by every local user
+        # through a world-readable mode inherited from umask. The socket
+        # BINDS the identity, so its permissions ARE the authorization
+        # boundary for that channel -- restrict explicitly, never rely on
+        # the ambient umask.
+        os.chmod(sock_path, 0o600)
 
     return ctx, tcp_server, uds_servers
 

@@ -120,3 +120,94 @@ and one real `answer` emits with the new gateway key.
 
 Modules built + test counts; proof for the §5 test; the new recall baseline (old vs
 new, honestly); any spec deviation and why; anything in §7 that bit anyway.
+
+
+---
+
+## Red productionalization review addendum (2026-08-23)
+
+Independent review of the migration plan + serve production posture returned
+**APPROVE-WITH-CHANGES** (round 1). The auth/hardening on main is sound for
+the three deployment shapes; two blockers and four musts must land before
+cutover. This addendum amends the plan accordingly; the engine-side fixes
+that were code gaps (unix-socket 0600 mode on identity sockets) landed on
+`feat/prod-readiness-nas`.
+
+### Blockers (must fix before any cutover)
+
+**B1 — embedding-cache transfer: plain rsync of a live SQLite WAL dataset is
+unsafe.** A cold rsync can capture `db`/`-wal`/`-shm` in inconsistent states
+and silently poison embeddings on the NAS even though startup and manifest
+checks pass. Required procedure:
+
+- Quiesce ALL Mac writers (stop the launchd job and any batch/cron writers).
+- `PRAGMA wal_checkpoint(TRUNCATE)` on the cache DB, then copy ONLY the main
+  DB file (no `-wal`/`-shm` sidecars).
+- On the NAS before starting serve: `PRAGMA integrity_check` on the copied
+  DB, and confirm the manifest identity (provider `local`, model, revision,
+  dim, normalization, dtype) exactly matches the Mac build that generated
+  the cache.
+- NEVER rebuild the cache on the NAS with a CPU embed as the default path:
+  a ~45k-chunk CPU embed previously took this NAS host down (2026-08-11);
+  NAS rebuild RTO must be benchmarked (§M3) before it is even considered.
+
+**B2 — cutover must prevent split-brain.** "Mac launchd retired only after
+verification" is too late if the Mac keeps serving/writing after the final
+rsync, or if any client still points at the Mac:
+
+- Stop the Mac launchd job and every batch/cron writer BEFORE the final
+  rsync; the final rsync must come from a quiescent source.
+- Re-point clients as ONE cutover action, then verify NAS `/health` and the
+  staleness check, then retire the Mac configuration.
+- Take a rollback snapshot (backup_state + index baseline archive) before
+  the NAS begins writing. Cross-writer locking protects writers inside ONE
+  install; it does not coordinate two hosts.
+
+### Musts (before migration)
+
+- **M1 — eval gate for the re-embed shift**: run the eval suite with the Mac
+  `local` provider, record the new recall/MRR baseline, set a rejection
+  threshold BEFORE looking at results, archive the old index + MLX baseline,
+  and do not cut over on a material regression.
+- **M2 — NAS provider readiness**: validate that the `local` torch provider
+  imports, loads the model, and passes the manifest gate ON THE NAS before
+  the migration; make systemd fail the unit immediately if the
+  provider/model cannot load (serve already refuses startup loudly via
+  `_warm_embedder`; the supervisor must treat that as a failed start).
+- **M3 — NAS rebuild RTO benchmark**: measure a full CPU re-embed/rebuild on
+  the NAS before cutover. The 33.1min Mac RTO does not transfer; if NAS RTO
+  is unacceptable, the safely-checkpointed cache copy (B1) is the fallback.
+- **M4 — off-NAS backup + restore test**: an off-NAS copy of the corpus +
+  `.alexandria` state (not only `backup_state` archives on the same disk),
+  and a restore test run on the NAS itself.
+
+### Auth/TLS deployment conditions (all three shapes)
+
+- Loopback-only local: sound on a trusted host; enable `--require-token` if
+  the NAS has untrusted local users (any local process can otherwise act as
+  `local-anonymous` with full access, including `/remember`).
+- Remote via tunnel: sound only if the tunnel terminates at NAS loopback and
+  is authenticated. Direct remote TCP without TLS/SSH/VPN is a BLOCKER
+  (tokens would pass in cleartext).
+- Proxy-fronted VPS: `--require-token` is mandatory; the proxy must forward
+  `Authorization` and must not log it.
+- Identity sockets are now chmod 0600 (engine fix on `feat/prod-readiness-nas`);
+  verify ownership/mode on the NAS supervisor config.
+- Token rotation requires a serve restart (load-once token file) — document
+  it; online rotation is a can-land-after item.
+
+### Ops musts before migration
+
+- Disk monitoring and log rotation (audit/cost logs, sqlite DBs).
+- systemd hardening: `EnvironmentFile` secrets mode 0600 or tighter, restart
+  policy, and a readiness check (health poll) after start.
+- Basic alerting on heartbeat/liveness failure and staleness — never rely on
+  a person checking `/health`.
+
+### Can land after migration
+
+- Centralized log aggregation/metrics.
+- Online token rotation/revocation without restart; token expiry/rate limits.
+- Automated upgrade/rollback pipeline (pinned commit + eval baseline
+  comparison).
+- Multi-tenancy/RBAC remains deliberately deferred (single-tenant trigger).

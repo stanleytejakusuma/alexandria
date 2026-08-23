@@ -171,6 +171,11 @@ def test_socket_identity_needs_no_token_and_beats_it(tmp_path, monkeypatch):
                                  token_file=_token_file(tmp_path, [("alice", "tok")]),
                                  unix_sockets={"prime-agent": sock_path})
     assert len(uds) == 1
+    import stat as stat_mod
+    assert (stat_mod.S_IMODE(os.stat(sock_path).st_mode)) == 0o600, (
+        "a tokenless identity socket must be 0600 -- its permissions ARE the "
+        "authorization boundary for that channel (Red productionalization)")
+
     with _running(tcp_server, uds) as addr:
         # Unix socket request without any token: socket identity is fixed.
         sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
