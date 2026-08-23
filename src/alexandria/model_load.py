@@ -35,6 +35,7 @@ unenforced assumption about how long an instance lives.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Callable, TypeVar
@@ -46,7 +47,25 @@ T = TypeVar("T")
 # Generous (a real model load is a few seconds even over a normal network) but
 # finite: past this, "slow" and "hung" are indistinguishable to the caller, and
 # a hang must never masquerade as normal startup.
+#
+# The 30s default fits the Mac (Apple Silicon) deploy. A CPU-only NAS/cloud
+# host can legitimately exceed 30s constructing the same model (measured
+# during the 2026-08-23 NAS migration: ~23s of shard progress plus
+# torch/pooling init crossed the bound). Override with
+# ALEXANDRIA_MODEL_LOAD_TIMEOUT (seconds) in the supervisor EnvironmentFile.
 DEFAULT_LOAD_TIMEOUT = 30.0
+
+
+def _effective_load_timeout(timeout: float | None) -> float:
+    """Env override (ALEXANDRIA_MODEL_LOAD_TIMEOUT, seconds) wins over the
+    caller's default, so a deployment can bound the bound without code."""
+    raw = os.environ.get("ALEXANDRIA_MODEL_LOAD_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return max(float(raw), 1.0)
+        except ValueError:
+            pass
+    return timeout if timeout is not None else DEFAULT_LOAD_TIMEOUT
 
 # A network blip must not become a process-lifetime outage (the exact bug
 # fixed here), but must also not force a real per-caller cost floor when the
@@ -90,9 +109,10 @@ def clear_failure_cache() -> None:
         _state.clear()
 
 
-def load_with_timeout(load: Callable[[], T], *, timeout: float = DEFAULT_LOAD_TIMEOUT,
+def load_with_timeout(load: Callable[[], T], *, timeout: float | None = DEFAULT_LOAD_TIMEOUT,
                       description: str, key: str | None = None,
                       cooldown: float = DEFAULT_COOLDOWN) -> T:
+    timeout = _effective_load_timeout(timeout)
     """Run ``load`` to completion, or raise ModelLoadTimeout after ``timeout``
     seconds.
 

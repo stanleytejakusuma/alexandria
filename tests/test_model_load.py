@@ -246,3 +246,39 @@ def test_concurrent_callers_with_the_same_key_share_one_in_flight_attempt():
         f"callers -- single-flight requires exactly one")
     assert len(results) == 5 and all(r == "loaded" for r in results)
     assert not errors
+
+
+def test_env_override_raises_the_load_bound(monkeypatch):
+    """ALEXANDRIA_MODEL_LOAD_TIMEOUT (seconds) overrides the 30s default, so a
+    CPU-only NAS host can load a model that legitimately takes longer to
+    construct. The override must WIN over the caller default."""
+    import time as time_mod
+
+    from alexandria import model_load as ml
+
+    started = time_mod.monotonic()
+    monkeypatch.setenv("ALEXANDRIA_MODEL_LOAD_TIMEOUT", "0.1")
+
+    def slow_load():
+        time_mod.sleep(5)
+        return "done"
+
+    with pytest.raises(ml.ModelLoadTimeout):
+        ml.load_with_timeout(slow_load, description="slow model")
+    assert time_mod.monotonic() - started < 3  # fired near the 0.1s override
+
+
+def test_env_override_is_ignored_when_unset(monkeypatch):
+    """Default behavior unchanged without the env var: the 30s bound applies."""
+    import time as time_mod
+
+    from alexandria import model_load as ml
+
+    monkeypatch.delenv("ALEXANDRIA_MODEL_LOAD_TIMEOUT", raising=False)
+    started = time_mod.monotonic()
+
+    def fast_load():
+        return "ok"
+
+    assert ml.load_with_timeout(fast_load, description="fast") == "ok"
+    assert time_mod.monotonic() - started < 3
