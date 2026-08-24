@@ -125,3 +125,25 @@ def test_errors_do_not_leak_between_instances(tmp_path):
     first.discover()
     assert first.errors
     assert KnowledgeGraphConnector(tmp_path).errors == []
+
+
+def test_appledouble_sidecars_are_never_ingested(tmp_path):
+    """Netatalk/SMB AppleDouble sidecars (`._*.md`) must not become corpus
+    documents. Some of them embed the original note's full text -- frontmatter,
+    source_id and H1 included -- so the normal 'unusable' filter does NOT catch
+    them. Observed 2026-08-24 on the NAS vault: 11,704 sidecars, 4,358 of which
+    were ingested as binary junk documents, and the weekly verify then failed
+    because those junk files were the newest 'documents' with no chunks."""
+    vault = tmp_path / "notes"
+    vault.mkdir()
+    (vault / "notes-real-note.md").write_text(NOTE, encoding="utf-8")
+    # A sidecar carrying a full embedded copy of the original note (as
+    # Netatalk does for files with resource forks): valid frontmatter, source,
+    # source_id and H1, so pre-fix discover() ingests it like a real note.
+    (vault / "._notes-real-note.md").write_text(NOTE, encoding="utf-8")
+    conn = KnowledgeGraphConnector(vault)
+    items = conn.discover()
+    names = sorted(i.content.splitlines()[-1].strip() if i.content else "" for i in items)
+    assert len(items) == 1, f"pre-fix discover() ingests the sidecar: {len(items)} items"
+    assert "All 14 Skills Verified" in items[0].content
+    assert not any("._" in n for n in names)

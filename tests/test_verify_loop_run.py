@@ -123,3 +123,27 @@ def test_a_stem_appearing_as_a_bare_substring_is_not_counted_as_a_hit(tmp_path):
     liar.chmod(0o755)
     out = _run(_corpus(tmp_path / "c"), liar, 1, 3)
     assert out.returncode == 1, "a bare substring must not count as retrieval"
+
+
+def test_verify_ignores_appledouble_sidecars(tmp_path):
+    """AppleDouble sidecar files in the corpus must not be treated as newest
+    documents: they are transfer artifacts with no chunks, and a sync that only
+    refreshes them would fail the loop every week (observed on the NAS,
+    2026-08-24: 4,358 ingested `._<store>-*` files failed the indexed and
+    retrievable checks)."""
+    corpus = _corpus(tmp_path, generation=3)
+    side = tmp_path / "sources" / "x" / "._zzz-newest-sidecar.md"
+    side.write_text("\x00\x05\x16\x07binary AppleDouble junk\n", encoding="utf-8")
+    # Make the sidecar the newest file so pre-fix newest_docs() picks it.
+    import os
+    os.utime(side, (2_000_000_000, 2_000_000_000))
+    os.utime(tmp_path / "sources" / "x" / f"{STEM}.md", (1_000_000_000, 1_000_000_000))
+    git = ["git", "-C", str(tmp_path), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "-C", str(tmp_path), "add", "sources"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "sidecar"], check=True)
+
+    # docs_before counts only the real document: the sidecar is new and
+    # committed, so the loop must pass with a bumped generation.
+    r = _run(corpus, _finder(tmp_path, finds=True), docs_before=1, gen_before=2)
+    assert r.returncode == 0, f"verify failed on sidecar-only newest docs:\n{r.stdout}\n{r.stderr}"
+    assert "[FAIL]" not in r.stdout

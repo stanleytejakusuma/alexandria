@@ -33,8 +33,17 @@ from pathlib import Path
 INDEXED_DIRS = ("sources", "wiki")
 
 
+def _is_document(p: Path) -> bool:
+    """A real corpus document: a .md file that is not an AppleDouble transfer
+    artifact. Netatalk/SMB sidecars ("._*.md") are binary metadata that
+    is_indexable_source ignores, so counting them as documents inflates the
+    count and, as the newest files, fails the indexed check every run."""
+    return p.suffix == ".md" and not p.name.startswith("._")
+
+
 def docs_on_disk(corpus: Path) -> int:
-    return sum(1 for d in INDEXED_DIRS for _ in (corpus / d).rglob("*.md"))
+    return sum(1 for d in INDEXED_DIRS for _ in (corpus / d).rglob("*.md")
+               if _is_document(_))
 
 
 def index_generation(corpus: Path) -> int:
@@ -54,7 +63,8 @@ def newest_docs(corpus: Path, n: int = 5) -> list[Path]:
     The vault really does contain one whose title is `[[none]]`; searching for
     that finds nothing, and probing only it failed the whole run.
     """
-    docs = [p for d in INDEXED_DIRS for p in (corpus / d).rglob("*.md")]
+    docs = [p for d in INDEXED_DIRS for p in (corpus / d).rglob("*.md")
+            if _is_document(p)]
     return sorted(docs, key=lambda p: p.stat().st_mtime, reverse=True)[:n]
 
 

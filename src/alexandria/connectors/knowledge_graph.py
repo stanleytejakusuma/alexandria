@@ -36,6 +36,11 @@ __all__ = ["KnowledgeGraphConnector"]
 SKIP_NAMES = {"index.md", "log.md", "README.md"}
 SKIP_MARKER = "sync-conflict"
 
+# Netatalk/SMB AppleDouble sidecars ("._*.md", 11,704 observed in the NAS vault
+# 2026-08-24). Some embed the original note's full text, so the frontmatter
+# filter below does not catch them and they get ingested as binary junk docs.
+APPLEDOUBLE_PREFIX = "._"
+
 H1_RE = re.compile(r"^#\s+(.+)$", re.M)
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+)")
 # The projection sweep's own output, dropped on import. Usually just a
@@ -82,7 +87,8 @@ class KnowledgeGraphConnector(NoStateMixin):
         if not self.vault_dir.is_dir():
             return items
         for path in sorted(self.vault_dir.rglob("*.md")):
-            if path.name in SKIP_NAMES or SKIP_MARKER in path.name:
+            if (path.name in SKIP_NAMES or SKIP_MARKER in path.name
+                    or path.name.startswith(APPLEDOUBLE_PREFIX)):
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
