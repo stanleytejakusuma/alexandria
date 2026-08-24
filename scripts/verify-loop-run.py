@@ -78,13 +78,45 @@ def chunks_for(corpus: Path, doc: Path) -> int:
     find anything.
     """
     key = str(doc.relative_to(corpus).with_suffix(""))
+    fts = _active_fts_path(corpus)
+    if fts is None:
+        return 0
     try:
-        con = sqlite3.connect(f"file:{corpus}/.alexandria/index/fts.sqlite?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{fts}?mode=ro", uri=True)
         with con:
             return con.execute("SELECT count(*) FROM chunk_metadata WHERE chunk_id LIKE ?",
                                (f"{key}#%",)).fetchone()[0]
     except sqlite3.Error:
         return 0
+
+
+def _active_fts_path(corpus: Path) -> Path | None:
+    """The fts.sqlite of the ACTIVE index, wherever it lives.
+
+    Since the staged-release cutover (DECISION-staged-releases-p2a) the live
+    store lives at .alexandria/index/releases/<id>/ -- the legacy flat
+    .alexandria/index/fts.sqlite is a frozen snapshot from before the first
+    release and never receives new chunks. Probing it made the indexed check
+    false-FAIL every run once a release existed (observed on the NAS
+    2026-08-24: the two newest documents had chunks in the active release but
+    the verify reported 0/5 because it queried the legacy file). Resolution
+    mirrors index/releases.py's resolve_active_index_dir: active.json wins;
+    a pointer to a missing release fails loud (returns None -> 0 chunks ->
+    the run fails, which is correct because the index is genuinely broken).
+    """
+    active = corpus / ".alexandria/index/active.json"
+    if not active.exists():
+        return corpus / ".alexandria/index/fts.sqlite"
+    try:
+        data = json.loads(active.read_text())
+        release_id = data.get("release_id")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(release_id, str):
+        return None
+    release_dir = corpus / ".alexandria/index/releases" / release_id
+    fts = release_dir / "fts.sqlite"
+    return fts if fts.exists() else None
 
 
 def is_probeable(title: str) -> bool:

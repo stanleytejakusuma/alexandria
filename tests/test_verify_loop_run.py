@@ -147,3 +147,53 @@ def test_verify_ignores_appledouble_sidecars(tmp_path):
     r = _run(corpus, _finder(tmp_path, finds=True), docs_before=1, gen_before=2)
     assert r.returncode == 0, f"verify failed on sidecar-only newest docs:\n{r.stdout}\n{r.stderr}"
     assert "[FAIL]" not in r.stdout
+
+
+def test_verify_reads_the_active_release_fts_not_the_legacy_file(tmp_path):
+    """Since the staged-release cutover the live FTS lives under
+    .alexandria/index/releases/<id>/. The verify must probe THAT file: the
+    legacy flat .alexandria/index/fts.sqlite is frozen before the first
+    release and never gains chunks, so probing it false-FAILs every post-
+    cutover run (observed on the NAS 2026-08-24: newest docs had chunks in
+    the active release, verify reported 0/5)."""
+    corpus = _corpus(tmp_path, generation=3)
+    # Remove the legacy fts and place a fresh one inside an active release --
+    # exactly the post-cutover layout. The stale legacy file exists too and
+    # holds NO rows for the document.
+    legacy = tmp_path / ".alexandria" / "index" / "fts.sqlite"
+    legacy.unlink()
+    rel = tmp_path / ".alexandria" / "index" / "releases" / "20260824T000000-deadbeef"
+    rel.mkdir(parents=True)
+    con = sqlite3.connect(rel / "fts.sqlite")
+    con.execute("CREATE TABLE chunk_metadata (chunk_id TEXT PRIMARY KEY)")
+    con.execute("INSERT INTO chunk_metadata VALUES (?)", (f"sources/x/{STEM}#ab12cd34",))
+    con.commit()
+    con.close()
+    (tmp_path / ".alexandria" / "index" / "active.json").write_text(
+        json.dumps({"activated_at": "2026-08-24T00:00:00+0000",
+                    "release_id": "20260824T000000-deadbeef"}))
+    git = ["git", "-C", str(tmp_path), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "release"], check=True)
+
+    r = _run(corpus, _finder(tmp_path, finds=True), docs_before=1, gen_before=2)
+    assert r.returncode == 0, f"verify failed against the active release:\n{r.stdout}\n{r.stderr}"
+    assert "[FAIL]" not in r.stdout
+
+
+def test_verify_fails_loud_when_active_release_fts_is_missing(tmp_path):
+    """A release pointer whose fts.sqlite is gone must fail the run, not
+    silently fall back to the legacy file (which would mask a broken index)."""
+    corpus = _corpus(tmp_path, generation=3)
+    rel = tmp_path / ".alexandria" / "index" / "releases" / "20260824T000000-deadbeef"
+    rel.mkdir(parents=True)
+    (tmp_path / ".alexandria" / "index" / "active.json").write_text(
+        json.dumps({"activated_at": "2026-08-24T00:00:00+0000",
+                    "release_id": "20260824T000000-deadbeef"}))
+    git = ["git", "-C", str(tmp_path), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "release"], check=True)
+
+    r = _run(corpus, _finder(tmp_path, finds=True), docs_before=1, gen_before=2)
+    assert r.returncode == 1
+    assert "[FAIL] indexed" in r.stdout
