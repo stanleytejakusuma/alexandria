@@ -20,11 +20,13 @@ def test_identity_reranker_keeps_order_and_obeys_top_k():
     assert IdentityReranker().rerank("query", candidates, k=1) == candidates[:1]
 
 
-def test_half_precision_is_on_by_default():
-    """Measured 3.12x faster with byte-identical top-5 ordering and no NaNs -- the
-    only latency lever tested that cost nothing. Truncation, a smaller model, and a
-    lower prefetch all changed results."""
-    assert CrossEncoderReranker().half_precision is True
+def test_half_precision_defaults_to_auto_not_hard_true():
+    """Was `half_precision is True` on the strength of a 3.12x MPS measurement
+    with byte-identical ordering. R6: that number does not transfer to bare-CPU
+    hosts, where fp16 runs in slow software emulation -- so the default is now
+    AUTO (None until load resolves it per-device). The fp16 win still applies
+    wherever it was measured; see test_rerank_precision_defaults_to_auto_device_aware."""
+    assert CrossEncoderReranker().half_precision is None
 
 
 def test_half_precision_can_be_disabled():
@@ -186,3 +188,48 @@ def test_a_failed_load_retries_after_the_cooldown_expires(monkeypatch):
         reranker.rerank("query", candidates, k=1)
 
     assert len(load_calls) == 2, "a call after the cooldown must retry, not stay cached-failed forever"
+
+
+def test_rerank_precision_defaults_to_auto_device_aware(monkeypatch):
+    """R6: half_precision=None (the new default) means AUTO -- fp16 on GPU
+    (CUDA/MPS), fp32 on bare CPU. NAS-class x86 CPUs emulate fp16 in slow
+    software paths; the 3.12x speedup measurement was an Apple-Silicon MPS
+    number and does not transfer. Auto keeps the win where it exists and
+    avoids the penalty where it doesn't, with no per-host config."""
+    import torch
+    from alexandria.retrieval.rerank import CrossEncoderReranker
+
+    r = CrossEncoderReranker()
+    assert r.half_precision is None  # unresolved until load
+
+    gpu = torch.cuda.is_available() or (
+        getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available())
+    assert r._resolve_half() is gpu
+
+
+def test_rerank_precision_env_overrides_auto(monkeypatch):
+    """ALEXANDRIA_RERANK_HALF=on|off forces precision regardless of device --
+    the benchmark/NaN-escape hatch."""
+    from alexandria.retrieval.rerank import CrossEncoderReranker
+
+    monkeypatch.setenv("ALEXANDRIA_RERANK_HALF", "off")
+    assert CrossEncoderReranker()._resolve_half() is False
+    monkeypatch.setenv("ALEXANDRIA_RERANK_HALF", "on")
+    assert CrossEncoderReranker()._resolve_half() is True
+
+
+def test_rerank_precision_explicit_arg_beats_env():
+    from alexandria.retrieval.rerank import CrossEncoderReranker
+
+    r = CrossEncoderReranker(half_precision=False)
+    assert r._resolve_half() is False
+
+
+def test_bad_rerank_half_env_is_a_loud_startup_error(monkeypatch):
+    """A typo'd value must refuse loudly, not silently pick a default."""
+    import pytest
+    from alexandria.retrieval.rerank import CrossEncoderReranker
+
+    monkeypatch.setenv("ALEXANDRIA_RERANK_HALF", "ture")  # typo
+    with pytest.raises(ValueError, match="ALEXANDRIA_RERANK_HALF"):
+        CrossEncoderReranker()._resolve_half()

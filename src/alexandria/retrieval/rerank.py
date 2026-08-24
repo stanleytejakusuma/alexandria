@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -80,13 +81,42 @@ class CrossEncoderReranker:
     """
 
     def __init__(self, model: str = "BAAI/bge-reranker-v2-m3", *,
-                 half_precision: bool = True, load_timeout: float = DEFAULT_LOAD_TIMEOUT,
+                 half_precision: bool | None = None, load_timeout: float = DEFAULT_LOAD_TIMEOUT,
                  cooldown: float = DEFAULT_COOLDOWN) -> None:
         self.model_name = model
+        # R6: None means AUTO -- resolved per-device at load time (fp16 on
+        # CUDA/MPS, fp32 on bare CPU). The old hard True default encoded an
+        # Apple-Silicon measurement (3.12x) that actively backfires on
+        # NAS-class x86 CPUs, which emulate fp16 in software. Explicit
+        # True/False still wins over everything; ALEXANDRIA_RERANK_HALF
+        # overrides auto without code changes.
         self.half_precision = half_precision
         self.load_timeout = load_timeout
         self.cooldown = cooldown
         self._model = None
+
+    def _resolve_half(self) -> bool:
+        """Resolve the tri-state to a concrete precision.
+
+        Precedence: explicit constructor arg > ALEXANDRIA_RERANK_HALF env >
+        device auto-detect at load time. A malformed env value raises here
+        -- loud refusal beats silently picking a default (the same policy
+        as ALEXANDRIA_ANSWER_TIMEOUT's startup validation)."""
+        if isinstance(self.half_precision, bool):
+            return self.half_precision
+        raw = os.environ.get("ALEXANDRIA_RERANK_HALF", "").strip().lower()
+        if raw:
+            if raw in ("on", "true", "1"):
+                return True
+            if raw in ("off", "false", "0"):
+                return False
+            raise ValueError(
+                f"ALEXANDRIA_RERANK_HALF must be on|off (got {raw!r})")
+        import torch  # deferred: only needed when auto actually resolves
+
+        return bool(torch.cuda.is_available() or (
+            getattr(torch.backends, "mps", None) is not None
+            and torch.backends.mps.is_available()))
 
     def rerank(self, query: str, candidates: list[RerankCandidate], k: int) -> list[RerankCandidate]:
         if not candidates or k < 1:
@@ -103,6 +133,10 @@ class CrossEncoderReranker:
     def _load(self):
         if self._model is not None:
             return self._model
+        # Resolve ONCE per instance, before the cache key: auto must not
+        # flip between ticks (a device that appears mid-process would
+        # otherwise build a second model under a different key).
+        self.half_precision = self._resolve_half()
         cache_key = (self.model_name, self.half_precision)
         cached = _MODEL_CACHE.get(cache_key)
         if cached is not None:
