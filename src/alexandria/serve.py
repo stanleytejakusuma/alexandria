@@ -244,10 +244,46 @@ def start_drain(ctx: ServeContext, *,
     """
     stop = threading.Event()
 
+    def _follow_release_cutover() -> bool:
+        """R7: re-resolve the active index each cycle and rebuild the engine
+        when the pointer moved. A serve that started against release A kept
+        promoting into frozen release A forever after a cutover to B --
+        every promoted entry invisible to search, which serves B (the
+        stale-serve fork, 2026-08-24). verify_manifest_for_write cannot
+        catch this: it checks store.path's OWN manifest, which is
+        self-consistent in a frozen release. The pointer check is the only
+        honest signal.
+
+        Caller holds ctx.engine_lock. Returns True if a rebuild happened."""
+        from .index.releases import resolve_active_index_dir
+        try:
+            current = resolve_active_index_dir(ctx.corpus)
+        except Exception:
+            # Pointer unreadable or names a missing release: keep serving
+            # the last known-good engine rather than dying mid-drain. The
+            # next tick retries; /health still reflects real liveness.
+            return False
+        if Path(current).resolve() == Path(ctx.store.path).resolve():
+            return False
+        from .cli import _build_search_engine  # same local-import rule as build_serve_context
+        engine = _build_search_engine(ctx.config, ctx.corpus, corpus_root=ctx.corpus,
+                                      client="serve")
+        _warm_embedder(engine.embedder)
+        _warm_reranker(engine.reranker)
+        ctx.engine = engine
+        ctx.locked_engine = _LockedEngine(engine, ctx.engine_lock)
+        ctx.embedder = engine.embedder
+        ctx.store = engine.store
+        ctx.lexical = engine.bm25
+        print("alexandria serve: active index moved to "
+              f"{current} -- drain rebuilt its engine", flush=True)
+        return True
+
     def loop() -> None:
         while not stop.wait(interval):
             try:
                 with ctx.engine_lock:
+                    _follow_release_cutover()
                     result = promote_pending(ctx.corpus, ctx.config, ctx.embedder,
                                              ctx.store, ctx.lexical)
                 if result.skipped_locked:

@@ -13,6 +13,7 @@ import json
 import socket as socket_mod
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -788,3 +789,48 @@ def test_health_exposes_the_drain_heartbeat_so_a_monitor_can_watch_the_async_hal
         tcp_server.server_close()
         for server in uds_servers:
             server.server_close()
+
+
+def test_the_drain_follows_a_release_cutover(tmp_path, monkeypatch):
+    """R7: the drain must re-resolve the active index each cycle. A serve
+    that started against release A keeps writing promoted entries into
+    frozen release A forever after a cutover to release B -- invisible to
+    search, which serves B (the stale-serve fork, 2026-08-24). The tick
+    that promotes must notice the pointer moved and rebuild first."""
+    import shutil
+    from alexandria import serve as serve_mod
+    from alexandria.index.releases import (
+        new_release_dir, resolve_active_index_dir, checksum_release,
+        verify_checksums, activate_release)
+
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    assert app(["--corpus", str(corpus), "remember", "written before the cutover."]) == 0
+
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    dir_a = Path(ctx.store.path).resolve()
+
+    # Cut over while "serve" is running: copy release A into a fresh release
+    # dir and point active.json at it. Same content, new pointer -- exactly
+    # the shape of a publish-cutover.
+    release_b = new_release_dir(corpus)
+    shutil.copytree(dir_a, release_b)
+    # drop sqlite sidecars from A's live state; B starts from committed files only
+    for sidecar in release_b.rglob("*-wal") :
+        pass  # keep: copytree already copied whatever existed; checksums rewritten next
+    checksum_release(release_b)  # writes checksums.json for the copied tree
+    verify_checksums(release_b)
+    activate_release(corpus, release_b.name)
+    assert Path(resolve_active_index_dir(corpus)).resolve() == release_b.resolve()
+
+    assert app(["--corpus", str(corpus), "remember", "written after the cutover."]) == 0
+
+    stop = serve_mod.start_drain(ctx, interval=0.02)
+    with _closing(tcp_server, uds_servers):
+        drained = _wait_until(lambda: not list_pending(corpus))
+        stop.set()
+    assert drained
+
+    # THE assertion: after promoting both pendings, serve's store must live
+    # in release B -- the tick rebuilt against the moved pointer before it
+    # wrote. Writing into frozen A leaves store.path at dir_a forever.
+    assert Path(ctx.store.path).resolve() == release_b.resolve()
