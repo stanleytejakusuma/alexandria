@@ -182,3 +182,64 @@ not a passive "revisit if something comes up": the phase 3 → 4 transition
 does not proceed without an explicit yes/no re-check against all six
 quantified metrics above, recorded as an update to this document either way
 (including "no change, still REJECT" — a checked box, not silence).
+
+---
+
+## 2026-08-28 addendum: derived rendering module is ruled NOT the graph index (Red-reviewed)
+
+Re-opened early (not at the phase 3 → 4 boundary) because a semantic-graph
+**visualization** was built as a demo artifact and proposed for
+production hardening inside this repo. The question put to Red: does a
+derived, disposable rendering of vectors that already exist violate this
+REJECT? Red verdict: **PROCEED-WITH-CONDITIONS**. This addendum records the
+ruling and binds the conditions into the repo.
+
+### Ruling
+
+The `viz` module (see `docs/WORK-ORDER-viz-production.md`) is a **rendering,
+not the graph index**:
+
+- No entity/relation extraction. Edges are cosine kNN between vectors that
+  already exist in the index — a deterministic view, fully regenerable in
+  ~2 minutes, nothing persisted.
+- No relation semantics and no retrieval path. Nothing queries it; nothing
+  imports it; it is a strict dependency sink (imports the engine, never the
+  reverse).
+- The maintenance-cost structure that disqualified the graph index
+  (per-note extraction, supersession re-resolution) is absent.
+
+### Bound conditions (checkable; the module fails review without them)
+
+1. **Data boundary.** Wiki + payload output live OUTSIDE the indexed corpus
+   root. A test asserts zero cluster-map content in either index after a
+   build on a fixture corpus. (History: the demo's cluster pages were
+   written into `wiki/`, which `chunker.py:564` walks — LLM labels would
+   have become retrievable content on the next index run. Reverted
+   `86fe959f3` on the corpus repo.)
+2. **Sink rule.** No engine module imports `viz`. A grep-level check asserts
+   the payload path constant appears only within `viz`.
+3. **Schema freeze.** Edge schema keys are exactly the geometric set
+   (source, target, similarity, ...). No type/label/relation field. The
+   schema test's failure message cites this document.
+4. **Label audit.** ~20 of the cluster labels sampled, ~5 member docs each,
+   recorded in the module README. <80% sane → labels carry a visible
+   "auto-generated, unaudited" banner or are regenerated. (Rationale: a
+   label is a natural-language claim about corpus content — it can be
+   *wrong*, not merely unhelpful. In a one-person system the operator is a
+   retrieval component; a wrong map misleads what they choose to search.)
+5. **No-persistence ratchet.** Forbidden until this decision is re-opened:
+   stable cluster IDs across rebuilds, label caching, incremental updates,
+   any state not regenerable by one command.
+6. **Metric-6 ledger.** Time on this module is logged. Two consecutive
+   months averaging >60 min/week → the module exits the repo or freezes.
+7. **This addendum exists** — and by it: **the module's existence is
+   inadmissible as evidence at the phase 3 → 4 re-examination.** The graph
+   decision must be re-argued from the six triggers, not from "we're
+   halfway there."
+
+### What flips this to STOP
+
+Wiki output inside the indexed corpus root; any semantic-typed field in the
+payload schema; any cross-rebuild identity persistence; maintenance ledger
+>60 min/week for ~a month; synthesis notes citing cluster pages (the
+human-mediated retrieval loop has closed).
