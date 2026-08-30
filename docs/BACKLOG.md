@@ -87,6 +87,12 @@ Audit sources: `/tmp/alx/audit/FINAL-GAP-PASS.md` (pass 1, 29 findings),
 
 ---
 
+## Product / architecture candidates
+
+| # | Item | Decision forks / smallest next step |
+|---|---|---|
+| 56 | **Indonesian-equity financial-knowledge module for a future public/member transparency dashboard** | **Design-only; no connector or ingestion work.** Model immutable, source-addressed company facts (financial statements, income/balance-sheet data, corporate actions, filings, events) separately from citation-gated synthesized company/concept pages. V1 is a public/member transparency aid for dashboard performance context, **not** a trading-execution signal source. Before implementation decide: (1) source/license posture — official issuer/exchange/regulator primary documents only vs a licensed market-data vendor, redistribution/retention terms, and whether derived ratios can be published; (2) freshness — filing/event publication timestamp versus report-period timestamp, correction/restatement/supersession policy, and an explicit stale-data banner/SLA; (3) citations — page-level source list versus claim-level `(claim, document, page/table, retrieval date)` provenance, plus the human review/reject gate for financial claims. **Smallest spike:** a non-ingesting architecture note that defines the fact, source, version/correction, citation, and synthesized-page schemas against three fictive companies; validate that every displayed claim can point to a source location. No live tickers, connectors, data, secrets, or dashboard changes. |
+
 ## Documentation debt
 
 | # | Item |
