@@ -1796,7 +1796,11 @@ def cmd_answer(args) -> int:
     """
     config = _config_for(args)
     corpus = config.corpus_path
+    print("answer: initializing retrieval...", file=sys.stderr, flush=True)
     engine = _build_search_engine(config, corpus, corpus_root=corpus, client="answer")
+    answer_timeout = getattr(args, "answer_timeout", DEFAULT_ANSWER_TIMEOUT)
+    budget = "unbounded" if answer_timeout <= 0 else f"{answer_timeout:g}s"
+    print(f"answer: synthesis started (shared budget {budget})...", file=sys.stderr, flush=True)
     outcome = run_answer(
         config, corpus, args.question, engine=engine, k=args.k,
         llm_model=args.llm_model, grader_a_model=args.grader_a_model,
@@ -1804,7 +1808,7 @@ def cmd_answer(args) -> int:
         max_follow_up_queries=getattr(args, "max_follow_up_queries", 2),
         audit_concurrency=getattr(args, "audit_concurrency", 4),
         api_key_env=args.api_key_env, prompt_version=args.prompt_version,
-        answer_timeout=getattr(args, "answer_timeout", DEFAULT_ANSWER_TIMEOUT),
+        answer_timeout=answer_timeout,
         save_dir=args.save_dir, caller=caller_label(args.caller), user=cli_identity())
     if outcome.cached:
         print("[cached] " + outcome.text)
