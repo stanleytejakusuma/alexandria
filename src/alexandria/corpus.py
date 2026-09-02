@@ -11,7 +11,9 @@ source mutations (lifecycle fields, `swept`) are frontmatter-only and must not t
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,7 +108,23 @@ class Doc:
         return cls(path=str(path.relative_to(root)), frontmatter=fm, body=body)
 
     def write(self, root: str | Path) -> Path:
+        """Atomically replace this document without exposing a torn Markdown file.
+
+        Connectors may be interrupted mid-sync. State checkpoints are already
+        temp-and-replace; corpus sources need the same guarantee so the next
+        run sees either the preceding complete document or this complete one.
+        """
         out = Path(root) / self.path
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render(self.frontmatter, self.body), encoding="utf-8")
+        fd, temporary = tempfile.mkstemp(
+            dir=out.parent, prefix=f".{out.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(render(self.frontmatter, self.body))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, out)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         return out
