@@ -21,6 +21,14 @@ REPO="${ALEXANDRIA_REPO:-$HOME/codebase/alexandria}"
 # ModuleNotFoundError while this console script -- which hardcodes its own
 # sys.path insert -- kept working. One entry point, and it is this one.
 CLI="$REPO/.venv/bin/alexandria"
+# Every unattended command has a deadline. A healthy connector can otherwise
+# replay an unbounded backlog for hours (838 pi-session bursts estimated 141m
+# on 2026-09-02), monopolising the Mac and preventing the next scheduled run.
+# A bounded batch makes backlog catch-up incremental; the next weekly run picks
+# up the rest. Override only for an explicitly supervised catch-up.
+TIMEOUT="${ALEXANDRIA_TIMEOUT:-/opt/homebrew/bin/timeout}"
+STEP_TIMEOUT_SECONDS="${ALEXANDRIA_STEP_TIMEOUT_SECONDS:-1800}"
+PI_SESSIONS_LIMIT="${ALEXANDRIA_PI_SESSIONS_LIMIT:-100}"
 BASE_URL="${ALEXANDRIA_BASE_URL:?set in the supervisor}"
 # Key source is deployment-dependent: the Mac supervisor supplies the
 # keychain service name; a Linux/NAS supervisor supplies ALEXANDRIA_LLM_KEY
@@ -71,11 +79,14 @@ elif ! PREFLIGHT_OUT=$("$CLI" --help 2>&1); then
     echo "$PREFLIGHT_OUT" | tail -5
     echo "Most likely: the venv's editable install points at a path that no"
     echo "longer exists (check .venv/lib/python3.12/site-packages/*.pth)."
-    echo "Fix: cd $REPO && .venv/bin/python -m pip install -e . --no-deps"
+    echo "Fix: cd $REPO && VIRTUAL_ENV=$REPO/.venv /opt/homebrew/bin/uv pip install -e . --no-deps"
   } >> "$DIGEST"
   PREFLIGHT_FAILED=1
+elif [ ! -x "$TIMEOUT" ]; then
+  echo "[FAIL] PREFLIGHT: no timeout runner at $TIMEOUT" >> "$DIGEST"
+  PREFLIGHT_FAILED=1
 else
-  echo "[PASS] preflight: CLI starts" >> "$DIGEST"
+  echo "[PASS] preflight: CLI starts; timeout=${STEP_TIMEOUT_SECONDS}s; pi-session batch=${PI_SESSIONS_LIMIT}" >> "$DIGEST"
   PREFLIGHT_FAILED=0
 fi
 
@@ -101,26 +112,55 @@ fi
 
 export ALEXANDRIA_LLM_KEY="$KEY"
 
-echo "### sync pi-sessions" >> "$DIGEST"
-"$CLI" --corpus "$CORPUS" sync pi-sessions \
-  --base-url "$BASE_URL" --model deepseek-v4-flash --workers 6 \
-  >> "$DIGEST" 2>&1 || echo "sync FAILED (see above)" >> "$DIGEST"
+# Required work must be bounded and fail the whole run. The old independent
+# `|| echo ... FAILED` clauses let five broken steps fall through to a corpus
+# snapshot, creating a commit that looked healthy while retrieval was frozen.
+run_required() {
+  local label="$1"
+  shift
+  echo "### $label" >> "$DIGEST"
+  "$TIMEOUT" "$STEP_TIMEOUT_SECONDS" "$@" >> "$DIGEST" 2>&1
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 124 ]; then
+      echo "[FAIL] $label timed out after ${STEP_TIMEOUT_SECONDS}s" >> "$DIGEST"
+    else
+      echo "[FAIL] $label exited $status" >> "$DIGEST"
+    fi
+  fi
+  return "$status"
+}
 
-echo "### sync journal (accountability digest)" >> "$DIGEST"
-"$CLI" --corpus "$CORPUS" sync journal \
+abort_required_work() {
+  local label="$1"
+  echo "required work failed at '$label'; snapshot skipped (partial corpus is not committed)" >> "$DIGEST"
+  NOTIFIER="${ALEXANDRIA_NOTIFIER:-/opt/homebrew/bin/terminal-notifier}"
+  if [ -x "$NOTIFIER" ]; then
+    "$NOTIFIER" \
+      -title "Alexandria weekly loop DID NOT COMPLETE" \
+      -subtitle "required step failed: $label" \
+      -message "$(grep "\[FAIL\] $label" "$DIGEST" | tail -1 | cut -c1-180)" \
+      -group alexandria-weekly-loop >/dev/null 2>&1 || true
+  fi
+  exit 1
+}
+
+run_required "sync pi-sessions" "$CLI" --corpus "$CORPUS" sync pi-sessions \
+  --base-url "$BASE_URL" --model deepseek-v4-flash --workers 6 --limit "$PI_SESSIONS_LIMIT" \
+  || abort_required_work "sync pi-sessions"
+
+run_required "sync journal (accountability digest)" "$CLI" --corpus "$CORPUS" sync journal \
   --journal-path "$HOME/citadel/personal-finance/accountability.md" \
-  >> "$DIGEST" 2>&1 || echo "journal sync FAILED" >> "$DIGEST"
+  || abort_required_work "sync journal (accountability digest)"
 
 # The vault is the upstream for ~70% of the corpus and the ONLY durable home of
 # ~1,296 harness memories the live store has already rotated out. No LLM, no
 # gateway: pure normalize-and-copy, so it runs even when the gateway is down.
-echo "### sync knowledge-graph (vault memories)" >> "$DIGEST"
-"$CLI" --corpus "$CORPUS" sync knowledge-graph \
-  >> "$DIGEST" 2>&1 || echo "knowledge-graph sync FAILED" >> "$DIGEST"
+run_required "sync knowledge-graph (vault memories)" "$CLI" --corpus "$CORPUS" sync knowledge-graph \
+  || abort_required_work "sync knowledge-graph (vault memories)"
 
-echo "### sync inbox (explicit memories)" >> "$DIGEST"
-"$CLI" --corpus "$CORPUS" sync inbox \
-  >> "$DIGEST" 2>&1 || echo "inbox sync FAILED" >> "$DIGEST"
+run_required "sync inbox (explicit memories)" "$CLI" --corpus "$CORPUS" sync inbox \
+  || abort_required_work "sync inbox (explicit memories)"
 
 # Syncing writes .md files; without this step they are on disk but invisible to
 # every query, which is the freshness failure the loop exists to prevent. A
@@ -130,26 +170,28 @@ echo "### sync inbox (explicit memories)" >> "$DIGEST"
 # to 22.2%. Enrichment stays available as a CLI flag; it is not the default and
 # must not run unattended until the ranking interaction is fixed. See
 # docs/DECISION-enrichment-2026-08-11.md.
-echo "### index (make newly synced docs retrievable)" >> "$DIGEST"
-"$CLI" --corpus "$CORPUS" index \
-  >> "$DIGEST" 2>&1 || echo "index FAILED" >> "$DIGEST"
+run_required "index (make newly synced docs retrievable)" "$CLI" --corpus "$CORPUS" index \
+  || abort_required_work "index (make newly synced docs retrievable)"
 
 echo "### query-log review (7d)" >> "$DIGEST"
 "$REPO/.venv/bin/python" "$REPO/scripts/query-log-review.py" --corpus "$CORPUS" --since 7 \
   >> "$DIGEST" 2>&1 || echo "review FAILED" >> "$DIGEST"
 
-# Leg-ablation invariant (BACKLOG #47/#48): only a significant positive recall
-# delta after removing a leg is red; MRR is context. Weekly, not pre-commit,
-# because each amputated pass is a full golden-set scoring (~60-90s).
-# The loop intentionally remains non-destructive: an ablation red must not hide
-# the later snapshot/verification. Unlike ordinary best-effort steps, however,
-# it has its own explicit notifier below so the red cannot be merely a digest line.
-echo "### leg-ablation (is either retrieval leg dead weight?)" >> "$DIGEST"
+# Ablation is deliberately NOT a weekly-loop responsibility. It performs full
+# model loads/scoring and has no bearing on whether the corpus can ingest and
+# index. The compute/storage split ratified on 2026-08-25 keeps it off all
+# weekly loops; run it explicitly in CI/on an engine change instead. The opt-in
+# remains only for supervised diagnosis and is separately bounded.
 LEG_ABLATION_STATUS=0
-"$REPO/.venv/bin/python" "$REPO/scripts/leg-ablation.py" --corpus "$CORPUS" \
-  >> "$DIGEST" 2>&1 || LEG_ABLATION_STATUS=$?
-if [ "$LEG_ABLATION_STATUS" -ne 0 ]; then
-  echo "[FAIL] leg-ablation exited $LEG_ABLATION_STATUS (distinct notifier queued)" >> "$DIGEST"
+if [ "${ALEXANDRIA_RUN_LEG_ABLATION:-0}" = "1" ]; then
+  echo "### leg-ablation (supervised opt-in)" >> "$DIGEST"
+  "$TIMEOUT" "$STEP_TIMEOUT_SECONDS" "$REPO/.venv/bin/python" "$REPO/scripts/leg-ablation.py" --corpus "$CORPUS" \
+    >> "$DIGEST" 2>&1 || LEG_ABLATION_STATUS=$?
+  if [ "$LEG_ABLATION_STATUS" -ne 0 ]; then
+    echo "[FAIL] leg-ablation exited $LEG_ABLATION_STATUS (distinct notifier queued)" >> "$DIGEST"
+  fi
+else
+  echo "### leg-ablation (skipped; CI/on-engine-change only)" >> "$DIGEST"
 fi
 
 # keep the corpus weekly-snapshot-able (the quarterly contest needs it).

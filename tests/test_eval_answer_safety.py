@@ -303,7 +303,7 @@ def test_weekly_loop_notifies_a_red_leg_ablation_without_changing_its_verify_exi
     env = os.environ | {
         "HOME": str(home), "ALEXANDRIA_CORPUS": str(corpus),
         "ALEXANDRIA_BASE_URL": "offline", "ALEXANDRIA_KEYCHAIN_SERVICE": "offline",
-        "ALEXANDRIA_NOTIFIER": str(notifier), "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "ALEXANDRIA_NOTIFIER": str(notifier), "ALEXANDRIA_RUN_LEG_ABLATION": "1", "PATH": f"{fake_bin}:{os.environ['PATH']}",
     }
     completed = subprocess.run(["bash", str(script)], env=env, text=True, capture_output=True)
     assert completed.returncode == 0, completed.stderr
