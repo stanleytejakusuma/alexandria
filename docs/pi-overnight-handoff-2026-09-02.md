@@ -20,8 +20,9 @@ Alexandria backlog items while keeping this handoff current.
   `/private/tmp` worktree. `python -m alexandria.cli` failed while the console
   entry point still worked; independent best-effort clauses let the script
   snapshot after sync/index failures.
-- Engine `main` local commits: `5b61095`, `ee01e90`, `2026321`, `4eac50c`,
-  `18fa929`. They are not pushed yet.
+- Engine `main` published commits: `5b61095`, `ee01e90`, `2026321`, `4eac50c`,
+  `18fa929`, `39464b2`, `3517499`, `1f2682b`, `59c3e8f` (all pushed to
+  `origin/main`).
 - Live bounded proof before the final Sol remediation: exit 0 in 13m35s;
   generation 250→251; 981 docs added; 5/5 newest indexed; newest Pi-session
   source retrieved rank 1; 3,782-file corpus snapshot committed.
@@ -64,7 +65,9 @@ failure surface, but does not make a partly completed batch/index publish safe.
 3. **Backlog filed**: #57 bounded Pi-session ingestion liveness; #58 answer
    progress/budget; #59 release seal lifecycle; #60 durable worktree placement;
    #61 memory capacity; #62 serve disconnect noise/slow health.
-4. **Other discovered work**: #83 Pi-session trigger, #84 loop, #85 memory,
+4. **Answer progress completed:** `59c3e8f` adds flushed CLI milestones before
+   retrieval and before synthesis with its budget; full suite passed 1,161.
+5. **Other discovered work**: #83 Pi-session trigger, #84 loop, #85 memory,
    #86 worktree placement, #87 answer progress are session todos; reconcile
    them with `docs/BACKLOG.md` as they are investigated.
 
