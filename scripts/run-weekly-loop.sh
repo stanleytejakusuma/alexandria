@@ -28,6 +28,7 @@ CLI="$REPO/.venv/bin/alexandria"
 # up the rest. Override only for an explicitly supervised catch-up.
 TIMEOUT="${ALEXANDRIA_TIMEOUT:-/opt/homebrew/bin/timeout}"
 STEP_TIMEOUT_SECONDS="${ALEXANDRIA_STEP_TIMEOUT_SECONDS:-1800}"
+TIMEOUT_KILL_AFTER_SECONDS="${ALEXANDRIA_TIMEOUT_KILL_AFTER_SECONDS:-30}"
 PI_SESSIONS_LIMIT="${ALEXANDRIA_PI_SESSIONS_LIMIT:-100}"
 BASE_URL="${ALEXANDRIA_BASE_URL:?set in the supervisor}"
 # Key source is deployment-dependent: the Mac supervisor supplies the
@@ -47,12 +48,25 @@ DOCS_BEFORE=$(find "$CORPUS/sources" "$CORPUS/wiki" -name '*.md' 2>/dev/null | w
 GEN_BEFORE=$(python3 -c "import json;print(json.load(open('$CORPUS/.alexandria/index/generation.json')).get('generation',0))" 2>/dev/null || echo 0)
 
 STAMP="$(date '+%Y-%m-%d %H:%M %Z')"
+KEY=""
+KEY_STATUS=0
+
+is_positive_integer() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+run_bounded() { "$TIMEOUT" --kill-after="${TIMEOUT_KILL_AFTER_SECONDS}s" "$STEP_TIMEOUT_SECONDS" "$@"; }
+
+# Validate all execution controls before any external call. A bad launchd value
+# must be a failed preflight, never a supposedly healthy but unbounded run.
+if [ ! -x "$TIMEOUT" ] || ! is_positive_integer "$STEP_TIMEOUT_SECONDS" || ! is_positive_integer "$TIMEOUT_KILL_AFTER_SECONDS" || ! is_positive_integer "$PI_SESSIONS_LIMIT"; then
+  PREFLIGHT_CONFIG_FAILED=1
+else
+  PREFLIGHT_CONFIG_FAILED=0
+fi
+
 if [ -n "${ALEXANDRIA_LLM_KEY:-}" ]; then
   KEY="$ALEXANDRIA_LLM_KEY"
-elif [ -n "$KEYCHAIN_SERVICE" ]; then
-  KEY="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"
-else
-  KEY=""
+elif [ -n "$KEYCHAIN_SERVICE" ] && [ "$PREFLIGHT_CONFIG_FAILED" -eq 0 ]; then
+  KEY=$("$TIMEOUT" --kill-after="${TIMEOUT_KILL_AFTER_SECONDS}s" 30 security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)
+  KEY_STATUS=$?
 fi
 
 {
@@ -70,23 +84,26 @@ fi
 # `--help` touches argparse and every import the verbs need -- and abort the
 # whole run if it cannot start. Fail loud and early beats fail quiet and late.
 echo "### preflight (can the CLI actually start?)" >> "$DIGEST"
-if [ ! -x "$CLI" ]; then
+if [ "$PREFLIGHT_CONFIG_FAILED" -ne 0 ]; then
+  echo "[FAIL] PREFLIGHT: timeout/config invalid (runner=$TIMEOUT, step=$STEP_TIMEOUT_SECONDS, kill-after=$TIMEOUT_KILL_AFTER_SECONDS, batch=$PI_SESSIONS_LIMIT)" >> "$DIGEST"
+  PREFLIGHT_FAILED=1
+elif [ ! -x "$CLI" ]; then
   echo "[FAIL] PREFLIGHT: no executable CLI at $CLI" >> "$DIGEST"
   PREFLIGHT_FAILED=1
-elif ! PREFLIGHT_OUT=$("$CLI" --help 2>&1); then
+elif ! PREFLIGHT_OUT=$(run_bounded "$CLI" --help 2>&1); then
   {
-    echo "[FAIL] PREFLIGHT: '$CLI --help' exited non-zero — the loop cannot run."
+    echo "[FAIL] PREFLIGHT: '$CLI --help' exited non-zero or timed out — the loop cannot run."
     echo "$PREFLIGHT_OUT" | tail -5
     echo "Most likely: the venv's editable install points at a path that no"
     echo "longer exists (check .venv/lib/python3.12/site-packages/*.pth)."
     echo "Fix: cd $REPO && VIRTUAL_ENV=$REPO/.venv /opt/homebrew/bin/uv pip install -e . --no-deps"
   } >> "$DIGEST"
   PREFLIGHT_FAILED=1
-elif [ ! -x "$TIMEOUT" ]; then
-  echo "[FAIL] PREFLIGHT: no timeout runner at $TIMEOUT" >> "$DIGEST"
+elif ! run_bounded "$CLI" sync pi-sessions --help >> "$DIGEST" 2>&1; then
+  echo "[FAIL] PREFLIGHT: sync pi-sessions --help cannot start" >> "$DIGEST"
   PREFLIGHT_FAILED=1
 else
-  echo "[PASS] preflight: CLI starts; timeout=${STEP_TIMEOUT_SECONDS}s; pi-session batch=${PI_SESSIONS_LIMIT}" >> "$DIGEST"
+  echo "[PASS] preflight: CLI and required sync parser start; timeout=${STEP_TIMEOUT_SECONDS}s; pi-session batch=${PI_SESSIONS_LIMIT}" >> "$DIGEST"
   PREFLIGHT_FAILED=0
 fi
 
@@ -97,17 +114,17 @@ if [ "$PREFLIGHT_FAILED" -ne 0 ]; then
   if [ -x "$NOTIFIER" ]; then
     "$NOTIFIER" \
       -title "Alexandria weekly loop DID NOT RUN" \
-      -subtitle "preflight failed: CLI cannot start" \
+      -subtitle "preflight failed" \
       -message "$(grep '\[FAIL\] PREFLIGHT' "$DIGEST" | tail -1 | cut -c1-180)" \
       -group alexandria-weekly-loop >/dev/null 2>&1 || true
   fi
-  echo "aborted before any sync (nothing was written, nothing committed)" >> "$DIGEST"
+  echo "aborted before any sync; no snapshot was committed" >> "$DIGEST"
   exit 1
 fi
 
 if [ -z "$KEY" ]; then
-  echo "LLM key lookup failed — sync skipped" >> "$DIGEST"
-  exit 0
+  echo "[FAIL] required credential lookup exited $KEY_STATUS; no sync was attempted; no snapshot was committed" >> "$DIGEST"
+  exit 1
 fi
 
 export ALEXANDRIA_LLM_KEY="$KEY"
@@ -119,7 +136,7 @@ run_required() {
   local label="$1"
   shift
   echo "### $label" >> "$DIGEST"
-  "$TIMEOUT" "$STEP_TIMEOUT_SECONDS" "$@" >> "$DIGEST" 2>&1
+  run_bounded "$@" >> "$DIGEST" 2>&1
   local status=$?
   if [ "$status" -ne 0 ]; then
     if [ "$status" -eq 124 ]; then
@@ -185,7 +202,7 @@ echo "### query-log review (7d)" >> "$DIGEST"
 LEG_ABLATION_STATUS=0
 if [ "${ALEXANDRIA_RUN_LEG_ABLATION:-0}" = "1" ]; then
   echo "### leg-ablation (supervised opt-in)" >> "$DIGEST"
-  "$TIMEOUT" "$STEP_TIMEOUT_SECONDS" "$REPO/.venv/bin/python" "$REPO/scripts/leg-ablation.py" --corpus "$CORPUS" \
+  run_bounded "$REPO/.venv/bin/python" "$REPO/scripts/leg-ablation.py" --corpus "$CORPUS" \
     >> "$DIGEST" 2>&1 || LEG_ABLATION_STATUS=$?
   if [ "$LEG_ABLATION_STATUS" -ne 0 ]; then
     echo "[FAIL] leg-ablation exited $LEG_ABLATION_STATUS (distinct notifier queued)" >> "$DIGEST"
