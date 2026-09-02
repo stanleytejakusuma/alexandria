@@ -11,7 +11,16 @@
 # has actually suffered, and a digest nobody reads cannot surface it.
 set -u
 CORPUS="${ALEXANDRIA_CORPUS:-$HOME/alexandria-corpus}"
-REPO="$HOME/codebase/alexandria"
+# Overridable so the broken-interpreter path can be exercised in a test
+# without touching the real venv (see tests/test_weekly_loop_preflight.py).
+REPO="${ALEXANDRIA_REPO:-$HOME/codebase/alexandria}"
+# Call the console script, never `python -m alexandria.cli`. The venv holds an
+# EDITABLE install whose .pth carries an absolute path; on 2026-08-30 that path
+# (/private/tmp/alexandria-procurement-floor/src, a worktree macOS reaped from
+# /tmp) no longer existed, so every `-m` invocation died with
+# ModuleNotFoundError while this console script -- which hardcodes its own
+# sys.path insert -- kept working. One entry point, and it is this one.
+CLI="$REPO/.venv/bin/alexandria"
 BASE_URL="${ALEXANDRIA_BASE_URL:?set in the supervisor}"
 # Key source is deployment-dependent: the Mac supervisor supplies the
 # keychain service name; a Linux/NAS supervisor supplies ALEXANDRIA_LLM_KEY
@@ -43,6 +52,48 @@ fi
   echo "## $STAMP"
 } >> "$DIGEST"
 
+# PREFLIGHT (2026-09-02). Before this existed, a broken interpreter did not
+# stop the run: five steps failed in sequence, each caught by its own
+# `|| echo ... FAILED`, and the snapshot step still committed 3,053 files.
+# The digest recorded the errors and nobody read it for three days.
+#
+# A dependency check belongs BEFORE the work, not distributed across it as
+# per-step error handling. Run the cheapest real invocation of the CLI --
+# `--help` touches argparse and every import the verbs need -- and abort the
+# whole run if it cannot start. Fail loud and early beats fail quiet and late.
+echo "### preflight (can the CLI actually start?)" >> "$DIGEST"
+if [ ! -x "$CLI" ]; then
+  echo "[FAIL] PREFLIGHT: no executable CLI at $CLI" >> "$DIGEST"
+  PREFLIGHT_FAILED=1
+elif ! PREFLIGHT_OUT=$("$CLI" --help 2>&1); then
+  {
+    echo "[FAIL] PREFLIGHT: '$CLI --help' exited non-zero — the loop cannot run."
+    echo "$PREFLIGHT_OUT" | tail -5
+    echo "Most likely: the venv's editable install points at a path that no"
+    echo "longer exists (check .venv/lib/python3.12/site-packages/*.pth)."
+    echo "Fix: cd $REPO && .venv/bin/python -m pip install -e . --no-deps"
+  } >> "$DIGEST"
+  PREFLIGHT_FAILED=1
+else
+  echo "[PASS] preflight: CLI starts" >> "$DIGEST"
+  PREFLIGHT_FAILED=0
+fi
+
+if [ "$PREFLIGHT_FAILED" -ne 0 ]; then
+  # Notify on the way out. A preflight failure is the one case where doing
+  # nothing is correct -- but doing nothing SILENTLY is what cost a week.
+  NOTIFIER="${ALEXANDRIA_NOTIFIER:-/opt/homebrew/bin/terminal-notifier}"
+  if [ -x "$NOTIFIER" ]; then
+    "$NOTIFIER" \
+      -title "Alexandria weekly loop DID NOT RUN" \
+      -subtitle "preflight failed: CLI cannot start" \
+      -message "$(grep '\[FAIL\] PREFLIGHT' "$DIGEST" | tail -1 | cut -c1-180)" \
+      -group alexandria-weekly-loop >/dev/null 2>&1 || true
+  fi
+  echo "aborted before any sync (nothing was written, nothing committed)" >> "$DIGEST"
+  exit 1
+fi
+
 if [ -z "$KEY" ]; then
   echo "LLM key lookup failed — sync skipped" >> "$DIGEST"
   exit 0
@@ -51,12 +102,12 @@ fi
 export ALEXANDRIA_LLM_KEY="$KEY"
 
 echo "### sync pi-sessions" >> "$DIGEST"
-"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" sync pi-sessions \
+"$CLI" --corpus "$CORPUS" sync pi-sessions \
   --base-url "$BASE_URL" --model deepseek-v4-flash --workers 6 \
   >> "$DIGEST" 2>&1 || echo "sync FAILED (see above)" >> "$DIGEST"
 
 echo "### sync journal (accountability digest)" >> "$DIGEST"
-"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" sync journal \
+"$CLI" --corpus "$CORPUS" sync journal \
   --journal-path "$HOME/citadel/personal-finance/accountability.md" \
   >> "$DIGEST" 2>&1 || echo "journal sync FAILED" >> "$DIGEST"
 
@@ -64,11 +115,11 @@ echo "### sync journal (accountability digest)" >> "$DIGEST"
 # ~1,296 harness memories the live store has already rotated out. No LLM, no
 # gateway: pure normalize-and-copy, so it runs even when the gateway is down.
 echo "### sync knowledge-graph (vault memories)" >> "$DIGEST"
-"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" sync knowledge-graph \
+"$CLI" --corpus "$CORPUS" sync knowledge-graph \
   >> "$DIGEST" 2>&1 || echo "knowledge-graph sync FAILED" >> "$DIGEST"
 
 echo "### sync inbox (explicit memories)" >> "$DIGEST"
-"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" sync inbox \
+"$CLI" --corpus "$CORPUS" sync inbox \
   >> "$DIGEST" 2>&1 || echo "inbox sync FAILED" >> "$DIGEST"
 
 # Syncing writes .md files; without this step they are on disk but invisible to
@@ -80,7 +131,7 @@ echo "### sync inbox (explicit memories)" >> "$DIGEST"
 # must not run unattended until the ranking interaction is fixed. See
 # docs/DECISION-enrichment-2026-08-11.md.
 echo "### index (make newly synced docs retrievable)" >> "$DIGEST"
-"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" index \
+"$CLI" --corpus "$CORPUS" index \
   >> "$DIGEST" 2>&1 || echo "index FAILED" >> "$DIGEST"
 
 echo "### query-log review (7d)" >> "$DIGEST"
@@ -131,7 +182,7 @@ VERIFY_STATUS=0
 # recall stays green on a frozen corpus (the 2026-08-11 incident). A corpus
 # that has gone quiet must fail the loop loudly, not just report.
 echo "### staleness (did the corpus go quiet?)" >> "$DIGEST"
-"$REPO/.venv/bin/python" -m alexandria.cli --corpus "$CORPUS" staleness \
+"$CLI" --corpus "$CORPUS" staleness \
   >> "$DIGEST" 2>&1 || { echo "staleness FAILED: corpus is stale" >> "$DIGEST"; VERIFY_STATUS=1; }
 
 # A non-zero exit is recorded by launchd and read by nobody. The whole point of
