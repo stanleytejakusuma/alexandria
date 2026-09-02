@@ -618,6 +618,19 @@ def _make_handler_class_impl(ctx: ServeContext, identity: str | None,
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
+        def handle(self) -> None:
+            """Quiet expected client disconnects, including before a request line.
+
+            Long `/answer` requests can outlive a dashboard/browser timeout.
+            `BaseHTTPRequestHandler.handle()` otherwise lets ConnectionResetError
+            and BrokenPipeError escape into socketserver's traceback logger,
+            turning normal cancellation into thousands of apparent failures.
+            """
+            try:
+                super().handle()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
         def _respond(self, status: int, body: bytes, content_type: str) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
