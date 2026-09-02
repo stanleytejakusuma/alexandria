@@ -293,6 +293,12 @@ def test_weekly_loop_notifies_a_red_leg_ablation_without_changing_its_verify_exi
     (repo / ".venv" / "bin" / "python").write_text(
         "#!/bin/sh\ncase \"$*\" in *leg-ablation.py*) exit 1;; esac\nexit 0\n", encoding="utf-8")
     (repo / ".venv" / "bin" / "python").chmod(0o755)
+    # The loop drives the console script, not `python -m` (2026-08-30 incident:
+    # a stale editable .pth broke `-m` while this entry point kept working).
+    # It must exist and start, or the preflight aborts the run before ablation.
+    (repo / ".venv" / "bin" / "alexandria").write_text(
+        "#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (repo / ".venv" / "bin" / "alexandria").chmod(0o755)
     script = SCRIPT_PATH.parent / "run-weekly-loop.sh"
     env = os.environ | {
         "HOME": str(home), "ALEXANDRIA_CORPUS": str(corpus),
