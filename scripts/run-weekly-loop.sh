@@ -241,8 +241,8 @@ run_bounded "$REPO/.venv/bin/python" "$REPO/scripts/verify-loop-run.py" \
 # recall stays green on a frozen corpus (the 2026-08-11 incident). A corpus
 # that has gone quiet must fail the loop loudly, not just report.
 echo "### staleness (did the corpus go quiet?)" >> "$DIGEST"
-"$CLI" --corpus "$CORPUS" staleness \
-  >> "$DIGEST" 2>&1 || { echo "staleness FAILED: corpus is stale" >> "$DIGEST"; VERIFY_STATUS=1; }
+run_bounded "$CLI" --corpus "$CORPUS" staleness \
+  >> "$DIGEST" 2>&1 || { echo "staleness FAILED or timed out" >> "$DIGEST"; VERIFY_STATUS=1; }
 
 # A non-zero exit is recorded by launchd and read by nobody. The whole point of
 # the self-check is that a silent failure becomes visible, so push it somewhere
@@ -255,14 +255,14 @@ NOTIFIER="${ALEXANDRIA_NOTIFIER:-/opt/homebrew/bin/terminal-notifier}"
 # Keep a red ablation nonfatal to the weekly maintenance run, but surface it via
 # a distinct alert even when the final freshness verification passes.
 if [ "$LEG_ABLATION_STATUS" -ne 0 ] && [ -x "$NOTIFIER" ]; then
-  "$NOTIFIER" \
+  "$TIMEOUT" --kill-after="${TIMEOUT_KILL_AFTER_SECONDS}s" 30 "$NOTIFIER" \
     -title "Alexandria weekly leg-ablation FAILED" \
     -subtitle "exit $LEG_ABLATION_STATUS; retrieval review required" \
     -message "$(grep '\[FAIL\] leg-ablation' "$DIGEST" | tail -1 | cut -c1-180)" \
     -group alexandria-weekly-leg-ablation >/dev/null 2>&1 || true
 fi
 if [ "$VERIFY_STATUS" -ne 0 ] && [ -x "$NOTIFIER" ]; then
-  "$NOTIFIER" \
+  "$TIMEOUT" --kill-after="${TIMEOUT_KILL_AFTER_SECONDS}s" 30 "$NOTIFIER" \
     -title "Alexandria weekly loop FAILED" \
     -subtitle "$(grep -c '\[FAIL\]' "$DIGEST" 2>/dev/null || echo '?') check(s) failed" \
     -message "$(grep '\[FAIL\]' "$DIGEST" | tail -3 | tr '\n' ' ' | cut -c1-180)" \
