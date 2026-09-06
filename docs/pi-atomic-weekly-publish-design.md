@@ -79,6 +79,17 @@ snapshot/publish at one defined commit point.
 4. **Vector seal:** #59 must define a genuine immutable vector-reader contract
    before the staged checksum can be called a production integrity proof.
 
+## Accepted decisions — 2026-09-03
+
+- **Git authority:** the stable corpus control root retains source-history/Git
+  ownership. A generation is a read/publish artifact, never a Git worktree.
+- **Retention:** keep the two most recent complete generations and one failed
+  staging candidate. Measure real generation size before enabling GC; do not
+  auto-delete in the first release.
+- **Cutover:** build fixture crash tests and a staging-only end-to-end proof
+  first. No service/corpus-path migration until the immutable vector-reader
+  decision in #59 is resolved and Stanley explicitly fires the cutover.
+
 ## Minimum implementation proof
 
 A fixture test must kill a staging run during (a) document write, (b) connector
