@@ -48,11 +48,29 @@ from the visible sources.
 - Treating a checksum map as an immutable seal while its vector backend can
   mutate on read (tracked separately in backlog #59).
 
+## Migration boundary (verified)
+
+The engine's command surface routes through `AppConfig.corpus_path`, so a
+single resolver can redirect ordinary CLI and serve reads. The weekly loop,
+launch configuration, verification scripts, and Git snapshot commands pass a
+corpus path directly. A correct migration therefore separates two concepts:
+
+- **stable corpus control root:** owns the generation pointer, retention,
+  staging candidates, and Git snapshot authority;
+- **resolved generation root:** contains complete `sources/`, `wiki/`, state,
+  and index data used by readers and engine commands.
+
+No code may infer Git ownership from a resolved generation path. The loop must
+operate on a staging generation through an explicit publisher interface, then
+snapshot/publish at one defined commit point.
+
 ## Design decisions still needed
 
-1. **Path migration:** serving and every consumer must use the stable pointer,
-   not an embedded generation path. This requires a controlled service
-   cutover, not an overnight restart.
+1. **Path migration:** make `AppConfig` resolve the stable control root to the
+   active generation while preserving an explicit control-root API for the
+   publisher and Git tools. Update every direct-path script deliberately; do
+   not rely on a symlink accident. This requires a controlled service cutover,
+   not an overnight restart.
 2. **Git authority:** decide whether each generation has its own Git checkout,
    or source history is maintained outside the published root. The source
    snapshot must remain inspectable and reversible.
