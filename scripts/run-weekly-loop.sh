@@ -191,8 +191,8 @@ run_required "index (make newly synced docs retrievable)" "$CLI" --corpus "$CORP
   || abort_required_work "index (make newly synced docs retrievable)"
 
 echo "### query-log review (7d)" >> "$DIGEST"
-"$REPO/.venv/bin/python" "$REPO/scripts/query-log-review.py" --corpus "$CORPUS" --since 7 \
-  >> "$DIGEST" 2>&1 || echo "review FAILED" >> "$DIGEST"
+run_bounded "$REPO/.venv/bin/python" "$REPO/scripts/query-log-review.py" --corpus "$CORPUS" --since 7 \
+  >> "$DIGEST" 2>&1 || echo "review FAILED or timed out" >> "$DIGEST"
 
 # Ablation is deliberately NOT a weekly-loop responsibility. It performs full
 # model loads/scoring and has no bearing on whether the corpus can ingest and
@@ -232,7 +232,7 @@ fi
 # checks what actually happened to the corpus, the index, and retrieval.
 echo "### verify (did the loop actually change anything?)" >> "$DIGEST"
 VERIFY_STATUS=0
-"$REPO/.venv/bin/python" "$REPO/scripts/verify-loop-run.py" \
+run_bounded "$REPO/.venv/bin/python" "$REPO/scripts/verify-loop-run.py" \
   --corpus "$CORPUS" --binary "$REPO/.venv/bin/alexandria" \
   --docs-before "$DOCS_BEFORE" --generation-before "$GEN_BEFORE" \
   >> "$DIGEST" 2>&1 || VERIFY_STATUS=1
