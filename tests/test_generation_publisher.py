@@ -32,6 +32,15 @@ def test_stage_copies_reader_inputs_but_not_git_or_unrelated_runtime_state(tmp_p
     assert not (staged / ".alexandria" / "cache").exists()
 
 
+def test_processing_a_staged_source_cannot_mutate_the_control_root(tmp_path: Path) -> None:
+    root = _control_root(tmp_path)
+    staged = stage_generation(root, "g-1")
+
+    (staged / "sources" / "note.md").write_text("new staged source", encoding="utf-8")
+
+    assert (root / "sources" / "note.md").read_text(encoding="utf-8") == "old source"
+
+
 def test_failed_snapshot_never_switches_the_live_pointer(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
     old = stage_generation(root, "old")
