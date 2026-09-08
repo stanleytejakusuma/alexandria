@@ -31,10 +31,18 @@ def stage_generation(control_root: str | Path, generation_id: str) -> Path:
     staged = _generations_root(control_root) / generation_id
     if staged.exists():
         raise PublishError(f"generation already exists: {generation_id}")
+    # After cutover the control root is Git/pointer authority, not reader data.
+    # Copy from the selected generation so the next candidate inherits exactly
+    # what readers see; before migration there is no pointer and root is legacy.
+    source_root = (
+        resolve_generation(control_root)
+        if (control_root / ".alexandria" / "current-generation.json").exists()
+        else control_root
+    )
     try:
         staged.mkdir(parents=True)
         for relative in (Path("sources"), Path("wiki"), Path(".alexandria") / "state"):
-            source = control_root / relative
+            source = source_root / relative
             if source.exists():
                 shutil.copytree(source, staged / relative)
         return staged

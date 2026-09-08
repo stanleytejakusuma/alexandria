@@ -49,6 +49,20 @@ def test_staging_failure_leaves_no_publishable_candidate_or_pointer(tmp_path: Pa
     assert not (root / ".alexandria" / "current-generation.json").exists()
 
 
+def test_staging_starts_from_the_active_generation_after_a_cutover(tmp_path: Path) -> None:
+    root = _control_root(tmp_path)
+    active = root / ".alexandria" / "generations" / "old"
+    (active / "sources").mkdir(parents=True)
+    (active / "sources" / "note.md").write_text("active source")
+    (active / "wiki").mkdir()
+    (active / ".alexandria" / "state").mkdir(parents=True)
+    activate_generation(root, active)
+
+    staged = stage_generation(root, "new")
+
+    assert (staged / "sources" / "note.md").read_text() == "active source"
+
+
 def test_processing_a_staged_source_cannot_mutate_the_control_root(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
     staged = stage_generation(root, "g-1")
