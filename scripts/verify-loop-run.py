@@ -54,7 +54,7 @@ def index_generation(corpus: Path) -> int:
         return 0
 
 
-def newest_docs(corpus: Path, n: int = 5) -> list[Path]:
+def newest_docs(corpus: Path, n: int = 20) -> list[Path]:
     """The most recently written documents -- the ones most likely to be missing
     from a stale index, which is precisely what we want to probe.
 
@@ -205,7 +205,15 @@ def main() -> int:
 
         # (b) RETRIEVABLE: can search actually surface one end to end? Only a
         #     document whose title is a meaningful query can answer that.
-        probeable = next((d for d in probes if is_probeable(title_of(d))), None)
+        # A connector may rewrite two historical documents carrying the exact
+        # same title (the staged proof hit two `Accountability journal
+        # 2026-08-07` files). Their embeddings compete, so exact-title search
+        # can correctly surface the sibling instead. Select a descriptive title
+        # that is unique among the recent candidates; membership above still
+        # proves every newest file is indexed.
+        titles = [title_of(d) for d in probes]
+        probeable = next((d for d in probes
+                          if is_probeable(title_of(d)) and titles.count(title_of(d)) == 1), None)
         if probeable is None:
             checks.append(("retrievable", True,
                            "skipped: none of the newest documents has a searchable title"))

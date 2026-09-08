@@ -131,6 +131,10 @@ if [ -z "$KEY" ]; then
 fi
 
 export ALEXANDRIA_LLM_KEY="$KEY"
+# The index step has already loaded this cached embedding model. Prevent a
+# post-index verification query from stalling on an unnecessary Hub metadata
+# request; operators may explicitly set 0 when intentionally refreshing.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 # Required work must be bounded and fail the whole run. The old independent
 # `|| echo ... FAILED` clauses let five broken steps fall through to a corpus
