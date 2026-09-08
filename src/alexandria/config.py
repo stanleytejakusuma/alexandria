@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import tomllib
+
+from .generation_pointer import resolve_generation
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -60,8 +62,11 @@ def load_config(*, corpus_override: str | Path | None = None,
     provider = _env_or_file("ALEXANDRIA_EMBED_PROVIDER", raw, ("embed", "provider"), "local")
     if provider not in {"local", "hash", "mlx"}:
         raise ValueError("ALEXANDRIA_EMBED_PROVIDER must be local, mlx, or hash")
+    corpus_path = Path(corpus).expanduser()
+    if (corpus_path / ".alexandria" / "current-generation.json").exists():
+        corpus_path = resolve_generation(corpus_path)
     return AppConfig(
-        corpus_path=Path(corpus).expanduser(),
+        corpus_path=corpus_path,
         embed_provider=provider,
         embed_model=_env_or_file("ALEXANDRIA_EMBED_MODEL", raw, ("embed", "model"),
                                  "Qwen/Qwen3-Embedding-0.6B"),
