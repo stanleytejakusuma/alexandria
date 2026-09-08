@@ -37,6 +37,18 @@ def test_stage_copies_reader_inputs_but_not_git_or_unrelated_runtime_state(tmp_p
     assert not (staged / ".alexandria" / "cache").exists()
 
 
+def test_staging_failure_leaves_no_publishable_candidate_or_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _control_root(tmp_path)
+    import alexandria.generation_publisher as publisher
+
+    monkeypatch.setattr(publisher.shutil, "copytree", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("simulated timeout")))
+    with pytest.raises(OSError, match="simulated timeout"):
+        stage_generation(root, "timed-out")
+
+    assert not (root / ".alexandria" / "generations" / "timed-out").exists()
+    assert not (root / ".alexandria" / "current-generation.json").exists()
+
+
 def test_processing_a_staged_source_cannot_mutate_the_control_root(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
     staged = stage_generation(root, "g-1")
