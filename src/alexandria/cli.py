@@ -1935,6 +1935,25 @@ def _citation_records(gathered, verdict, *, schema_version: str = "citation-v2")
 
 
 
+def cmd_parity(args) -> int:
+    """Emit read-only local/remote corpus parity evidence as JSON."""
+    from .parity import compare_snapshots, probe_remote_snapshot, snapshot_corpus
+
+    local = snapshot_corpus(_config_for(args).corpus_path)
+    remote = probe_remote_snapshot(args.remote_host, args.remote_corpus)
+    report = compare_snapshots(local, remote)
+    print(json.dumps({
+        "local": local.to_json(),
+        "remote": remote.to_json(),
+        "local_only": report.local_only,
+        "remote_only": report.remote_only,
+        "document_delta": report.document_delta,
+        "generation_delta": report.generation_delta,
+        "in_sync": report.in_sync,
+    }, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_staleness(args) -> int:
     """C5 freshness check: the age of the newest corpus content and newest
     index finish, failing loudly past a threshold (default two weeks).
@@ -2612,6 +2631,11 @@ def build_parser() -> argparse.ArgumentParser:
     au.add_argument("--last", type=int, default=200)
     au.set_defaults(func=lambda a: print(audit_summary(_config_for(a).corpus_path, a.last)) or 0)
 
+
+    parity = sub.add_parser("parity", help="read-only local/remote corpus parity evidence")
+    parity.add_argument("--remote-host", required=True, help="SSH alias or hostname for the storage host")
+    parity.add_argument("--remote-corpus", required=True, help="corpus root on the storage host")
+    parity.set_defaults(func=cmd_parity)
 
     st = sub.add_parser("staleness", help="C5 freshness check: age of the newest content/index, fails loudly past a threshold")
     st.add_argument("--max-age-days", type=float, default=None,
