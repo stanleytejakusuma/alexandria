@@ -1947,6 +1947,7 @@ def cmd_parity(args) -> int:
         "remote": remote.to_json(),
         "local_only": report.local_only,
         "remote_only": report.remote_only,
+        "content_mismatches": report.content_mismatches,
         "document_delta": report.document_delta,
         "generation_delta": report.generation_delta,
         "in_sync": report.in_sync,

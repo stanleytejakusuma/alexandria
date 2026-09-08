@@ -63,10 +63,27 @@ def test_compare_reports_every_mac_only_and_nas_only_source(tmp_path: Path) -> N
     assert not report.in_sync
 
 
+def test_compare_distinguishes_same_id_with_changed_content(tmp_path: Path) -> None:
+    local = snapshot_corpus(_corpus(
+        tmp_path, "local", docs={"sources/shared.md": "new fact"}, generation=3
+    ))
+    remote = snapshot_corpus(_corpus(
+        tmp_path, "nas", docs={"sources/shared.md": "old fact"}, generation=3
+    ))
+
+    report = compare_snapshots(local, remote)
+
+    assert report.local_only == ()
+    assert report.remote_only == ()
+    assert report.content_mismatches == ("sources/shared",)
+    assert not report.in_sync
+
+
 def test_remote_probe_uses_validated_host_and_json_only(tmp_path: Path) -> None:
     expected = CorpusSnapshot(
         corpus="/remote/corpus",
         document_ids=frozenset({"sources/remote"}),
+        document_hashes={"sources/remote": "a" * 64},
         generation=7,
         active_generation=None,
         git_head="abc123",

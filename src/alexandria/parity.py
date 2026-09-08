@@ -1,6 +1,7 @@
 """Read-only corpus parity evidence for storage migration decisions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shlex
@@ -22,6 +23,7 @@ class ParityError(RuntimeError):
 class CorpusSnapshot:
     corpus: str
     document_ids: frozenset[str]
+    document_hashes: Mapping[str, str]
     generation: int
     active_generation: str | None
     git_head: str | None
@@ -31,6 +33,7 @@ class CorpusSnapshot:
         return {
             "corpus": self.corpus,
             "document_ids": sorted(self.document_ids),
+            "document_hashes": dict(self.document_hashes),
             "generation": self.generation,
             "active_generation": self.active_generation,
             "git_head": self.git_head,
@@ -42,6 +45,7 @@ class CorpusSnapshot:
         try:
             corpus = data["corpus"]
             ids = data["document_ids"]
+            hashes = data["document_hashes"]
             generation = data["generation"]
             sizes = data["logical_bytes"]
         except KeyError as exc:
@@ -50,6 +54,11 @@ class CorpusSnapshot:
             raise ParityError("remote snapshot has invalid required fields")
         if not all(isinstance(item, str) for item in ids):
             raise ParityError("remote snapshot document_ids must be strings")
+        if not isinstance(hashes, dict) or set(hashes) != set(ids) or not all(
+            isinstance(key, str) and isinstance(value, str) and len(value) == 64
+            for key, value in hashes.items()
+        ):
+            raise ParityError("remote snapshot document_hashes must cover every ID with SHA-256")
         if not isinstance(sizes, dict) or not all(isinstance(k, str) and isinstance(v, int) for k, v in sizes.items()):
             raise ParityError("remote snapshot logical_bytes must be string/integer pairs")
         active = data.get("active_generation")
@@ -58,7 +67,7 @@ class CorpusSnapshot:
             raise ParityError("remote snapshot active_generation must be a string or null")
         if head is not None and not isinstance(head, str):
             raise ParityError("remote snapshot git_head must be a string or null")
-        return cls(corpus, frozenset(ids), generation, active, head, sizes)
+        return cls(corpus, frozenset(ids), hashes, generation, active, head, sizes)
 
 
 @dataclass(frozen=True)
@@ -69,14 +78,20 @@ class ParityReport:
     remote_only: tuple[str, ...]
     document_delta: int
     generation_delta: int
+    content_mismatches: tuple[str, ...]
 
     @property
     def in_sync(self) -> bool:
-        return not self.local_only and not self.remote_only and self.generation_delta == 0
+        return (
+            not self.local_only
+            and not self.remote_only
+            and not self.content_mismatches
+            and self.generation_delta == 0
+        )
 
 
-def _document_ids(root: Path) -> frozenset[str]:
-    found: set[str] = set()
+def _document_hashes(root: Path) -> dict[str, str]:
+    found: dict[str, str] = {}
     for dirname in _DOCUMENT_DIRS:
         directory = root / dirname
         if not directory.exists():
@@ -84,8 +99,9 @@ def _document_ids(root: Path) -> frozenset[str]:
         for path in directory.rglob("*.md"):
             if path.name.startswith("._"):
                 continue
-            found.add(str(path.relative_to(root).with_suffix("")))
-    return frozenset(found)
+            identifier = str(path.relative_to(root).with_suffix(""))
+            found[identifier] = hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+    return found
 
 
 def _logical_bytes(path: Path, *, ignore_appledouble: bool = False) -> int:
@@ -129,9 +145,11 @@ def snapshot_corpus(corpus: str | Path) -> CorpusSnapshot:
     """Collect deterministic evidence without modifying the corpus."""
     root = Path(corpus).expanduser().resolve()
     active = _pointer_generation(root)
+    hashes = _document_hashes(root)
     return CorpusSnapshot(
         corpus=str(root),
-        document_ids=_document_ids(root),
+        document_ids=frozenset(hashes),
+        document_hashes=hashes,
         generation=_index_generation(root, active),
         active_generation=active,
         git_head=_git_head(root),
@@ -152,16 +170,21 @@ def compare_snapshots(local: CorpusSnapshot, remote: CorpusSnapshot) -> ParityRe
         remote_only=tuple(sorted(remote.document_ids - local.document_ids)),
         document_delta=len(local.document_ids) - len(remote.document_ids),
         generation_delta=local.generation - remote.generation,
+        content_mismatches=tuple(sorted(
+            source_id
+            for source_id in local.document_ids & remote.document_ids
+            if local.document_hashes[source_id] != remote.document_hashes[source_id]
+        )),
     )
 
 
-_REMOTE_PROBE = """import json, pathlib, subprocess, sys
+_REMOTE_PROBE = """import hashlib, json, pathlib, subprocess, sys
 root = pathlib.Path(sys.argv[1]).expanduser().resolve()
 documents = set()
 for name in ('sources', 'wiki'):
     directory = root / name
     if directory.exists():
-        documents.update(str(path.relative_to(root).with_suffix('')) for path in directory.rglob('*.md') if not path.name.startswith('._'))
+        documents.update((str(path.relative_to(root).with_suffix('')), hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()) for path in directory.rglob('*.md') if not path.name.startswith('._'))
 def size(path, ignore_appledouble=False):
     return sum(item.stat().st_size for item in path.rglob('*') if item.is_file() and not (ignore_appledouble and item.name.startswith('._'))) if path.exists() else 0
 try:
@@ -174,7 +197,7 @@ try:
 except Exception:
     generation = 0
 head = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True)
-print(json.dumps({'corpus': str(root), 'document_ids': sorted(documents), 'generation': generation, 'active_generation': pointer, 'git_head': head.stdout.strip() if head.returncode == 0 else None, 'logical_bytes': {name: size(root / path, name in ('sources', 'wiki')) for name, path in {'sources':'sources', 'wiki':'wiki', 'state':'.alexandria/state', 'index':'.alexandria/index', 'cache':'.alexandria/cache'}.items()}}))"""
+print(json.dumps({'corpus': str(root), 'document_ids': sorted(dict(documents)), 'document_hashes': dict(documents), 'generation': generation, 'active_generation': pointer, 'git_head': head.stdout.strip() if head.returncode == 0 else None, 'logical_bytes': {name: size(root / path, name in ('sources', 'wiki')) for name, path in {'sources':'sources', 'wiki':'wiki', 'state':'.alexandria/state', 'index':'.alexandria/index', 'cache':'.alexandria/cache'}.items()}}))"""
 
 
 def probe_remote_snapshot(
