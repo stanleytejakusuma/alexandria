@@ -97,6 +97,38 @@ class ParityReport:
         )
 
 
+@dataclass(frozen=True)
+class ReconciliationPlan:
+    """A review artifact; it intentionally has no apply or copy operation."""
+
+    add_to_remote: tuple[str, ...]
+    add_to_local: tuple[str, ...]
+    conflicts: tuple[tuple[str, str, str], ...]
+    local_git_head: str | None
+    remote_git_head: str | None
+
+    @property
+    def requires_operator_confirmation(self) -> bool:
+        return True
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "apply": False,
+            "requires_operator_confirmation": True,
+            "add_to_remote": self.add_to_remote,
+            "add_to_local": self.add_to_local,
+            "conflicts": [
+                {"source_id": source_id, "local_sha256": local, "remote_sha256": remote}
+                for source_id, local, remote in self.conflicts
+            ],
+            "source_history": {
+                "local": self.local_git_head,
+                "remote": self.remote_git_head,
+                "diverged": self.local_git_head != self.remote_git_head,
+            },
+        }
+
+
 def _document_hashes(root: Path) -> dict[str, str]:
     found: dict[str, str] = {}
     for dirname in _DOCUMENT_DIRS:
@@ -166,6 +198,20 @@ def snapshot_corpus(corpus: str | Path) -> CorpusSnapshot:
             )
             for name in _SIZE_DIRS
         },
+    )
+
+
+def build_reconcile_plan(report: ParityReport) -> ReconciliationPlan:
+    """Turn read-only parity evidence into a deliberately non-executable plan."""
+    return ReconciliationPlan(
+        add_to_remote=report.local_only,
+        add_to_local=report.remote_only,
+        conflicts=tuple(
+            (source_id, report.local.document_hashes[source_id], report.remote.document_hashes[source_id])
+            for source_id in report.content_mismatches
+        ),
+        local_git_head=report.local.git_head,
+        remote_git_head=report.remote.git_head,
     )
 
 
