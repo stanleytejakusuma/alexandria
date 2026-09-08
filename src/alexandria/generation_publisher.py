@@ -1,6 +1,7 @@
 """Build and publish complete corpus generations under a stable control root."""
 from __future__ import annotations
 
+import fcntl
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -73,19 +74,25 @@ def publish_generation(
     """
     control_root = Path(control_root)
     staged = Path(staged).resolve()
-    try:
+    lock_path = control_root / ".alexandria" / "generation-publish.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            previous = resolve_generation(control_root)
-        except GenerationPointerError:
-            docs_before = generation_before = 0
-        else:
-            previous_evidence = validate_generation(previous, docs_before=0, generation_before=0)
-            docs_before = previous_evidence["documents"]
-            generation_before = previous_evidence["generation"]
-        validate_generation(staged, docs_before=docs_before, generation_before=generation_before)
-        snapshot(staged)
-        return activate_generation(control_root, staged)
-    except (GenerationPointerError, ValueError) as exc:
-        raise PublishError(f"generation validation failed; staged generation was not published: {exc}") from exc
-    except Exception as exc:
-        raise PublishError(f"snapshot failed; staged generation was not published: {exc}") from exc
+            try:
+                previous = resolve_generation(control_root)
+            except GenerationPointerError:
+                docs_before = generation_before = 0
+            else:
+                previous_evidence = validate_generation(previous, docs_before=0, generation_before=0)
+                docs_before = previous_evidence["documents"]
+                generation_before = previous_evidence["generation"]
+            validate_generation(staged, docs_before=docs_before, generation_before=generation_before)
+            snapshot(staged)
+            return activate_generation(control_root, staged)
+        except (GenerationPointerError, ValueError) as exc:
+            raise PublishError(f"generation validation failed; staged generation was not published: {exc}") from exc
+        except Exception as exc:
+            raise PublishError(f"snapshot failed; staged generation was not published: {exc}") from exc
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

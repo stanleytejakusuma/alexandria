@@ -9,7 +9,8 @@ PYTHON="$REPO/.venv/bin/python"
 GENERATION_ID="${ALEXANDRIA_GENERATION_ID:-$(date -u '+%Y%m%dT%H%M%SZ')}"
 
 STAGED=$(PYTHONPATH="$REPO/src" "$PYTHON" -c \
-  "from alexandria.generation_publisher import stage_generation; print(stage_generation('$CONTROL_ROOT', '$GENERATION_ID'))")
+  'import sys; from alexandria.generation_publisher import stage_generation; print(stage_generation(sys.argv[1], sys.argv[2]))' \
+  "$CONTROL_ROOT" "$GENERATION_ID")
 
 echo "staged generation: $STAGED"
 if ! ALEXANDRIA_STAGED_MODE=1 ALEXANDRIA_CORPUS="$STAGED" "$REPO/scripts/run-weekly-loop.sh"; then

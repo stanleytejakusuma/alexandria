@@ -16,11 +16,21 @@ def snapshot_and_commit_history(control_root: str | Path, staged: str | Path, *,
     target = snapshot_source_history(control, staged, generation_id=generation_id)
     relative = target.relative_to(control)
     try:
+        # Refuse a dirty index: a publisher must not smuggle unrelated staged
+        # work into the acceptance commit.
+        if subprocess.run(["git", "-C", str(control), "diff", "--cached", "--quiet"]).returncode:
+            raise HistorySnapshotError("control-root Git index is already staged")
         subprocess.run(["git", "-C", str(control), "add", "--", str(relative)], check=True)
         subprocess.run(
-            ["git", "-C", str(control), "commit", "-m", f"weekly generation {generation_id}"],
+            ["git", "-C", str(control), "commit", "--only", "-m", f"weekly generation {generation_id}", "--", str(relative)],
             check=True, capture_output=True, text=True,
         )
+        changed = subprocess.run(
+            ["git", "-C", str(control), "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD", "--", str(relative)],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        if not changed:
+            raise HistorySnapshotError("history snapshot commit omitted the generation path")
     except subprocess.CalledProcessError as exc:
         raise HistorySnapshotError(f"history snapshot was not committed: {exc.stderr or exc}") from exc
     return target
