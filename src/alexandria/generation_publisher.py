@@ -5,7 +5,8 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from .generation_pointer import GenerationPointerError, activate_generation
+from .generation_pointer import GenerationPointerError, activate_generation, resolve_generation
+from .generation_validation import validate_generation
 
 __all__ = ["PublishError", "publish_generation", "stage_generation"]
 
@@ -57,9 +58,18 @@ def publish_generation(
     control_root = Path(control_root)
     staged = Path(staged).resolve()
     try:
+        try:
+            previous = resolve_generation(control_root)
+        except GenerationPointerError:
+            docs_before = generation_before = 0
+        else:
+            previous_evidence = validate_generation(previous, docs_before=0, generation_before=0)
+            docs_before = previous_evidence["documents"]
+            generation_before = previous_evidence["generation"]
+        validate_generation(staged, docs_before=docs_before, generation_before=generation_before)
         snapshot(staged)
         return activate_generation(control_root, staged)
-    except GenerationPointerError as exc:
-        raise PublishError(str(exc)) from exc
+    except (GenerationPointerError, ValueError) as exc:
+        raise PublishError(f"generation validation failed; staged generation was not published: {exc}") from exc
     except Exception as exc:
         raise PublishError(f"snapshot failed; staged generation was not published: {exc}") from exc

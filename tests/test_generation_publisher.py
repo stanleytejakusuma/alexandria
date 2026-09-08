@@ -18,14 +18,19 @@ def _control_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _built(stage: Path, generation: int) -> None:
+    (stage / ".alexandria" / "index").mkdir(parents=True)
+    (stage / ".alexandria" / "index" / "generation.json").write_text(
+        f'{{"generation": {generation}}}', encoding="utf-8"
+    )
+
+
 def test_stage_copies_reader_inputs_but_not_git_or_unrelated_runtime_state(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
     (root / ".git").mkdir()
     (root / ".alexandria" / "cache").mkdir()
     (root / ".alexandria" / "cache" / "ignored").write_text("cache")
-
     staged = stage_generation(root, "g-1")
-
     assert (staged / "sources" / "note.md").read_text() == "old source"
     assert (staged / ".alexandria" / "state" / "connector.json").read_text() == "old state"
     assert not (staged / ".git").exists()
@@ -35,39 +40,33 @@ def test_stage_copies_reader_inputs_but_not_git_or_unrelated_runtime_state(tmp_p
 def test_processing_a_staged_source_cannot_mutate_the_control_root(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
     staged = stage_generation(root, "g-1")
-
     (staged / "sources" / "note.md").write_text("new staged source", encoding="utf-8")
-
     assert (root / "sources" / "note.md").read_text(encoding="utf-8") == "old source"
 
 
 def test_failed_snapshot_never_switches_the_live_pointer(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
-    old = stage_generation(root, "old")
-    new = stage_generation(root, "new")
-    activate_generation(root, old)
-
-    def fail_snapshot(_staged: Path) -> None:
-        raise RuntimeError("git snapshot failed")
-
+    old, new = stage_generation(root, "old"), stage_generation(root, "new")
+    _built(old, 1); _built(new, 2); activate_generation(root, old)
     with pytest.raises(PublishError, match="snapshot failed"):
-        publish_generation(root, new, snapshot=fail_snapshot)
+        publish_generation(root, new, snapshot=lambda _stage: (_ for _ in ()).throw(RuntimeError("git snapshot failed")))
+    assert resolve_generation(root) == old
 
+
+def test_unvalidated_generation_cannot_be_published(tmp_path: Path) -> None:
+    root = _control_root(tmp_path)
+    old, new = stage_generation(root, "old"), stage_generation(root, "new")
+    _built(old, 1); activate_generation(root, old)
+    with pytest.raises(PublishError, match="generation validation failed"):
+        publish_generation(root, new, snapshot=lambda _stage: None)
     assert resolve_generation(root) == old
 
 
 def test_snapshot_finishes_before_the_new_generation_becomes_live(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
-    old = stage_generation(root, "old")
-    new = stage_generation(root, "new")
-    activate_generation(root, old)
+    old, new = stage_generation(root, "old"), stage_generation(root, "new")
+    _built(old, 1); _built(new, 2); activate_generation(root, old)
     observed: list[Path] = []
-
-    def snapshot(staged: Path) -> None:
-        observed.append(resolve_generation(root))
-        assert staged == new
-
-    publish_generation(root, new, snapshot=snapshot)
-
+    publish_generation(root, new, snapshot=lambda staged: observed.append(resolve_generation(root)))
     assert observed == [old]
     assert resolve_generation(root) == new
