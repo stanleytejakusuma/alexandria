@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,12 @@ def test_compare_reports_every_mac_only_and_nas_only_source(tmp_path: Path) -> N
     assert report.remote_only == ("sources/nas",)
     assert report.document_delta == 0
     assert report.generation_delta == 68
+    assert report.local_only_families == {"sources/mac": 1}
+    assert report.remote_only_families == {"sources/nas": 1}
+    assert not report.source_history_diverged
+    assert compare_snapshots(
+        replace(local, git_head="local-head"), replace(remote, git_head="remote-head")
+    ).source_history_diverged
     assert not report.in_sync
 
 

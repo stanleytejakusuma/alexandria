@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -79,6 +80,12 @@ class ParityReport:
     document_delta: int
     generation_delta: int
     content_mismatches: tuple[str, ...]
+    local_only_families: Mapping[str, int]
+    remote_only_families: Mapping[str, int]
+
+    @property
+    def source_history_diverged(self) -> bool:
+        return self.local.git_head != self.remote.git_head
 
     @property
     def in_sync(self) -> bool:
@@ -162,12 +169,19 @@ def snapshot_corpus(corpus: str | Path) -> CorpusSnapshot:
     )
 
 
+def _families(source_ids: frozenset[str]) -> dict[str, int]:
+    """Group IDs by their first two path components for a compact report."""
+    return dict(sorted(Counter("/".join(source_id.split("/")[:2]) for source_id in source_ids).items()))
+
+
 def compare_snapshots(local: CorpusSnapshot, remote: CorpusSnapshot) -> ParityReport:
+    local_only = frozenset(local.document_ids - remote.document_ids)
+    remote_only = frozenset(remote.document_ids - local.document_ids)
     return ParityReport(
         local=local,
         remote=remote,
-        local_only=tuple(sorted(local.document_ids - remote.document_ids)),
-        remote_only=tuple(sorted(remote.document_ids - local.document_ids)),
+        local_only=tuple(sorted(local_only)),
+        remote_only=tuple(sorted(remote_only)),
         document_delta=len(local.document_ids) - len(remote.document_ids),
         generation_delta=local.generation - remote.generation,
         content_mismatches=tuple(sorted(
@@ -175,6 +189,8 @@ def compare_snapshots(local: CorpusSnapshot, remote: CorpusSnapshot) -> ParityRe
             for source_id in local.document_ids & remote.document_ids
             if local.document_hashes[source_id] != remote.document_hashes[source_id]
         )),
+        local_only_families=_families(local_only),
+        remote_only_families=_families(remote_only),
     )
 
 
