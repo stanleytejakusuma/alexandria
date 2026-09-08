@@ -30,6 +30,9 @@ TIMEOUT="${ALEXANDRIA_TIMEOUT:-/opt/homebrew/bin/timeout}"
 STEP_TIMEOUT_SECONDS="${ALEXANDRIA_STEP_TIMEOUT_SECONDS:-1800}"
 TIMEOUT_KILL_AFTER_SECONDS="${ALEXANDRIA_TIMEOUT_KILL_AFTER_SECONDS:-30}"
 PI_SESSIONS_LIMIT="${ALEXANDRIA_PI_SESSIONS_LIMIT:-100}"
+# The vault connector can enumerate 24k+ notes; without a cap it rewrites a
+# whole generation and turns its index step into a multi-hour cold rebuild.
+KNOWLEDGE_GRAPH_LIMIT="${ALEXANDRIA_KNOWLEDGE_GRAPH_LIMIT:-100}"
 BASE_URL="${ALEXANDRIA_BASE_URL:?set in the supervisor}"
 # Key source is deployment-dependent: the Mac supervisor supplies the
 # keychain service name; a Linux/NAS supervisor supplies ALEXANDRIA_LLM_KEY
@@ -56,7 +59,7 @@ run_bounded() { "$TIMEOUT" --kill-after="${TIMEOUT_KILL_AFTER_SECONDS}s" "$STEP_
 
 # Validate all execution controls before any external call. A bad launchd value
 # must be a failed preflight, never a supposedly healthy but unbounded run.
-if [ ! -x "$TIMEOUT" ] || ! is_positive_integer "$STEP_TIMEOUT_SECONDS" || ! is_positive_integer "$TIMEOUT_KILL_AFTER_SECONDS" || ! is_positive_integer "$PI_SESSIONS_LIMIT"; then
+if [ ! -x "$TIMEOUT" ] || ! is_positive_integer "$STEP_TIMEOUT_SECONDS" || ! is_positive_integer "$TIMEOUT_KILL_AFTER_SECONDS" || ! is_positive_integer "$PI_SESSIONS_LIMIT" || ! is_positive_integer "$KNOWLEDGE_GRAPH_LIMIT"; then
   PREFLIGHT_CONFIG_FAILED=1
 else
   PREFLIGHT_CONFIG_FAILED=0
@@ -103,7 +106,7 @@ elif ! run_bounded "$CLI" sync pi-sessions --help >> "$DIGEST" 2>&1; then
   echo "[FAIL] PREFLIGHT: sync pi-sessions --help cannot start" >> "$DIGEST"
   PREFLIGHT_FAILED=1
 else
-  echo "[PASS] preflight: CLI and required sync parser start; timeout=${STEP_TIMEOUT_SECONDS}s; pi-session batch=${PI_SESSIONS_LIMIT}" >> "$DIGEST"
+  echo "[PASS] preflight: CLI and required sync parser start; timeout=${STEP_TIMEOUT_SECONDS}s; pi-session batch=${PI_SESSIONS_LIMIT}; vault batch=${KNOWLEDGE_GRAPH_LIMIT}" >> "$DIGEST"
   PREFLIGHT_FAILED=0
 fi
 
@@ -174,6 +177,7 @@ run_required "sync journal (accountability digest)" "$CLI" --corpus "$CORPUS" sy
 # ~1,296 harness memories the live store has already rotated out. No LLM, no
 # gateway: pure normalize-and-copy, so it runs even when the gateway is down.
 run_required "sync knowledge-graph (vault memories)" "$CLI" --corpus "$CORPUS" sync knowledge-graph \
+  --limit "$KNOWLEDGE_GRAPH_LIMIT" \
   || abort_required_work "sync knowledge-graph (vault memories)"
 
 run_required "sync inbox (explicit memories)" "$CLI" --corpus "$CORPUS" sync inbox \

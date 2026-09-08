@@ -23,6 +23,12 @@ def test_pi_session_sync_has_a_configurable_batch_limit_and_timeout() -> None:
     assert "gtimeout" in text or "timeout" in text
 
 
+def test_knowledge_graph_sync_has_a_configurable_batch_limit() -> None:
+    text = LOOP.read_text()
+    assert "ALEXANDRIA_KNOWLEDGE_GRAPH_LIMIT" in text
+    assert "--limit \"$KNOWLEDGE_GRAPH_LIMIT\"" in text
+
+
 def test_required_sync_failure_never_snapshots_partial_corpus() -> None:
     """A valid CLI that fails pi-session sync must halt before git commit.
 
