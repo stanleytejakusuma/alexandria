@@ -211,21 +211,26 @@ else
   echo "### leg-ablation (skipped; CI/on-engine-change only)" >> "$DIGEST"
 fi
 
-# keep the corpus weekly-snapshot-able (the quarterly contest needs it).
-# Only `sources` and `wiki`: `notes` does not exist, and `.alexandria/` is
-# gitignored as derived state. git add is ATOMIC across pathspecs, so naming
-# either one made the whole add fail ("fatal: pathspec 'notes' did not match")
-# and stage nothing -- while --allow-empty still produced a commit. Observed
-# 2026-08-11: 2,277 new notes untracked, commit reported 0 files changed.
-# No --allow-empty: a commit must mean something was actually captured.
-git -C "$CORPUS" add sources wiki >> "$DIGEST" 2>&1 || echo "git add FAILED" >> "$DIGEST"
-if git -C "$CORPUS" diff --cached --quiet; then
-  echo "corpus snapshot: nothing new to commit" >> "$DIGEST"
+# A staged run deliberately has no Git checkout. Its wrapper snapshots history
+# at the control root, commits it, then flips the generation pointer. Never
+# manufacture a Git repository inside a generation just to preserve this old
+# verifier shape.
+if [ "${ALEXANDRIA_STAGED_MODE:-0}" = "1" ]; then
+  echo "### corpus snapshot (deferred to control-root publisher)" >> "$DIGEST"
 else
-  staged=$(git -C "$CORPUS" diff --cached --numstat | wc -l | tr -d ' ')
-  git -C "$CORPUS" commit -q -m "weekly loop digest $(date '+%Y-%m-%d')" \
-    && echo "corpus snapshot: committed $staged file(s)" >> "$DIGEST" \
-    || echo "corpus commit FAILED" >> "$DIGEST"
+  # keep the corpus weekly-snapshot-able (the quarterly contest needs it).
+  # Only `sources` and `wiki`: `notes` does not exist, and `.alexandria/` is
+  # gitignored as derived state. git add is ATOMIC across pathspecs, so naming
+  # either one made the whole add fail and stage nothing.
+  git -C "$CORPUS" add sources wiki >> "$DIGEST" 2>&1 || echo "git add FAILED" >> "$DIGEST"
+  if git -C "$CORPUS" diff --cached --quiet; then
+    echo "corpus snapshot: nothing new to commit" >> "$DIGEST"
+  else
+    staged=$(git -C "$CORPUS" diff --cached --numstat | wc -l | tr -d ' ')
+    git -C "$CORPUS" commit -q -m "weekly loop digest $(date '+%Y-%m-%d')" \
+      && echo "corpus snapshot: committed $staged file(s)" >> "$DIGEST" \
+      || echo "corpus commit FAILED" >> "$DIGEST"
+  fi
 fi
 
 # The load-bearing step. Everything above reports what it INTENDED to do; this
@@ -235,6 +240,7 @@ VERIFY_STATUS=0
 run_bounded "$REPO/.venv/bin/python" "$REPO/scripts/verify-loop-run.py" \
   --corpus "$CORPUS" --binary "$REPO/.venv/bin/alexandria" \
   --docs-before "$DOCS_BEFORE" --generation-before "$GEN_BEFORE" \
+  $([ "${ALEXANDRIA_STAGED_MODE:-0}" = "1" ] && echo "--skip-commit-check") \
   >> "$DIGEST" 2>&1 || VERIFY_STATUS=1
 
 # C5 freshness (2026-08-23): quality gates cannot detect liveness failures --

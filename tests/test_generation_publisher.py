@@ -56,11 +56,13 @@ def test_staging_starts_from_the_active_generation_after_a_cutover(tmp_path: Pat
     (active / "sources" / "note.md").write_text("active source")
     (active / "wiki").mkdir()
     (active / ".alexandria" / "state").mkdir(parents=True)
+    _built(active, 41)
     activate_generation(root, active)
 
     staged = stage_generation(root, "new")
 
     assert (staged / "sources" / "note.md").read_text() == "active source"
+    assert (staged / ".alexandria" / "index" / "generation.json").read_text() == '{"generation": 41}'
 
 
 def test_processing_a_staged_source_cannot_mutate_the_control_root(tmp_path: Path) -> None:

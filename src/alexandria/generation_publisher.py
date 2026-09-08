@@ -45,6 +45,14 @@ def stage_generation(control_root: str | Path, generation_id: str) -> Path:
             source = source_root / relative
             if source.exists():
                 shutil.copytree(source, staged / relative)
+        # The rebuilt staged index is independent, but its generation must be
+        # monotonic relative to the live generation so liveness checks can
+        # distinguish a successful staged rebuild from a reset counter.
+        generation = source_root / ".alexandria" / "index" / "generation.json"
+        if generation.exists():
+            destination = staged / ".alexandria" / "index" / "generation.json"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(generation, destination)
         return staged
     except Exception:
         shutil.rmtree(staged, ignore_errors=True)
