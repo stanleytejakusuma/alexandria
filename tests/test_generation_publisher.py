@@ -62,6 +62,17 @@ def test_unvalidated_generation_cannot_be_published(tmp_path: Path) -> None:
     assert resolve_generation(root) == old
 
 
+def test_crash_after_snapshot_leaves_old_generation_live(tmp_path: Path) -> None:
+    root = _control_root(tmp_path)
+    old, new = stage_generation(root, "old"), stage_generation(root, "new")
+    _built(old, 1); _built(new, 2); activate_generation(root, old)
+
+    with pytest.raises(SystemExit, match="137"):
+        publish_generation(root, new, snapshot=lambda _stage: (_ for _ in ()).throw(SystemExit(137)))
+
+    assert resolve_generation(root) == old
+
+
 def test_snapshot_finishes_before_the_new_generation_becomes_live(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
     old, new = stage_generation(root, "old"), stage_generation(root, "new")
