@@ -25,7 +25,7 @@ def _built(stage: Path, generation: int) -> None:
     )
 
 
-def test_stage_copies_reader_inputs_but_not_git_or_unrelated_runtime_state(tmp_path: Path) -> None:
+def test_stage_copies_reader_inputs_and_clones_required_derived_state(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
     (root / ".git").mkdir()
     (root / ".alexandria" / "cache").mkdir()
@@ -34,7 +34,7 @@ def test_stage_copies_reader_inputs_but_not_git_or_unrelated_runtime_state(tmp_p
     assert (staged / "sources" / "note.md").read_text() == "old source"
     assert (staged / ".alexandria" / "state" / "connector.json").read_text() == "old state"
     assert not (staged / ".git").exists()
-    assert not (staged / ".alexandria" / "cache").exists()
+    assert (staged / ".alexandria" / "cache" / "ignored").read_text() == "cache"
 
 
 def test_staging_failure_leaves_no_publishable_candidate_or_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,6 +63,21 @@ def test_staging_starts_from_the_active_generation_after_a_cutover(tmp_path: Pat
 
     assert (staged / "sources" / "note.md").read_text() == "active source"
     assert (staged / ".alexandria" / "index" / "generation.json").read_text() == '{"generation": 41}'
+
+
+def test_staging_clones_derived_index_and_cache_without_mutating_control_root(tmp_path: Path) -> None:
+    root = _control_root(tmp_path)
+    for name in ("index", "cache"):
+        source = root / ".alexandria" / name
+        source.mkdir(parents=True)
+        (source / "marker").write_text("control")
+
+    staged = stage_generation(root, "g-1")
+    (staged / ".alexandria" / "index" / "marker").write_text("stage")
+    (staged / ".alexandria" / "cache" / "marker").write_text("stage")
+
+    assert (root / ".alexandria" / "index" / "marker").read_text() == "control"
+    assert (root / ".alexandria" / "cache" / "marker").read_text() == "control"
 
 
 def test_processing_a_staged_source_cannot_mutate_the_control_root(tmp_path: Path) -> None:

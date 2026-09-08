@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import shutil
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -49,11 +50,18 @@ def stage_generation(control_root: str | Path, generation_id: str) -> Path:
         # The rebuilt staged index is independent, but its generation must be
         # monotonic relative to the live generation so liveness checks can
         # distinguish a successful staged rebuild from a reset counter.
-        generation = source_root / ".alexandria" / "index" / "generation.json"
-        if generation.exists():
-            destination = staged / ".alexandria" / "index" / "generation.json"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(generation, destination)
+        # The derived index/cache are large (15GB/6.9GB on the Mac) but needed
+        # for incremental staging. APFS clones give private copy-on-write
+        # mutations without a multi-hour byte copy. Fail closed elsewhere: a
+        # normal recursive copy defeats the loop's bounded-liveness contract.
+        for name in ("index", "cache"):
+            source = source_root / ".alexandria" / name
+            if source.exists():
+                destination = staged / ".alexandria" / name
+                try:
+                    subprocess.run(["/bin/cp", "-cR", str(source), str(destination)], check=True)
+                except (OSError, subprocess.CalledProcessError) as exc:
+                    raise PublishError(f"cannot clone staged {name}; refusing an unbounded byte copy") from exc
         return staged
     except Exception:
         shutil.rmtree(staged, ignore_errors=True)
