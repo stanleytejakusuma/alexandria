@@ -73,6 +73,25 @@ def test_crash_after_snapshot_leaves_old_generation_live(tmp_path: Path) -> None
     assert resolve_generation(root) == old
 
 
+def test_crash_after_activation_keeps_new_generation_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _control_root(tmp_path)
+    old, new = stage_generation(root, "old"), stage_generation(root, "new")
+    _built(old, 1); _built(new, 2); activate_generation(root, old)
+
+    import alexandria.generation_publisher as publisher
+
+    original = publisher.activate_generation
+    def activate_then_die(control_root: Path, staged: Path) -> Path:
+        original(control_root, staged)
+        raise SystemExit(137)
+    monkeypatch.setattr(publisher, "activate_generation", activate_then_die)
+
+    with pytest.raises(SystemExit, match="137"):
+        publish_generation(root, new, snapshot=lambda _stage: None)
+
+    assert resolve_generation(root) == new
+
+
 def test_snapshot_finishes_before_the_new_generation_becomes_live(tmp_path: Path) -> None:
     root = _control_root(tmp_path)
     old, new = stage_generation(root, "old"), stage_generation(root, "new")
