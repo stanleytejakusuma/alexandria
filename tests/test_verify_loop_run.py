@@ -55,11 +55,12 @@ def _finder(tmp_path: Path, *, finds: bool) -> Path:
     return p
 
 
-def _run(corpus: Path, binary: Path, docs_before: int, gen_before: int):
-    return subprocess.run(
-        [sys.executable, str(SCRIPT), "--corpus", str(corpus), "--binary", str(binary),
-         "--docs-before", str(docs_before), "--generation-before", str(gen_before)],
-        capture_output=True, text=True)
+def _run(corpus: Path, binary: Path, docs_before: int, gen_before: int, *, skip_commit: bool = False):
+    command = [sys.executable, str(SCRIPT), "--corpus", str(corpus), "--binary", str(binary),
+               "--docs-before", str(docs_before), "--generation-before", str(gen_before)]
+    if skip_commit:
+        command.append("--skip-commit-check")
+    return subprocess.run(command, capture_output=True, text=True)
 
 
 def test_a_healthy_run_passes(tmp_path):
@@ -113,6 +114,14 @@ def test_an_empty_commit_after_new_documents_fails(tmp_path):
     out = _run(_corpus(tmp_path / "c", commit_files=False), _finder(tmp_path, finds=True), 0, 3)
     assert out.returncode == 1
     assert "new documents were not committed" in out.stdout
+
+
+def test_staged_verification_skips_only_the_external_git_snapshot_check(tmp_path):
+    corpus = _corpus(tmp_path / "c", commit_files=False)
+    (corpus / ".git").rename(corpus / ".git-hidden")
+    out = _run(corpus, _finder(tmp_path, finds=True), 1, 3, skip_commit=True)
+    assert out.returncode == 0, out.stdout
+    assert "skipped: staged generation has no Git checkout" in out.stdout
 
 
 def test_a_stem_appearing_as_a_bare_substring_is_not_counted_as_a_hit(tmp_path):

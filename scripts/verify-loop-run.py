@@ -166,6 +166,8 @@ def main() -> int:
     ap.add_argument("--binary", required=True, help="path to the alexandria CLI")
     ap.add_argument("--docs-before", type=int, required=True)
     ap.add_argument("--generation-before", type=int, required=True)
+    ap.add_argument("--skip-commit-check", action="store_true",
+                    help="generation-local verification; control-root snapshot is checked separately")
     args = ap.parse_args()
 
     corpus = Path(args.corpus).expanduser()
@@ -213,11 +215,15 @@ def main() -> int:
 
     # A commit is only meaningful if it captured something. An empty commit after
     # new documents arrived is the --allow-empty failure resurfacing.
-    files = committed_file_count(corpus)
-    commit_ok = files > 0 if new_docs > 0 else True
-    checks.append(("corpus snapshot", commit_ok,
-                   f"HEAD contains {files} file(s)"
-                   + ("" if commit_ok else "  <-- new documents were not committed")))
+    if args.skip_commit_check:
+        checks.append(("corpus snapshot", True,
+                       "skipped: staged generation has no Git checkout"))
+    else:
+        files = committed_file_count(corpus)
+        commit_ok = files > 0 if new_docs > 0 else True
+        checks.append(("corpus snapshot", commit_ok,
+                       f"HEAD contains {files} file(s)"
+                       + ("" if commit_ok else "  <-- new documents were not committed")))
 
     width = max(len(n) for n, _, _ in checks)
     for name, ok, detail in checks:
