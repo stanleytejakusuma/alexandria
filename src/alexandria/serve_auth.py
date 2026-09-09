@@ -30,7 +30,12 @@ import hashlib
 import hmac
 import secrets
 
-TOKEN_FILE_DEFAULT = "serve-tokens.txt"
+# One constant for one file. This was "serve-tokens.txt" while serve read
+# ".alexandria/serve-tokens.txt", so `serve --add-token` wrote a path serve
+# never loaded: every request 401d with no diagnosis. serve's spelling wins --
+# it is the one a running server actually reads, and it keeps the file out of
+# the corpus content tree.
+TOKEN_FILE_DEFAULT = ".alexandria/serve-tokens.txt"
 
 
 def hash_token(token: str) -> str:

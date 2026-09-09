@@ -28,7 +28,19 @@ class AppConfig:
     rerank_top_k: int = 5
     chunk_tokens: int = 512
     chunk_overlap: float = 0.15
+    # The durable corpus root: pointer, Git history, inbox, pending markers,
+    # serve tokens, drain liveness. `None` means "same as corpus_path", which is
+    # the truth for legacy corpora and for the 27 call sites that construct an
+    # AppConfig directly from a fixture path. Read it through `control_root`,
+    # never this field -- a bare default would silently point every fixture at
+    # the real corpus.
+    control_root_override: Path | None = None
     index_progress_every: int = 250
+
+    @property
+    def control_root(self) -> Path:
+        """The durable root. Falls back to the corpus when no generation is in play."""
+        return self.control_root_override or self.corpus_path
     # Commit granularity, deliberately decoupled from embed_batch_size. Every
     # store write is one LanceDB commit, and a commit rewrites a manifest listing
     # every existing fragment -- so per-commit cost grows with the number of prior
@@ -62,11 +74,34 @@ def load_config(*, corpus_override: str | Path | None = None,
     provider = _env_or_file("ALEXANDRIA_EMBED_PROVIDER", raw, ("embed", "provider"), "local")
     if provider not in {"local", "hash", "mlx"}:
         raise ValueError("ALEXANDRIA_EMBED_PROVIDER must be local, mlx, or hash")
-    corpus_path = Path(corpus).expanduser()
+    # Two roots, deliberately distinct.
+    #
+    # `control_root` is durable: it owns the pointer, Git history, the inbox,
+    # pending markers, serve tokens, and drain liveness. `corpus_path` is the
+    # resolved generation -- a disposable projection that readers see and that
+    # every publish replaces.
+    #
+    # Collapsing the two caused three incidents in two days: `remember` wrote
+    # into a generation staging did not copy (a4b4131), the drain recorded its
+    # heartbeat into a generation so /health called a healthy drain dead
+    # (a7f8290), and `serve --add-token` still mints tokens a publish drops.
+    # Each was patched at its call site; keeping both roots on the config is
+    # what stops the next one.
+    control_root = Path(corpus).expanduser()
+    corpus_path = control_root
     if (corpus_path / ".alexandria" / "current-generation.json").exists():
         corpus_path = resolve_generation(corpus_path)
+    else:
+        # A caller may hand us a generation directly (the stage runner does).
+        # It has no pointer of its own, so it resolves to itself -- but the
+        # durable root is the corpus that OWNS it, three parents up, not the
+        # generation.
+        parent = control_root.parent
+        if parent.name == "generations" and parent.parent.name == ".alexandria":
+            control_root = parent.parent.parent
     return AppConfig(
         corpus_path=corpus_path,
+        control_root_override=control_root,
         embed_provider=provider,
         embed_model=_env_or_file("ALEXANDRIA_EMBED_MODEL", raw, ("embed", "model"),
                                  "Qwen/Qwen3-Embedding-0.6B"),

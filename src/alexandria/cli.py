@@ -595,7 +595,10 @@ def cmd_serve(args) -> int:
         from .serve_auth import TOKEN_FILE_DEFAULT, hash_token, mint_token
 
         token_file = args.token_file or os.environ.get("ALEXANDRIA_SERVE_TOKENS", "")
-        path = Path(token_file).expanduser() if token_file else config.corpus_path / TOKEN_FILE_DEFAULT
+        # control_root, not corpus_path: a token minted into a resolved
+        # generation is dropped by the next publish, and auth then fails with
+        # no diagnosis.
+        path = Path(token_file).expanduser() if token_file else config.control_root / TOKEN_FILE_DEFAULT
         # Never echo the token into the audit trail or logs beyond this one
         # print: the token is shown once to the operator, then only its hash
         # exists on disk.
@@ -2048,8 +2051,12 @@ def cmd_eval(args) -> int:
               f"({marker}); refusing to measure a partial index. Finish the "
               f"rebuild, or pass --allow-partial-index to override.", file=sys.stderr)
         return 2
+    # Golden sets are operator-maintained control-root state that staging does
+    # not copy. Resolving them against the generation made the pre-commit gate
+    # unable to read its own evidence, which it then reported as a retrieval
+    # regression. The INDEX under evaluation stays `corpus` (the generation).
     golden_path = (Path(args.golden).expanduser() if args.golden else
-                   corpus / ".alexandria" / "golden" / "golden-v1.jsonl")
+                   config.control_root / ".alexandria" / "golden" / "golden-v1.jsonl")
     try:
         entries = load_golden(golden_path)
     except ValueError as exc:
@@ -2075,7 +2082,7 @@ def cmd_eval(args) -> int:
     # scores exactly as well as one that stays right. Run when the set exists so
     # a corpus without one still evaluates, rather than failing on absence.
     negative_path = (Path(args.negative).expanduser() if args.negative else
-                     corpus / ".alexandria" / "golden" / "negative-v1.jsonl")
+                     config.control_root / ".alexandria" / "golden" / "negative-v1.jsonl")
     if negative_path.exists():
         try:
             negative_entries = load_negative(negative_path)

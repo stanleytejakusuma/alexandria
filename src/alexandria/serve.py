@@ -121,7 +121,9 @@ def _validated_answer_timeout() -> str:
 
 TOKENS_ENV = "ALEXANDRIA_SERVE_TOKENS"
 REQUIRE_TOKEN_ENV = "ALEXANDRIA_SERVE_REQUIRE_TOKEN"
-_TOKEN_FILE_DEFAULT = ".alexandria/serve-tokens.txt"
+# Re-exported from serve_auth so there is exactly one definition. Two spellings
+# is how the mint path and the read path silently diverged.
+from .serve_auth import TOKEN_FILE_DEFAULT as _TOKEN_FILE_DEFAULT
 
 
 def _load_token_store(token_file: str | Path | None, corpus: Path) -> dict[str, str]:
