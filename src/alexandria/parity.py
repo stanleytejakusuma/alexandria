@@ -104,6 +104,8 @@ class ReconciliationPlan:
     add_to_remote: tuple[str, ...]
     add_to_local: tuple[str, ...]
     conflicts: tuple[tuple[str, str, str], ...]
+    local_addition_hashes: Mapping[str, str]
+    remote_addition_hashes: Mapping[str, str]
     local_git_head: str | None
     remote_git_head: str | None
 
@@ -121,6 +123,8 @@ class ReconciliationPlan:
                 {"source_id": source_id, "local_sha256": local, "remote_sha256": remote}
                 for source_id, local, remote in self.conflicts
             ],
+            "local_addition_hashes": dict(self.local_addition_hashes),
+            "remote_addition_hashes": dict(self.remote_addition_hashes),
             "source_history": {
                 "local": self.local_git_head,
                 "remote": self.remote_git_head,
@@ -210,6 +214,8 @@ def build_reconcile_plan(report: ParityReport) -> ReconciliationPlan:
             (source_id, report.local.document_hashes[source_id], report.remote.document_hashes[source_id])
             for source_id in report.content_mismatches
         ),
+        local_addition_hashes={source_id: report.local.document_hashes[source_id] for source_id in report.local_only},
+        remote_addition_hashes={source_id: report.remote.document_hashes[source_id] for source_id in report.remote_only},
         local_git_head=report.local.git_head,
         remote_git_head=report.remote.git_head,
     )

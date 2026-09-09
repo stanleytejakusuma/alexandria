@@ -40,6 +40,8 @@ def test_reconcile_plan_is_directional_and_never_an_apply_instruction() -> None:
     assert plan.add_to_remote == ("sources/local",)
     assert plan.add_to_local == ("sources/remote",)
     assert plan.conflicts == (("sources/shared", "b" * 64, "d" * 64),)
+    assert plan.local_addition_hashes == {"sources/local": "a" * 64}
+    assert plan.remote_addition_hashes == {"sources/remote": "c" * 64}
     assert plan.requires_operator_confirmation
     assert plan.to_json()["apply"] is False
     assert plan.to_json()["source_history"] == {
