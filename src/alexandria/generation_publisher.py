@@ -21,6 +21,18 @@ def _generations_root(control_root: Path) -> Path:
     return control_root / ".alexandria" / "generations"
 
 
+def _copy_missing(source: Path, destination: Path) -> None:
+    """Copy only what `destination` lacks, leaving existing files untouched."""
+    destination.mkdir(parents=True, exist_ok=True)
+    for entry in source.rglob("*"):
+        target = destination / entry.relative_to(source)
+        if entry.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(entry, target)
+
+
 def stage_generation(control_root: str | Path, generation_id: str) -> Path:
     """Copy only reader inputs into a fresh, unpublished generation.
 
@@ -33,20 +45,45 @@ def stage_generation(control_root: str | Path, generation_id: str) -> Path:
     staged = _generations_root(control_root) / generation_id
     if staged.exists():
         raise PublishError(f"generation already exists: {generation_id}")
-    # After cutover the control root is Git/pointer authority, not reader data.
-    # Copy from the selected generation so the next candidate inherits exactly
-    # what readers see; before migration there is no pointer and root is legacy.
-    source_root = (
-        resolve_generation(control_root)
-        if (control_root / ".alexandria" / "current-generation.json").exists()
-        else control_root
+    # Reader inputs are the UNION of the selected generation and the control
+    # root, in that order of precedence.
+    #
+    # 2026-09-09: copying from the generation alone silently dropped four
+    # standing-convention documents that had been written to the control root --
+    # on disk, in no generation, in no index, unreachable by search. Copying
+    # from the control root alone is worse: 897 reconciled documents existed
+    # only in the active generation and would have been dropped instead.
+    # Neither side is authoritative on its own, so take both.
+    #
+    # The generation wins a collision: it is what readers currently see, and
+    # promotion rewrites a document in place there.
+    pointer_exists = (control_root / ".alexandria" / "current-generation.json").exists()
+    source_roots: tuple[Path, ...] = (
+        (resolve_generation(control_root), control_root) if pointer_exists else (control_root,)
     )
     try:
         staged.mkdir(parents=True)
-        for relative in (Path("sources"), Path("wiki"), Path(".alexandria") / "state"):
-            source = source_root / relative
-            if source.exists():
-                shutil.copytree(source, staged / relative)
+        # `inbox` and `.alexandria/pending` travel too: an entry that has been
+        # appended but not yet promoted must survive a cutover, or /remember
+        # silently loses writes that arrive mid-publish.
+        for relative in (
+            Path("sources"),
+            Path("wiki"),
+            Path("inbox"),
+            Path(".alexandria") / "state",
+            Path(".alexandria") / "pending",
+        ):
+            for index, source_root in enumerate(source_roots):
+                source = source_root / relative
+                if not source.exists():
+                    continue
+                if index == 0:
+                    shutil.copytree(source, staged / relative)
+                    continue
+                # Lower-precedence roots may only FILL GAPS. shutil.copytree
+                # with dirs_exist_ok overwrites, which would let a stale
+                # control-root copy clobber a promoted generation document.
+                _copy_missing(source, staged / relative)
         # The rebuilt staged index is independent, but its generation must be
         # monotonic relative to the live generation so liveness checks can
         # distinguish a successful staged rebuild from a reset counter.
@@ -55,7 +92,7 @@ def stage_generation(control_root: str | Path, generation_id: str) -> Path:
         # mutations without a multi-hour byte copy. Fail closed elsewhere: a
         # normal recursive copy defeats the loop's bounded-liveness contract.
         for name in ("index", "cache"):
-            source = source_root / ".alexandria" / name
+            source = source_roots[0] / ".alexandria" / name
             if source.exists():
                 destination = staged / ".alexandria" / name
                 try:
