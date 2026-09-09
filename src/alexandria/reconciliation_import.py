@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from .generation_publisher import stage_generation
@@ -14,6 +14,51 @@ from .parity import ReconciliationPlan
 
 class ReconciliationImportError(RuntimeError):
     """A reviewed reconciliation plan could not be staged safely."""
+
+
+def plan_from_json(data: Mapping[str, object]) -> ReconciliationPlan:
+    """Decode only the non-executable, hash-bound review artifact."""
+    if not isinstance(data, Mapping):
+        raise ReconciliationImportError("reconciliation plan must be a JSON object")
+    if data.get("apply") is not False or data.get("requires_operator_confirmation") is not True:
+        raise ReconciliationImportError("reconciliation plan must be a non-executable reviewed artifact")
+    try:
+        raw_remote, raw_local = data["add_to_remote"], data["add_to_local"]
+        local_hashes, remote_hashes = data["local_addition_hashes"], data["remote_addition_hashes"]
+        raw_conflicts, history = data["conflicts"], data["source_history"]
+    except KeyError as exc:
+        raise ReconciliationImportError(f"reconciliation plan missing {exc.args[0]}") from exc
+    if (not isinstance(raw_remote, (list, tuple)) or not isinstance(raw_local, (list, tuple))
+            or not all(isinstance(value, str) for value in (*raw_remote, *raw_local))
+            or len(set(raw_remote)) != len(raw_remote) or len(set(raw_local)) != len(raw_local)):
+        raise ReconciliationImportError("reconciliation plan IDs must be unique strings")
+    if not isinstance(local_hashes, dict) or not isinstance(remote_hashes, dict) or not isinstance(raw_conflicts, list) or not isinstance(history, dict):
+        raise ReconciliationImportError("reconciliation plan has invalid hash sections")
+    def valid_hashes(values: dict[object, object]) -> bool:
+        return all(isinstance(key, str) and isinstance(value, str) and len(value) == 64
+                   and all(char in "0123456789abcdef" for char in value) for key, value in values.items())
+    if not valid_hashes(local_hashes) or not valid_hashes(remote_hashes):
+        raise ReconciliationImportError("reconciliation plan hashes must be lowercase sha256 values")
+    try:
+        conflicts = tuple(
+            (entry["source_id"], entry["local_sha256"], entry["remote_sha256"])
+            for entry in raw_conflicts if isinstance(entry, dict)
+        )
+        if len(conflicts) != len(raw_conflicts) or not all(
+            isinstance(source_id, str) and isinstance(local_hash, str) and isinstance(remote_hash, str)
+            and len(local_hash) == len(remote_hash) == 64
+            for source_id, local_hash, remote_hash in conflicts
+        ):
+            raise TypeError
+        plan = ReconciliationPlan(
+            add_to_remote=tuple(raw_remote), add_to_local=tuple(raw_local), conflicts=conflicts,
+            local_addition_hashes=local_hashes, remote_addition_hashes=remote_hashes,
+            local_git_head=history.get("local"), remote_git_head=history.get("remote"),
+        )
+    except (KeyError, TypeError) as exc:
+        raise ReconciliationImportError("reconciliation plan has invalid conflicts") from exc
+    _validate_plan(plan)
+    return plan
 
 
 def _destination(stage: Path, source_id: str) -> Path:

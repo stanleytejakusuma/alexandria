@@ -8,7 +8,7 @@ import pytest
 from alexandria.generation_pointer import activate_generation, resolve_generation
 from alexandria.generation_publisher import PublishError, publish_generation
 from alexandria.parity import ReconciliationPlan
-from alexandria.reconciliation_import import ReconciliationImportError, stage_reconciliation
+from alexandria.reconciliation_import import ReconciliationImportError, plan_from_json, stage_reconciliation
 
 
 def _sha(content: bytes) -> str:
@@ -91,6 +91,16 @@ def test_invalid_source_ids_fail_closed(tmp_path: Path, source_id: str) -> None:
         stage_reconciliation(root, "bad-id", plan, fetch=lambda _source_id: b"x")
     assert not (root / ".alexandria" / "generations" / "bad-id").exists()
     assert resolve_generation(root) == active
+
+
+def test_plan_from_json_requires_hash_bound_non_executable_review() -> None:
+    plan = _plan()
+    raw = plan.to_json()
+    parsed = plan_from_json(raw)
+    assert parsed == plan
+    raw["apply"] = True
+    with pytest.raises(ReconciliationImportError, match="non-executable"):
+        plan_from_json(raw)
 
 
 def test_plan_hash_maps_must_exactly_match_reviewed_directional_ids(tmp_path: Path) -> None:
