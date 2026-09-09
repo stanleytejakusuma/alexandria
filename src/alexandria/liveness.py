@@ -52,8 +52,28 @@ WARN_MULTIPLE = 2.0
 STALE_CYCLES = 3.0
 
 
+def _control_root(corpus: str | Path) -> Path:
+    """Map a resolved generation back to the corpus that owns it.
+
+    2026-09-09: the drain wrote its heartbeat into `<generation>/.alexandria/`,
+    which `stage_generation` does not copy. Every publish therefore produced a
+    generation with no heartbeat, and `check()` reported a perfectly healthy
+    drain as dead. A serve that bound before a cutover kept recording into its
+    original generation, freezing the active one's heartbeat for good.
+
+    The heartbeat describes the drain process, which outlives any single
+    generation, so it belongs in the control root. Generations live at
+    `<control>/.alexandria/generations/<id>`, so the owner is three parents up.
+    """
+    path = Path(corpus).expanduser()
+    parent = path.parent
+    if parent.name == "generations" and parent.parent.name == ".alexandria":
+        return parent.parent.parent
+    return path
+
+
 def _state_path(corpus: str | Path) -> Path:
-    return Path(corpus).expanduser() / ".alexandria" / STATE_FILE
+    return _control_root(corpus) / ".alexandria" / STATE_FILE
 
 
 def record_success(corpus: str | Path, *, promoted_count: int, generation: int) -> None:
