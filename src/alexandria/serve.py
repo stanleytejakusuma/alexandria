@@ -86,6 +86,9 @@ class _LockedEngine:
 @dataclass
 class ServeContext:
     config: AppConfig
+    # Stable owner of current-generation.json. `corpus` below is always the
+    # resolved generation used for reads/writes in this process.
+    control_root: Path
     corpus: Path
     engine: Any            # SearchEngine, used directly by /search
     locked_engine: _LockedEngine  # passed to run_pipeline for /answer
@@ -138,6 +141,7 @@ def _load_token_store(token_file: str | Path | None, corpus: Path) -> dict[str, 
 
 
 def build_serve_context(config: AppConfig, corpus: Path, *,
+                         control_root: Path | None = None,
                          token_file: str | Path | None = None,
                          require_token: bool = False) -> ServeContext:
     """Build once at startup, reused by every request. Delegates the
@@ -152,7 +156,7 @@ def build_serve_context(config: AppConfig, corpus: Path, *,
     _warm_reranker(engine.reranker)
     lock = threading.Lock()
     return ServeContext(
-        config=config, corpus=corpus, engine=engine,
+        config=config, control_root=control_root or corpus, corpus=corpus, engine=engine,
         locked_engine=_LockedEngine(engine, lock),
         embedder=engine.embedder, store=engine.store, lexical=engine.bm25,
         engine_lock=lock, started_monotonic=time.monotonic(),
@@ -244,6 +248,27 @@ def start_drain(ctx: ServeContext, *,
     """
     stop = threading.Event()
 
+    def _follow_generation_cutover() -> bool:
+        """R8: follow current-generation.json without restarting serve."""
+        from .config import load_config
+        try:
+            config = load_config(corpus_override=ctx.control_root)
+        except Exception:
+            return False
+        if Path(config.corpus_path).resolve() == Path(ctx.corpus).resolve():
+            return False
+        from .cli import _build_search_engine
+        engine = _build_search_engine(config, config.corpus_path,
+                                      corpus_root=config.corpus_path, client="serve")
+        _warm_embedder(engine.embedder)
+        _warm_reranker(engine.reranker)
+        ctx.config, ctx.corpus = config, config.corpus_path
+        ctx.engine = engine
+        ctx.locked_engine = _LockedEngine(engine, ctx.engine_lock)
+        ctx.embedder, ctx.store, ctx.lexical = engine.embedder, engine.store, engine.bm25
+        print(f"alexandria serve: generation moved to {ctx.corpus} -- drain rebuilt its engine", flush=True)
+        return True
+
     def _follow_release_cutover() -> bool:
         """R7: re-resolve the active index each cycle and rebuild the engine
         when the pointer moved. A serve that started against release A kept
@@ -283,6 +308,7 @@ def start_drain(ctx: ServeContext, *,
         while not stop.wait(interval):
             try:
                 with ctx.engine_lock:
+                    _follow_generation_cutover()
                     _follow_release_cutover()
                     result = promote_pending(ctx.corpus, ctx.config, ctx.embedder,
                                              ctx.store, ctx.lexical)
@@ -742,7 +768,8 @@ def bind(corpus: str | Path, *, config: AppConfig | None = None, host: str = "12
         raise NonLoopbackRefused(
             f"refusing to bind {host}: set {REMOTE_ENV}=1 to allow a non-loopback bind")
 
-    ctx = build_serve_context(cfg, corpus, token_file=token_file, require_token=require_token)
+    ctx = build_serve_context(cfg, cfg.corpus_path, control_root=corpus,
+                              token_file=token_file, require_token=require_token)
     # Started here, not in serve(), because bind() is the single chokepoint
     # both the blocking entry point and every test go through -- a drain wired
     # only into serve() would be exercised by nothing.
