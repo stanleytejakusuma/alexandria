@@ -618,7 +618,10 @@ def cmd_serve(args) -> int:
         return 0
 
     try:
-        serve_forever(config.corpus_path, config=config, host=args.host, port=args.port,
+        # Preserve the operator's stable control root. `load_config` resolves a
+        # generation pointer, but serve must retain that raw root to follow a
+        # later current-generation cutover without a restart.
+        serve_forever(args.corpus or config.corpus_path, config=config, host=args.host, port=args.port,
                       unix_sockets=unix_sockets, token_file=args.token_file or None,
                       require_token=args.require_token)
     except NonLoopbackRefused as exc:

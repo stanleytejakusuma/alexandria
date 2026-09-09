@@ -160,7 +160,7 @@ def build_serve_context(config: AppConfig, corpus: Path, *,
         locked_engine=_LockedEngine(engine, lock),
         embedder=engine.embedder, store=engine.store, lexical=engine.bm25,
         engine_lock=lock, started_monotonic=time.monotonic(),
-        token_store=_load_token_store(token_file, corpus),
+        token_store=_load_token_store(token_file, control_root or corpus),
         require_token=require_token,
         llm_defaults={
             "base_url": os.environ.get("ALEXANDRIA_LLM_BASE_URL", "http://127.0.0.1:20128/v1"),
@@ -258,10 +258,14 @@ def start_drain(ctx: ServeContext, *,
         if Path(config.corpus_path).resolve() == Path(ctx.corpus).resolve():
             return False
         from .cli import _build_search_engine
-        engine = _build_search_engine(config, config.corpus_path,
-                                      corpus_root=config.corpus_path, client="serve")
-        _warm_embedder(engine.embedder)
-        _warm_reranker(engine.reranker)
+        try:
+            engine = _build_search_engine(config, config.corpus_path,
+                                          corpus_root=config.corpus_path, client="serve")
+            _warm_embedder(engine.embedder)
+            _warm_reranker(engine.reranker)
+        except BaseException:
+            traceback.print_exc()
+            return False
         ctx.config, ctx.corpus = config, config.corpus_path
         ctx.engine = engine
         ctx.locked_engine = _LockedEngine(engine, ctx.engine_lock)
@@ -291,10 +295,14 @@ def start_drain(ctx: ServeContext, *,
         if Path(current).resolve() == Path(ctx.store.path).resolve():
             return False
         from .cli import _build_search_engine  # same local-import rule as build_serve_context
-        engine = _build_search_engine(ctx.config, ctx.corpus, corpus_root=ctx.corpus,
-                                      client="serve")
-        _warm_embedder(engine.embedder)
-        _warm_reranker(engine.reranker)
+        try:
+            engine = _build_search_engine(ctx.config, ctx.corpus, corpus_root=ctx.corpus,
+                                          client="serve")
+            _warm_embedder(engine.embedder)
+            _warm_reranker(engine.reranker)
+        except BaseException:
+            traceback.print_exc()
+            return False
         ctx.engine = engine
         ctx.locked_engine = _LockedEngine(engine, ctx.engine_lock)
         ctx.embedder = engine.embedder
@@ -526,40 +534,39 @@ def _handle_remember(ctx: ServeContext, identity: str, payload: dict) -> tuple[i
     text, err = _validate_text(payload, "text")
     if err:
         return _json_error(400, err)
-    # §5.3: identity comes from the socket (`identity`), never the body. The
-    # remaining body fields are still attacker-controlled and land in the
-    # inbox's in-band metadata, so append_inbox_entry validates them and can
-    # refuse -- a refusal is the caller's fault, hence 400 not 500.
-    result = append_inbox_entry(ctx.corpus, text, from_=identity,
-                                session=payload.get("session"), corrects=payload.get("corrects"))
-    if result.status == "invalid":
-        return _json_error(400, result.error)
-    if result.status == "duplicate":
-        return _json_ok(200, {"status": "duplicate"})
-    if result.status == "inbox_write_failed":
-        return _json_error(500, f"failed to write the inbox entry: {result.error}")
-    if result.status == "marker_failed":
-        return _json_error(500, f"wrote inbox entry but failed to mark it pending: {result.error}")
+    # §5.3: identity comes from the socket (`identity`), never the body. Keep
+    # append and promote under the SAME lock as R8's generation swap: otherwise
+    # a cutover between them strands the pending marker in the old generation.
+    with ctx.engine_lock:
+        result = append_inbox_entry(ctx.corpus, text, from_=identity,
+                                    session=payload.get("session"), corrects=payload.get("corrects"))
+        if result.status == "invalid":
+            return _json_error(400, result.error)
+        if result.status == "duplicate":
+            return _json_ok(200, {"status": "duplicate"})
+        if result.status == "inbox_write_failed":
+            return _json_error(500, f"failed to write the inbox entry: {result.error}")
+        if result.status == "marker_failed":
+            return _json_error(500, f"wrote inbox entry but failed to mark it pending: {result.error}")
 
-    entry_id = result.entry.entry_id
-    promote_result = None
-    for attempt in range(2):
-        with ctx.engine_lock:
+        entry_id = result.entry.entry_id
+        promote_result = None
+        for attempt in range(2):
             promote_result = promote_pending(ctx.corpus, ctx.config, ctx.embedder, ctx.store,
                                              ctx.lexical, entry_ids=[entry_id])
-        if not promote_result.skipped_locked:
-            break
-        time.sleep(0.2 * (attempt + 1))
+            if not promote_result.skipped_locked:
+                break
+            time.sleep(0.2 * (attempt + 1))
 
-    if promote_result.skipped_locked:
-        return _json_ok(202, {"status": "queued", "entry_id": entry_id,
-                              "note": "write lock held by another process; will promote on the next drain"})
-    liveness.record_success(ctx.corpus, promoted_count=len(promote_result.promoted),
-                            generation=read_index_generation(ctx.corpus))
-    if promote_result.errors:
-        return _json_error(500, f"promote failed: {'; '.join(promote_result.errors)}")
-    return _json_ok(200, {"status": "promoted", "entry_id": entry_id,
-                          "chunks_written": promote_result.chunks_written})
+        if promote_result.skipped_locked:
+            return _json_ok(202, {"status": "queued", "entry_id": entry_id,
+                                  "note": "write lock held by another process; will promote on the next drain"})
+        liveness.record_success(ctx.corpus, promoted_count=len(promote_result.promoted),
+                                generation=read_index_generation(ctx.corpus))
+        if promote_result.errors:
+            return _json_error(500, f"promote failed: {'; '.join(promote_result.errors)}")
+        return _json_ok(200, {"status": "promoted", "entry_id": entry_id,
+                              "chunks_written": promote_result.chunks_written})
 
 
 def dispatch(ctx: ServeContext, identity: str, method: str, path: str, body: bytes) -> tuple[int, bytes, str]:
