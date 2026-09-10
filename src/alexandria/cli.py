@@ -1967,6 +1967,50 @@ def cmd_parity(args) -> int:
     return 0
 
 
+def cmd_generation(args) -> int:
+    """Reclaim disk from old corpus generations.
+
+    `stage_generation` clones the index/cache with APFS copy-on-write, so an
+    apparent (`du`-style) size wildly overstates what deleting a generation
+    actually frees back to the filesystem. This verb reports the true
+    reclaimable footprint and, by default, deletes nothing -- pass --apply to
+    actually remove the generations the plan marks reclaimable. The active
+    generation is never eligible, regardless of the retention counts.
+    """
+    from .generation_gc import GenerationGcError, run_generation_gc
+
+    control_root = _config_for(args).control_root
+    try:
+        plan = run_generation_gc(
+            control_root,
+            keep_published=args.keep_published,
+            keep_unpublished=args.keep_unpublished,
+            apply=args.apply,
+        )
+    except GenerationGcError as exc:
+        print(f"generation gc: refused: {exc}", file=sys.stderr)
+        return 1
+
+    verb = "reclaimed" if args.apply else "would reclaim"
+    print(f"generation gc: active generation: {plan.active_generation_id or '(none published yet)'}")
+    print(f"generation gc: keeping {len(plan.keep)} generation(s):")
+    for c in plan.keep:
+        kind = "published" if c.published else "unpublished"
+        print(f"  - {c.generation_id} ({kind}, {c.apparent_bytes / (1 << 20):.1f} MiB apparent)")
+    if not plan.reclaim:
+        print("generation gc: nothing to reclaim")
+        return 0
+    print(f"generation gc: {verb} {len(plan.reclaim)} generation(s), "
+          f"{plan.reclaimable_bytes / (1 << 30):.2f} GiB of real (non-shared) disk:")
+    for c in plan.reclaim:
+        kind = "published" if c.published else "unpublished"
+        print(f"  - {c.generation_id} ({kind}, {c.apparent_bytes / (1 << 20):.1f} MiB apparent, "
+              f"{c.unique_bytes / (1 << 20):.1f} MiB unique)")
+    if not args.apply:
+        print("generation gc: dry run -- pass --apply to actually delete the above")
+    return 0
+
+
 def cmd_staleness(args) -> int:
     """C5 freshness check: the age of the newest corpus content and newest
     index finish, failing loudly past a threshold (default two weeks).
@@ -2655,6 +2699,17 @@ def build_parser() -> argparse.ArgumentParser:
     parity.add_argument("--reconcile-plan", action="store_true",
                         help="emit a non-executable directional reconciliation plan")
     parity.set_defaults(func=cmd_parity)
+
+    gen = sub.add_parser("generation", help="inspect/reclaim old corpus generations (staged copies left behind by publish)")
+    gen_sub = gen.add_subparsers(dest="generation_command", required=True)
+    gen_gc = gen_sub.add_parser("gc", help="report (or, with --apply, delete) reclaimable old generations; dry-run by default")
+    gen_gc.add_argument("--keep-published", type=int, default=2,
+                        help="newest successfully-published generations to keep (default: 2)")
+    gen_gc.add_argument("--keep-unpublished", type=int, default=1,
+                        help="newest failed/abandoned staging candidates to keep, for forensics (default: 1)")
+    gen_gc.add_argument("--apply", action="store_true",
+                        help="actually delete; without this flag, only report the plan")
+    gen_gc.set_defaults(func=cmd_generation)
 
     st = sub.add_parser("staleness", help="C5 freshness check: age of the newest content/index, fails loudly past a threshold")
     st.add_argument("--max-age-days", type=float, default=None,
