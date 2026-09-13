@@ -344,6 +344,87 @@ def _json_error(status: int, message: object) -> tuple[int, bytes, str]:
     return status, json.dumps({"error": message}).encode(), "application/json"
 
 
+# The ask page: a same-origin browser surface for /answer. Served UNAUTHENTICATED
+# on purpose -- it contains no secrets and no corpus data (the auth gate still
+# guards every endpoint that does), and a demo page behind a Bearer wall can
+# never be opened in a browser, which is the only way anyone actually demos
+# this server. The page posts the question to /answer and renders the cited
+# result; /search gets the instant (no-LLM) variant. Auth posture is unchanged:
+# loopback-anonymous already reaches /search and /answer when require_token is
+# off; where tokens are required, the page loads but every request 401s.
+_ASK_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>alexandria ask</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 15px/1.5 -apple-system, sans-serif; background: #0d1117; color: #e6edf3;
+         max-width: 52rem; margin: 3rem auto; padding: 0 1.5rem; }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  h1 span { color: #58a6ff; }
+  textarea { width: 100%; box-sizing: border-box; background: #161b22; color: #e6edf3;
+             border: 1px solid #30363d; border-radius: 8px; padding: .7rem .9rem;
+             font: inherit; resize: vertical; min-height: 4.5rem; }
+  textarea:focus { outline: none; border-color: #2f6fb5; }
+  button { background: #238636; border: 1px solid #2ea043; color: #fff; font: inherit;
+           padding: .45rem 1.1rem; border-radius: 6px; cursor: pointer; }
+  button.ghost { background: transparent; border-color: #30363d; }
+  button:disabled { opacity: .5; cursor: wait; }
+  #status { color: #8b949e; font-size: .85rem; min-height: 1.2em; }
+  pre { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+        padding: 1rem; white-space: pre-wrap; overflow-x: hidden; display: none; }
+  ul.sources { font-size: .85rem; color: #8b949e; display: none; }
+</style>
+</head>
+<body>
+<h1><span>alexandria</span> · ask the corpus</h1>
+<textarea id="q" placeholder="Ask anything the corpus should know about…"></textarea>
+<p>
+  <button id="ask">Answer</button>
+  <button id="find" class="ghost">Search only</button>
+</p>
+<p id="status"></p>
+<pre id="out"></pre>
+<ul class="sources" id="src"></ul>
+<script>
+const $ = id => document.getElementById(id);
+async function run(kind) {
+  const q = $("q").value.trim();
+  if (!q) { $("status").textContent = "type a question first"; return; }
+  const t0 = performance.now();
+  $("status").textContent = kind === "answer" ? "answering (gather → write → judge)…" : "searching…";
+  $("ask").disabled = $("find").disabled = true;
+  $("out").style.display = "none"; $("src").style.display = "none";
+  try {
+    const body = kind === "answer" ? { question: q } : { query: q, k: 8 };
+    const r = await fetch("/" + kind, { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    if (kind === "answer") {
+      $("out").textContent = data.text || JSON.stringify(data, null, 2);
+      const ids = (data.sources || data.citations || []).map(s => s.id || s.doc_id || String(s));
+      $("src").innerHTML = ids.length ? ids.map(i => `<li>${i}</li>`).join("") : "";
+      $("src").style.display = ids.length ? "block" : "none";
+    } else {
+      const hits = (data.results || []).map(x =>
+        `[${(x.score ?? x.rank ?? "").toString().slice(0, 6)}] ${x.doc_id}\n${x.text?.slice(0, 400)}…`).join("\n\n");
+      $("out").textContent = hits || "no hits";
+    }
+    $("status").textContent = `done in ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+    $("out").style.display = "block";
+  } catch (e) { $("status").textContent = "failed: " + e.message; }
+  finally { $("ask").disabled = $("find").disabled = false; }
+}
+$("ask").onclick = () => run("answer");
+$("find").onclick = () => run("search");
+$("q").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) run("answer"); });
+</script>
+</body>
+</html>"""
+
+
 def _json_ok(status: int, payload: dict) -> tuple[int, bytes, str]:
     return status, json.dumps(payload).encode(), "application/json"
 
@@ -595,6 +676,8 @@ def dispatch(ctx: ServeContext, identity: str, method: str, path: str, body: byt
                     "reason": str(exc),
                     "uptime_seconds": round(time.monotonic() - ctx.started_monotonic, 1),
                 })
+        if method == "GET" and path == "/":
+            return 200, _ASK_PAGE.encode("utf-8"), "text/html; charset=utf-8"
         if method != "POST":
             return _json_error(404, "not found")
         if len(body) > MAX_BODY_BYTES:

@@ -834,3 +834,50 @@ def test_the_drain_follows_a_release_cutover(tmp_path, monkeypatch):
     # in release B -- the tick rebuilt against the moved pointer before it
     # wrote. Writing into frozen A leaves store.path at dir_a forever.
     assert Path(ctx.store.path).resolve() == release_b.resolve()
+
+
+def test_get_root_serves_the_ask_page_without_auth_or_secrets(tmp_path, monkeypatch):
+    """GET / returns the ask page: a same-origin form for /answer.
+
+    The page must be servable WITHOUT any token -- it is the only way a browser
+    can actually demo the server (a Bearer-gated page can never be opened). It
+    must therefore leak nothing: no corpus content, no tokens, no key material.
+    Auth posture is unchanged -- every data endpoint still dispatches behind
+    the identity gate exactly as before.
+    """
+    from alexandria import serve as serve_mod
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    try:
+        status, raw, ctype = serve_mod.dispatch(ctx, "test", "GET", "/", b"")
+        assert status == 200
+        assert "text/html" in ctype
+        html = raw.decode("utf-8")
+        assert 'await fetch("/" + kind' in html, "the page must hit /answer or /search, same origin"
+        # nothing sensitive rides along on the unauthenticated page
+        assert "Bearer" not in html
+        assert str(ctx.corpus) not in html
+    finally:
+        tcp_server.server_close()
+        for server in uds_servers:
+            server.server_close()
+
+
+def test_ask_page_route_does_not_hijack_other_paths(tmp_path, monkeypatch):
+    """Only exactly '/' serves the page; every other unknown GET still 404s.
+
+    If the route match ever widened (prefix match, trailing-slash alias), an
+    accidental catch-all could shadow future GET endpoints -- this pins the
+    narrow contract.
+    """
+    from alexandria import serve as serve_mod
+    corpus = _index_a_tiny_corpus(tmp_path, monkeypatch)
+    ctx, tcp_server, uds_servers = _bind(corpus, monkeypatch)
+    try:
+        for path in ("/ask", "/index.html", "/?q=x", "//", "/answer"):
+            status, _, _ = serve_mod.dispatch(ctx, "test", "GET", path, b"")
+            assert status == 404, f"GET {path} must stay 404"
+    finally:
+        tcp_server.server_close()
+        for server in uds_servers:
+            server.server_close()

@@ -15,4 +15,10 @@ if [ -z "$KEY" ]; then
 fi
 export ALEXANDRIA_LLM_KEY="$KEY"
 unset KEY
+# The embedder model (Qwen3-Embedding-0.6B) is fully cached locally; without
+# this, every cold start re-checks HF Hub for updates and a slow/unreachable
+# network kills the first query with ModelLoadTimeout (seen live 2026-09-12:
+# /answer timed out while the model re-checked the hub). Offline mode loads
+# the cached copy instantly. Only revisit if a different model is adopted.
+export HF_HUB_OFFLINE=1
 exec "$@"
